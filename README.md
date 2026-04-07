@@ -151,12 +151,19 @@ streamlit run streamlit_app.py
 
 Puis dans l interface:
 - uploader le fichier `.rdl`
+- laisser `Enable publish stage` decoche pour les tests conversion-only
 - cliquer `Convert`
 
 ### Mode multi-agent LLM
 
 ```bash
 python run_conversion.py --rdl path/to/report.rdl --config config/llm_config.example.json
+```
+
+Mode conversion-only (sans extract/publish/RPA):
+
+```bash
+python run_conversion.py --rdl path/to/report.rdl --config config/llm_config.json --no-publish
 ```
 
 Si `--config` n est pas fourni, le CLI prend automatiquement:

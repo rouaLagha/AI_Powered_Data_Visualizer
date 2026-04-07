@@ -1,0 +1,853 @@
+<workbook version="18.1" source-build="2024.2.0 (20242.24.0620.1454)" source-platform="win">
+  <preferences />
+  <style />
+  <datasources>
+    <datasource name="EnterData" caption="EnterData" inline="true" hasconnection="true">
+      <connection class="federated">
+        <named-connections>
+          <named-connection name="sqlserver.enterdata" caption="DESKTOP-GC2J9J1\SQLEXPRESS">
+            <connection class="sqlserver" server="DESKTOP-GC2J9J1\SQLEXPRESS" dbname="AdventureWorksDW2022" authentication="sspi" />
+          </named-connection>
+        </named-connections>
+        <relation type="join" join="inner">
+          <clause type="join">
+            <expression op="=">
+              <expression op="[DimDate].[DateKey]" />
+              <expression op="[FactSalesQuota].[DateKey]" />
+            </expression>
+          </clause>
+          <relation type="join" join="inner">
+            <clause type="join">
+              <expression op="=">
+                <expression op="[FactResellerSales].[OrderDateKey]" />
+                <expression op="[DimDate].[DateKey]" />
+              </expression>
+            </clause>
+            <relation type="join" join="inner">
+              <clause type="join">
+                <expression op="=">
+                  <expression op="[FactResellerSales].[SalesTerritoryKey]" />
+                  <expression op="[DimSalesTerritory].[SalesTerritoryKey]" />
+                </expression>
+              </clause>
+              <relation connection="sqlserver.enterdata" name="FactResellerSales" table="[dbo].[FactResellerSales]" type="table" />
+              <relation connection="sqlserver.enterdata" name="DimSalesTerritory" table="[dbo].[DimSalesTerritory]" type="table" />
+            </relation>
+            <relation connection="sqlserver.enterdata" name="DimDate" table="[dbo].[DimDate]" type="table" />
+          </relation>
+          <relation connection="sqlserver.enterdata" name="FactSalesQuota" table="[dbo].[FactSalesQuota]" type="table" />
+        </relation>
+        <cols>
+          <map key="[OrderQuantity]" value="[FactResellerSales].[OrderQuantity]" />
+          <map key="[SalesAmount]" value="[FactResellerSales].[SalesAmount]" />
+          <map key="[SalesTerritoryGroup]" value="[DimSalesTerritory].[SalesTerritoryGroup]" />
+          <map key="[CalendarYear]" value="[DimDate].[CalendarYear]" />
+          <map key="[EnglishMonthName]" value="[DimDate].[EnglishMonthName]" />
+          <map key="[SalesAmountQuota]" value="[FactSalesQuota].[SalesAmountQuota]" />
+        </cols>
+      </connection>
+      <column name="[OrderQuantity]" role="measure" datatype="real" type="quantitative" />
+      <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" />
+      <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" />
+      <column name="[CalendarYear]" role="dimension" datatype="integer" type="quantitative" />
+      <column name="[EnglishMonthName]" role="dimension" datatype="string" type="nominal" />
+      <column name="[SalesAmountQuota]" role="measure" datatype="real" type="quantitative" />
+      <column name="[SalesVariance]" role="measure" datatype="real" type="quantitative" caption="Variance">
+        <calculation class="tableau" formula="ZN(SUM([SalesAmount])) - ZN(SUM([SalesAmountQuota]))" />
+      </column>
+      <column name="[SalesVariancePct]" role="measure" datatype="real" type="quantitative" caption="Variance %">
+        <calculation class="tableau" formula="IF ZN(SUM([SalesAmountQuota])) = 0 THEN 0 ELSE (ZN(SUM([SalesAmount])) - ZN(SUM([SalesAmountQuota]))) / ZN(SUM([SalesAmountQuota])) END" />
+      </column>
+      <column name="[ReportLogoLabel]" role="dimension" datatype="string" type="nominal" caption="ReportLogo">
+        <calculation class="tableau" formula="&quot;ID16313774731791&quot;" />
+      </column>
+      <column name="[ReportTitleText]" role="dimension" datatype="string" type="nominal" caption="ReportTitle">
+        <calculation class="tableau" formula="&quot;Regional Sales&quot;" />
+      </column>
+      <column name="[ReportSubtitleText]" role="dimension" datatype="string" type="nominal" caption="ReportSubtitle">
+        <calculation class="tableau" formula="(IF MIN([CalendarYear]) = MAX([CalendarYear]) THEN &quot;Year: &quot; + STR(MIN([CalendarYear])) ELSE &quot;Year: &quot; + STR(MIN([CalendarYear])) + &quot;-&quot; + STR(MAX([CalendarYear])) END) + &quot; | Group: &quot; + (IF MIN([SalesTerritoryGroup]) = MAX([SalesTerritoryGroup]) THEN MIN([SalesTerritoryGroup]) ELSE &quot;Multiple&quot; END)" />
+      </column>
+      <column name="[FooterRunAtText]" role="dimension" datatype="string" type="nominal" caption="FooterRunAt">
+        <calculation class="tableau" formula="&quot;Run at &quot; + STR(NOW())" />
+      </column>
+      <column name="[FooterPageText]" role="dimension" datatype="string" type="nominal" caption="FooterPage">
+        <calculation class="tableau" formula="&quot;Page 1 of 1&quot;" />
+      </column>
+      <column name="[KPIHeaderText]" role="dimension" datatype="string" type="nominal" caption="KPIHeaders">
+        <calculation class="tableau" formula="&quot;ORDERS     SALES     QUOTA     VARIANCE&quot;" />
+      </column>
+      <layout dim-ordering="alphabetic" measure-ordering="alphabetic" dim-percentage="0.50" measure-percentage="0.50" show-structure="true" />
+      <style />
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name="PageHeader_ReportLogo">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[ReportLogoLabel]" role="dimension" datatype="string" type="nominal" caption="ReportLogoLabel" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[ReportLogoLabel]" derivation="None" name="[none:ReportLogoLabel:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+            <column caption="SalesTerritoryGroup" name="[SalesTerritoryGroup]" datatype="string" type="nominal" role="dimension" />
+            <column-instance derivation="None" column="[SalesTerritoryGroup]" name="[none:SalesTerritoryGroup:nk]" type="nominal" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+            <target field="[EnterData].[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Shape" />
+          </pane>
+        </panes>
+        <rows />
+        <cols>[EnterData].[none:ReportLogoLabel:nk]</cols>
+      </table>
+    </worksheet>
+    <worksheet name="PageHeader_ReportSubtitle">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[ReportSubtitleText]" role="dimension" datatype="string" type="nominal" caption="ReportSubtitleText" />
+            <column name="[CalendarYear]" role="dimension" datatype="integer" type="quantitative" caption="CalendarYear" />
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column-instance column="[ReportSubtitleText]" derivation="Attribute" name="[attr:ReportSubtitleText:nk]" pivot="key" type="nominal" />
+            <column-instance column="[CalendarYear]" derivation="None" name="[none:CalendarYear:qk]" pivot="key" type="quantitative" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[attr:ReportSubtitleText:nk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols>[EnterData].[attr:ReportSubtitleText:nk]</cols>
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_SalesTerritoryRegion">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[none:SalesTerritoryGroup:nk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows>[EnterData].[none:SalesTerritoryGroup:nk]</rows>
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_ColumnHeaders">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column name="[KPIHeaderText]" role="dimension" datatype="string" type="nominal" caption="KPIHeaderText" />
+            <column-instance column="[KPIHeaderText]" derivation="None" name="[none:KPIHeaderText:nk]" pivot="key" type="nominal" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[none:KPIHeaderText:nk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols>[EnterData].[none:KPIHeaderText:nk]</cols>
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_Quantity">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[OrderQuantity]" role="measure" datatype="real" type="quantitative" caption="OrderQuantity" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[OrderQuantity]" derivation="Sum" name="[sum:OrderQuantity:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[sum:OrderQuantity:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_Sales">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[sum:SalesAmount:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_Textbox6">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmountQuota]" role="measure" datatype="real" type="quantitative" caption="SalesAmountQuota" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmountQuota]" derivation="Sum" name="[sum:SalesAmountQuota:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[sum:SalesAmountQuota:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_Textbox8">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesVariance]" role="measure" datatype="real" type="quantitative" caption="SalesVariance" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesVariance]" derivation="Sum" name="[sum:SalesVariance:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[sum:SalesVariance:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_GaugePanel1">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Pie" />
+            <encodings>
+              <color column="[EnterData].[none:SalesTerritoryGroup:nk]" />
+              <wedge-size column="[EnterData].[sum:SalesAmount:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_GaugeLabel">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesVariancePct]" role="measure" datatype="real" type="quantitative" caption="SalesVariancePct" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesVariancePct]" derivation="Sum" name="[sum:SalesVariancePct:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[sum:SalesVariancePct:qk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols />
+      </table>
+    </worksheet>
+    <worksheet name="tablixRegionSummary_Chart1">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[EnglishMonthName]" role="dimension" datatype="string" type="nominal" caption="EnglishMonthName" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[EnglishMonthName]" derivation="None" name="[none:EnglishMonthName:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column name="[SalesAmountQuota]" role="measure" datatype="real" type="quantitative" caption="SalesAmountQuota" />
+            <column-instance column="[SalesAmountQuota]" derivation="Sum" name="[sum:SalesAmountQuota:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+            <column caption="SalesTerritoryGroup" name="[SalesTerritoryGroup]" datatype="string" type="nominal" role="dimension" />
+            <column-instance derivation="None" column="[SalesTerritoryGroup]" name="[none:SalesTerritoryGroup:nk]" type="nominal" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <filter class="categorical" column="[EnterData].[:Measure Names]">
+            <groupfilter function="union">
+              <groupfilter function="member" level="[:Measure Names]" member="&quot;[EnterData].[sum:SalesAmount:qk]&quot;" />
+              <groupfilter function="member" level="[:Measure Names]" member="&quot;[EnterData].[sum:SalesAmountQuota:qk]&quot;" />
+            </groupfilter>
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[:Measure Names]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Line" />
+            <encodings>
+              <color column="[EnterData].[:Measure Names]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows>[EnterData].[Multiple Values]</rows>
+        <cols>[EnterData].[none:EnglishMonthName:nk]</cols>
+      </table>
+    </worksheet>
+    <worksheet name="Filter - SalesTerritoryGroup">
+      <layout-options />
+      <table>
+        <view>
+          <datasources>
+            <datasource name="EnterData" />
+          </datasources>
+          <datasource-dependencies datasource="EnterData">
+            <column name="[SalesTerritoryGroup]" role="dimension" datatype="string" type="nominal" caption="SalesTerritoryGroup" />
+            <column name="[SalesAmount]" role="measure" datatype="real" type="quantitative" caption="SalesAmount" />
+            <column-instance column="[SalesTerritoryGroup]" derivation="None" name="[none:SalesTerritoryGroup:nk]" pivot="key" type="nominal" />
+            <column-instance column="[SalesAmount]" derivation="Sum" name="[sum:SalesAmount:qk]" pivot="key" type="quantitative" />
+            <column caption="CalendarYear" name="[CalendarYear]" datatype="integer" type="quantitative" role="dimension" />
+            <column-instance derivation="None" column="[CalendarYear]" name="[none:CalendarYear:qk]" type="quantitative" pivot="key" />
+          </datasource-dependencies>
+          <filter column="[EnterData].[none:CalendarYear:qk]" class="quantitative" included-values="in-range-or-null">
+            <min>0</min>
+            <max>9999</max>
+          </filter>
+          <filter class="categorical" column="[EnterData].[none:SalesTerritoryGroup:nk]" filter-group="1">
+            <groupfilter function="level-members" level="[none:SalesTerritoryGroup:nk]" />
+          </filter>
+          <perspectives />
+          <slices>
+            <column>[EnterData].[none:CalendarYear:qk]</column>
+            <column>[EnterData].[none:SalesTerritoryGroup:nk]</column>
+          </slices>
+          <aggregation value="true" />
+        </view>
+        <style />
+        <panes>
+          <pane>
+            <view>
+              <breakdown value="auto" />
+            </view>
+            <mark class="Text" />
+            <encodings>
+              <text column="[EnterData].[none:SalesTerritoryGroup:nk]" />
+            </encodings>
+          </pane>
+        </panes>
+        <rows />
+        <cols>[EnterData].[none:SalesTerritoryGroup:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+  <dashboards>
+    <dashboard name="RegionalSales Dashboard">
+      <style />
+      <size maxheight="900" maxwidth="1400" minheight="900" minwidth="1400" />
+      <datasources>
+        <datasource name="EnterData" />
+      </datasources>
+      <zones>
+        <zone id="0" type-v2="layout-basic" x="0" y="0" w="100000" h="100000">
+          <zone id="1" type-v2="bitmap" param="C:/Users/Roua/Desktop/1631377473179.jpg" x="0" y="0" w="14000" h="18000">
+            <zone-style>
+              <format attr="border-color" value="#000000" />
+              <format attr="border-style" value="none" />
+              <format attr="border-width" value="0" />
+              <format attr="margin" value="4" />
+            </zone-style>
+          </zone>
+          <zone id="3" type-v2="text" x="16000" y="2200" w="80000" h="7000" forceUpdate="true">
+            <formatted-text>
+              <run bold="true" fontsize="22">Regional Sales</run>
+            </formatted-text>
+            <zone-style>
+              <format attr="border-color" value="#000000" />
+              <format attr="border-style" value="none" />
+              <format attr="border-width" value="0" />
+              <format attr="margin" value="4" />
+            </zone-style>
+          </zone>
+          <zone id="4" name="PageHeader_ReportSubtitle" type-v2="worksheet" show-title="false" x="16000" y="9800" w="80000" h="5600" />
+          <zone id="6" name="tablixRegionSummary_SalesTerritoryRegion" type-v2="worksheet" show-title="false" x="0" y="18000" w="100000" h="7000" />
+          <zone id="7" name="tablixRegionSummary_ColumnHeaders" type-v2="worksheet" show-title="false" x="0" y="25000" w="100000" h="5000" />
+          <zone id="8" name="tablixRegionSummary_Quantity" type-v2="worksheet" show-title="false" x="0" y="30000" w="20000" h="20000" />
+          <zone id="9" name="tablixRegionSummary_Sales" type-v2="worksheet" show-title="false" x="20000" y="30000" w="20000" h="20000" />
+          <zone id="10" name="tablixRegionSummary_Textbox6" type-v2="worksheet" show-title="false" x="40000" y="30000" w="20000" h="20000" />
+          <zone id="11" name="tablixRegionSummary_Textbox8" type-v2="worksheet" show-title="false" x="60000" y="30000" w="20000" h="20000" />
+          <zone id="12" name="tablixRegionSummary_GaugePanel1" type-v2="worksheet" show-title="false" x="80000" y="30000" w="20000" h="14500" />
+          <zone id="13" name="tablixRegionSummary_GaugeLabel" type-v2="worksheet" show-title="false" x="80000" y="44500" w="20000" h="5500" />
+          <zone id="14" name="tablixRegionSummary_Chart1" type-v2="worksheet" show-title="false" x="0" y="50000" w="100000" h="33000" />
+          <zone id="15" type-v2="text" x="0" y="83000" w="50000" h="7000" forceUpdate="true">
+            <formatted-text>
+              <run fontsize="10">Run at</run>
+            </formatted-text>
+            <zone-style>
+              <format attr="border-color" value="#000000" />
+              <format attr="border-style" value="none" />
+              <format attr="border-width" value="0" />
+              <format attr="margin" value="4" />
+            </zone-style>
+          </zone>
+          <zone id="16" type-v2="text" x="50000" y="83000" w="50000" h="7000" forceUpdate="true">
+            <formatted-text>
+              <run fontsize="10">Page 1 of 1</run>
+            </formatted-text>
+            <zone-style>
+              <format attr="border-color" value="#000000" />
+              <format attr="border-style" value="none" />
+              <format attr="border-width" value="0" />
+              <format attr="margin" value="4" />
+            </zone-style>
+          </zone>
+        </zone>
+      </zones>
+    </dashboard>
+  </dashboards>
+  <windows>
+    <window name="RegionalSales Dashboard" class="dashboard">
+      <viewpoints>
+        <viewpoint name="PageHeader_ReportLogo" />
+        <viewpoint name="PageHeader_ReportSubtitle" />
+        <viewpoint name="tablixRegionSummary_SalesTerritoryRegion" />
+        <viewpoint name="tablixRegionSummary_ColumnHeaders" />
+        <viewpoint name="tablixRegionSummary_Quantity" />
+        <viewpoint name="tablixRegionSummary_Sales" />
+        <viewpoint name="tablixRegionSummary_Textbox6" />
+        <viewpoint name="tablixRegionSummary_Textbox8" />
+        <viewpoint name="tablixRegionSummary_GaugePanel1" />
+        <viewpoint name="tablixRegionSummary_GaugeLabel" />
+        <viewpoint name="tablixRegionSummary_Chart1" />
+      </viewpoints>
+      <active id="-1" />
+    </window>
+    <window name="PageHeader_ReportLogo" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="PageHeader_ReportSubtitle" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_SalesTerritoryRegion" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_ColumnHeaders" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_Quantity" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_Sales" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_Textbox6" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_Textbox8" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_GaugePanel1" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_GaugeLabel" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="tablixRegionSummary_Chart1" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+    <window name="Filter - SalesTerritoryGroup" class="worksheet">
+      <cards>
+        <edge name="right">
+          <strip size="160">
+            <card param="[EnterData].[none:SalesTerritoryGroup:nk]" type="filter" />
+            <card param="[EnterData].[none:CalendarYear:qk]" show-domain="false" show-null-ctrls="false" type="filter" />
+          </strip>
+        </edge>
+      </cards>
+      <viewpoint />
+    </window>
+  </windows>
+</workbook>

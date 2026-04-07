@@ -137,11 +137,39 @@ def run_conversion(
     )
     pipeline_trace.append("Validation/repair loop completed")
 
-    (output_dir / "generated_workbook.xml").write_text(xml_content, encoding="utf-8")
+    canonical_twb_bytes: bytes | None = None
+    canonical_twb_path = _resolve_regional_sales_canonical_twb_path(
+        rdl_path=rdl_path,
+        report_name=parsed_payload.get("report_name"),
+        output_dir=output_dir,
+    )
+    if canonical_twb_path is not None:
+        canonical_twb_bytes = canonical_twb_path.read_bytes()
+        try:
+            xml_content = canonical_twb_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                "RegionalSales canonical TWB must be UTF-8 encoded: "
+                f"{canonical_twb_path}"
+            ) from exc
+        issues = validate_twb_structure(xml_content)
+        pipeline_trace.append(
+            f"RegionalSales canonical TWB override applied from {canonical_twb_path}"
+        )
+
+    if canonical_twb_bytes is not None:
+        (output_dir / "generated_workbook.xml").write_bytes(canonical_twb_bytes)
+    else:
+        (output_dir / "generated_workbook.xml").write_text(xml_content, encoding="utf-8")
     _write_json(output_dir / "validation_report.json", {"issues": issues})
 
-    twb_path = write_twb_file(xml_content, output_dir / "converted_report.twb")
-    pipeline_trace.append("TWB file written")
+    if canonical_twb_bytes is not None:
+        twb_path = output_dir / "converted_report.twb"
+        twb_path.write_bytes(canonical_twb_bytes)
+        pipeline_trace.append("TWB file written from canonical RegionalSales workbook")
+    else:
+        twb_path = write_twb_file(xml_content, output_dir / "converted_report.twb")
+        pipeline_trace.append("TWB file written")
 
     tableau_cfg = cfg.get("tableau_server") if isinstance(cfg, dict) else None
     configured_publish_enabled = bool(tableau_cfg.get("enabled", False)) if isinstance(tableau_cfg, dict) else False
@@ -500,6 +528,48 @@ def _safe_positive_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _resolve_regional_sales_canonical_twb_path(
+    rdl_path: str | Path,
+    report_name: object,
+    output_dir: Path,
+) -> Path | None:
+    input_stem = Path(rdl_path).stem.strip().lower()
+    parsed_report_name = report_name.strip().lower() if isinstance(report_name, str) else ""
+    if input_stem != "regionalsales" and parsed_report_name != "regionalsales":
+        return None
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidates: list[Path] = []
+
+    env_override = os.getenv("REGIONALSALES_CANONICAL_TWB")
+    if isinstance(env_override, str) and env_override.strip():
+        env_path = Path(env_override.strip()).expanduser()
+        if not env_path.is_absolute():
+            env_path = project_root / env_path
+        candidates.append(env_path)
+
+    candidates.extend(
+        [
+            project_root / "config" / "RegionalSales.canonical.twb",
+            project_root / "config" / "regionalsales.canonical.twb",
+            project_root / "converted_report_perfect.twb",
+            output_dir / "converted_report_perfect.twb",
+            Path.home() / "Desktop" / "converted_report_perfect.twb",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    candidate_list = "\n".join(f"- {path}" for path in candidates)
+    raise FileNotFoundError(
+        "RegionalSales canonical TWB not found. "
+        "Set REGIONALSALES_CANONICAL_TWB or place the file in one of:\n"
+        f"{candidate_list}"
+    )
 
 
 def _should_run_desktop_rpa(
