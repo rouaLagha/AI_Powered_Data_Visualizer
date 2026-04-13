@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+output/*.twb
+output/*.xml
+output/*.json
+config/llm_config.json
