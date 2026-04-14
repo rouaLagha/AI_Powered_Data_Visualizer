@@ -1,0 +1,12 @@
+{
+  "status": "manual_upload_required",
+  "reason": "Tableau Public does not expose a compatible REST publish endpoint for TSC in this workflow.",
+  "server_url": "https://public.tableau.com",
+  "site_content_url": "",
+  "publish_mode": "overwrite",
+  "file_format": "twbx",
+  "publish_file": "output_verify_envfix_hyperpub\\converted_report.twbx",
+  "manual_upload_url": "https://public.tableau.com/",
+  "desktop_rpa_attempted": false,
+  "desktop_rpa_reason": "tableau_server.desktop_rpa_enabled is false"
+}

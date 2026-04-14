@@ -1,2 +1,6 @@
 streamlit>=1.32.0
 pyodbc>=5.1.0
+tableauserverclient>=0.32.0
+tableauhyperapi>=0.0.19484
+pywinauto>=0.6.8
+playwright>=1.45.0

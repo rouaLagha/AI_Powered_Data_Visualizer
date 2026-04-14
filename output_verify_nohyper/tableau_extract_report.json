@@ -1,0 +1,11 @@
+{
+  "status": "packaged_without_extract",
+  "reason": "Hyper extract packaging disabled; generated TWBX from TWB",
+  "twbx_package_fallback": {
+    "status": "packaged",
+    "twbx_path": "output_verify_nohyper\\converted_report.twbx",
+    "twb_in_package": "converted_report.twb",
+    "package_mode": "twb_only"
+  },
+  "publish_input_path": "output_verify_nohyper\\converted_report.twbx"
+}

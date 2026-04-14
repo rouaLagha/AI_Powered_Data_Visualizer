@@ -6,6 +6,13 @@ from pathlib import Path
 from src.rdl_to_twb.pipeline import run_conversion
 
 
+ROOT_DIR = Path(__file__).resolve().parent
+LOCAL_CONFIG_PATH = ROOT_DIR / "config" / "llm_config.json"
+DEFAULT_CONFIG_PATH = (
+    LOCAL_CONFIG_PATH if LOCAL_CONFIG_PATH.exists() else ROOT_DIR / "config" / "llm_config.example.json"
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert SSRS RDL to Tableau TWB")
     parser.add_argument("--rdl", required=True, help="Path to source .rdl file")
@@ -26,7 +33,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        default="config/llm_config.example.json",
+        default=str(DEFAULT_CONFIG_PATH),
         help="Path to LLM config JSON",
     )
 

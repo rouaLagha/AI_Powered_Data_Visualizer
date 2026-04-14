@@ -1,0 +1,15 @@
+{
+  "steps": [
+    "Schemas loaded",
+    "RDL parsed",
+    "DB catalog introspection completed",
+    "Prompt payloads compacted",
+    "Agent-1 semantic generation succeeded",
+    "Agent-2 XML generation failed; deterministic seed workbook generated (TimeoutError: LLM request timed out after 20s: http://127.0.0.1:11434/v1/chat/completions.)",
+    "Validation/repair loop completed",
+    "TWB file written",
+    "Hyper extract created and TWBX package built",
+    "Tableau Public manual upload required",
+    "Tableau Public Desktop RPA attempted (status=needs_manual_check, reason=publish_outcome_not_detected)"
+  ]
+}

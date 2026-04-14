@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 from .agent_semantic_modeler import generate_semantic_models
@@ -10,6 +13,12 @@ from .db_introspection import build_db_catalog
 from .llm_client import LLMClient, LLMConfig
 from .rdl_parser import parse_rdl_file
 from .schema_utils import summarize_xsd_elements
+from .tableau_extract import (
+    build_hyper_extract_from_catalog,
+    build_twbx_package,
+    rewrite_workbook_for_hyper,
+)
+from .tableau_publisher import publish_workbook_if_configured
 from .twb_builder import (
     inject_datasource_connections,
     inject_semantic_bindings,
@@ -132,9 +141,221 @@ def run_conversion(
 
     twb_path = write_twb_file(xml_content, output_dir / "converted_report.twb")
     pipeline_trace.append("TWB file written")
+
+    tableau_cfg = cfg.get("tableau_server") if isinstance(cfg, dict) else None
+    fail_on_publish_error = bool(tableau_cfg.get("fail_on_error", False)) if isinstance(tableau_cfg, dict) else False
+    publish_input_path = Path(twb_path)
+    tableau_extract_report: dict = {
+        "status": "skipped",
+        "reason": "Hyper extract packaging not requested",
+        "publish_input_path": str(publish_input_path),
+    }
+
+    if isinstance(tableau_cfg, dict) and bool(tableau_cfg.get("enabled", False)):
+        requested_format = str(tableau_cfg.get("file_format") or "twb").strip().lower()
+        server_url = str(tableau_cfg.get("server_url") or "").strip().lower()
+        twbx_required_for_publish = bool(
+            requested_format == "twbx"
+            or "public.tableau.com" in server_url
+            or bool(tableau_cfg.get("desktop_rpa_enabled", False))
+        )
+        should_build_extract = bool(
+            tableau_cfg.get(
+                "build_hyper_extract",
+                twbx_required_for_publish,
+            )
+        )
+
+        if should_build_extract:
+            max_rows = _safe_positive_int(tableau_cfg.get("hyper_max_rows_per_table"))
+            try:
+                hyper_path = output_dir / "converted_report.hyper"
+                tableau_extract_report = build_hyper_extract_from_catalog(
+                    output_hyper_path=hyper_path,
+                    data_sources=parsed_payload.get("data_sources", []),
+                    db_catalog=db_catalog,
+                    max_rows_per_table=max_rows,
+                )
+
+                if tableau_extract_report.get("status") == "created":
+                    hyper_twb_path = output_dir / "converted_report_hyper.twb"
+                    rewrite_report = rewrite_workbook_for_hyper(
+                        source_twb_path=twb_path,
+                        output_twb_path=hyper_twb_path,
+                        hyper_relative_path=f"Data/Extracts/{hyper_path.name}",
+                    )
+                    twbx_path = output_dir / "converted_report.twbx"
+                    package_report = build_twbx_package(
+                        twb_path=hyper_twb_path,
+                        output_twbx_path=twbx_path,
+                        hyper_path=hyper_path,
+                    )
+
+                    tableau_extract_report["workbook_rewrite"] = rewrite_report
+                    tableau_extract_report["twbx_package"] = package_report
+                    publish_input_path = twbx_path
+                    tableau_extract_report["publish_input_path"] = str(publish_input_path)
+                    pipeline_trace.append("Hyper extract created and TWBX package built")
+                    if requested_format == "twb":
+                        pipeline_trace.append(
+                            "Publish target switched from TWB to TWBX because extract packaging is enabled"
+                        )
+                else:
+                    pipeline_trace.append(
+                        "Hyper extract not created "
+                        f"(status={tableau_extract_report.get('status')}, reason={tableau_extract_report.get('reason')})"
+                    )
+
+                    if twbx_required_for_publish:
+                        try:
+                            twbx_path = output_dir / "converted_report.twbx"
+                            fallback_package_report = build_twbx_package(
+                                twb_path=twb_path,
+                                output_twbx_path=twbx_path,
+                            )
+                            publish_input_path = twbx_path
+                            tableau_extract_report["twbx_package_fallback"] = fallback_package_report
+                            tableau_extract_report["publish_input_path"] = str(publish_input_path)
+                            pipeline_trace.append("Fallback TWBX package built without Hyper extract")
+                        except Exception as fallback_exc:
+                            tableau_extract_report["twbx_fallback_error_type"] = type(fallback_exc).__name__
+                            tableau_extract_report["twbx_fallback_error"] = str(fallback_exc)
+                            pipeline_trace.append(
+                                "Fallback TWBX packaging failed "
+                                f"({type(fallback_exc).__name__}: {fallback_exc})"
+                            )
+            except Exception as exc:
+                tableau_extract_report = {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "publish_input_path": str(publish_input_path),
+                }
+                pipeline_trace.append(
+                    "Hyper extract packaging failed "
+                    f"({type(exc).__name__}: {exc})"
+                )
+
+                if twbx_required_for_publish:
+                    try:
+                        twbx_path = output_dir / "converted_report.twbx"
+                        fallback_package_report = build_twbx_package(
+                            twb_path=twb_path,
+                            output_twbx_path=twbx_path,
+                        )
+                        publish_input_path = twbx_path
+                        tableau_extract_report["twbx_package_fallback"] = fallback_package_report
+                        tableau_extract_report["publish_input_path"] = str(publish_input_path)
+                        pipeline_trace.append("Fallback TWBX package built after Hyper failure")
+                    except Exception as fallback_exc:
+                        tableau_extract_report["twbx_fallback_error_type"] = type(fallback_exc).__name__
+                        tableau_extract_report["twbx_fallback_error"] = str(fallback_exc)
+                        pipeline_trace.append(
+                            "Fallback TWBX packaging failed "
+                            f"({type(fallback_exc).__name__}: {fallback_exc})"
+                        )
+
+                if fail_on_publish_error:
+                    raise
+        elif twbx_required_for_publish:
+            try:
+                twbx_path = output_dir / "converted_report.twbx"
+                fallback_package_report = build_twbx_package(
+                    twb_path=twb_path,
+                    output_twbx_path=twbx_path,
+                )
+                publish_input_path = twbx_path
+                tableau_extract_report = {
+                    "status": "packaged_without_extract",
+                    "reason": "Hyper extract packaging disabled; generated TWBX from TWB",
+                    "twbx_package_fallback": fallback_package_report,
+                    "publish_input_path": str(publish_input_path),
+                }
+                pipeline_trace.append("TWBX package built without Hyper extract")
+            except Exception as exc:
+                tableau_extract_report = {
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "publish_input_path": str(publish_input_path),
+                }
+                pipeline_trace.append(
+                    "TWBX packaging without Hyper failed "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                if fail_on_publish_error:
+                    raise
+
+    publish_status: str | None = None
+    tableau_rpa_report: dict = {
+        "status": "skipped",
+        "reason": "Desktop RPA fallback not triggered",
+        "workbook_path": str(publish_input_path),
+    }
+
+    try:
+        tableau_publish_report = publish_workbook_if_configured(
+            workbook_path=publish_input_path,
+            tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+        )
+        publish_status = tableau_publish_report.get("status")
+        if publish_status == "published":
+            pipeline_trace.append("Tableau Server publish succeeded")
+        elif publish_status == "skipped":
+            pipeline_trace.append("Tableau Server publish skipped")
+        elif publish_status == "manual_upload_required":
+            pipeline_trace.append("Tableau Public manual upload required")
+        else:
+            pipeline_trace.append(f"Tableau Server publish status: {publish_status}")
+    except Exception as exc:
+        tableau_publish_report = {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "workbook_path": str(publish_input_path),
+        }
+        publish_status = "failed"
+        pipeline_trace.append(
+            "Tableau Server publish failed "
+            f"({type(exc).__name__}: {exc})"
+        )
+        if fail_on_publish_error:
+            raise
+
+    run_rpa, rpa_reason = _should_run_desktop_rpa(
+        tableau_cfg=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+        publish_status=publish_status if isinstance(publish_status, str) else None,
+        workbook_path=publish_input_path,
+    )
+    if run_rpa:
+        tableau_rpa_report = _run_desktop_rpa_publish(
+            workbook_path=publish_input_path,
+            tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+        )
+        tableau_publish_report["desktop_rpa_attempted"] = True
+        tableau_publish_report["desktop_rpa_reason"] = "triggered"
+        tableau_publish_report["desktop_rpa_status"] = tableau_rpa_report.get("status")
+        if tableau_rpa_report.get("status") == "published":
+            tableau_publish_report["rest_status"] = publish_status
+            tableau_publish_report["status"] = "published"
+            tableau_publish_report["publish_channel"] = "desktop_rpa"
+            pipeline_trace.append("Tableau Public publish succeeded via Desktop RPA")
+        else:
+            pipeline_trace.append(
+                "Tableau Public Desktop RPA attempted "
+                f"(status={tableau_rpa_report.get('status')}, reason={tableau_rpa_report.get('reason')})"
+            )
+    else:
+        tableau_rpa_report["reason"] = rpa_reason
+        tableau_publish_report["desktop_rpa_attempted"] = False
+        tableau_publish_report["desktop_rpa_reason"] = rpa_reason
+
+    _write_json(output_dir / "tableau_extract_report.json", tableau_extract_report)
+    _write_json(output_dir / "tableau_publish_report.json", tableau_publish_report)
+    _write_json(output_dir / "tableau_rpa_publish_report.json", tableau_rpa_report)
     _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
 
-    return {
+    result = {
         "parsed_rdl": str(output_dir / "parsed_rdl.json"),
         "data_model": str(output_dir / "data_model.json"),
         "visual_model": str(output_dir / "visual_model.json"),
@@ -144,8 +365,20 @@ def run_conversion(
         "db_catalog": str(output_dir / "db_catalog.json"),
         "generated_xml": str(output_dir / "generated_workbook.xml"),
         "twb": str(twb_path),
+        "tableau_extract_report": str(output_dir / "tableau_extract_report.json"),
+        "tableau_publish_report": str(output_dir / "tableau_publish_report.json"),
+        "tableau_rpa_publish_report": str(output_dir / "tableau_rpa_publish_report.json"),
         "pipeline_trace": str(output_dir / "pipeline_trace.json"),
     }
+
+    if publish_input_path.suffix.lower() == ".twbx" and publish_input_path.exists():
+        result["twbx"] = str(publish_input_path)
+
+    extract_hyper_path = tableau_extract_report.get("hyper_path") if isinstance(tableau_extract_report, dict) else None
+    if isinstance(extract_hyper_path, str) and extract_hyper_path:
+        result["hyper"] = extract_hyper_path
+
+    return result
 
 
 def _build_deterministic_seed_twb_xml(data_model: dict, visual_model: dict) -> str:
@@ -227,6 +460,197 @@ def _load_config(config_path: str | Path) -> dict:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _safe_positive_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _should_run_desktop_rpa(
+    tableau_cfg: dict | None,
+    publish_status: str | None,
+    workbook_path: Path,
+) -> tuple[bool, str]:
+    if not isinstance(tableau_cfg, dict) or not bool(tableau_cfg.get("enabled", False)):
+        return False, "tableau_server publishing is disabled"
+
+    if not bool(tableau_cfg.get("desktop_rpa_enabled", False)):
+        return False, "tableau_server.desktop_rpa_enabled is false"
+
+    server_url = str(tableau_cfg.get("server_url") or "").strip().lower()
+    if "public.tableau.com" not in server_url:
+        return False, "desktop RPA fallback is only enabled for Tableau Public"
+
+    normalized_status = str(publish_status or "").strip().lower()
+    if normalized_status not in {"manual_upload_required", "failed", "unsupported_file_type"}:
+        return False, f"publish status does not trigger desktop RPA ({normalized_status or 'unknown'})"
+
+    if workbook_path.suffix.lower() != ".twbx":
+        return False, "desktop RPA requires a .twbx artifact"
+
+    if not workbook_path.exists():
+        return False, f"desktop RPA input file not found: {workbook_path}"
+
+    return True, "triggered"
+
+
+def _run_desktop_rpa_publish(workbook_path: Path, tableau_config: dict | None) -> dict:
+    if not isinstance(tableau_config, dict):
+        return {
+            "status": "skipped",
+            "reason": "tableau configuration is not available",
+            "workbook_path": str(workbook_path),
+        }
+
+    project_root = Path(__file__).resolve().parents[2]
+    script_path = project_root / "scripts" / "publish_tableau_public_desktop_rpa.py"
+    if not script_path.exists():
+        return {
+            "status": "failed",
+            "reason": "Desktop RPA script was not found",
+            "script_path": str(script_path),
+            "workbook_path": str(workbook_path),
+        }
+
+    timeout_seconds = _safe_positive_int(tableau_config.get("desktop_rpa_timeout_seconds")) or 180
+    publish_wait_seconds = _safe_positive_int(tableau_config.get("desktop_rpa_publish_wait_seconds")) or 240
+    launch_settle_seconds = _safe_positive_int(tableau_config.get("desktop_rpa_launch_settle_seconds")) or 4
+    process_timeout_seconds = timeout_seconds * 4 + publish_wait_seconds + launch_settle_seconds + 30
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--twbx",
+        str(workbook_path),
+        "--timeout-seconds",
+        str(timeout_seconds),
+        "--publish-wait-seconds",
+        str(publish_wait_seconds),
+        "--launch-settle-seconds",
+        str(launch_settle_seconds),
+    ]
+
+    workbook_name = str(tableau_config.get("workbook_name") or "").strip()
+    if workbook_name:
+        cmd.extend(["--workbook-name", workbook_name])
+
+    tableau_exe = _resolve_config_secret(
+        tableau_config.get("desktop_rpa_tableau_exe"),
+        fallback_env="TABLEAU_PUBLIC_EXE",
+    )
+    if tableau_exe:
+        cmd.extend(["--tableau-exe", tableau_exe])
+
+    env = os.environ.copy()
+    email = _resolve_config_secret(
+        tableau_config.get("desktop_rpa_email"),
+        fallback_env="TABLEAU_EMAIL",
+    ) or _resolve_config_secret(tableau_config.get("username"), fallback_env="TABLEAU_USERNAME")
+    password = _resolve_config_secret(
+        tableau_config.get("desktop_rpa_password"),
+        fallback_env="TABLEAU_PASSWORD",
+    ) or _resolve_config_secret(tableau_config.get("password"), fallback_env="TABLEAU_PASSWORD")
+
+    if email:
+        env["TABLEAU_EMAIL"] = email
+    if password:
+        env["TABLEAU_PASSWORD"] = password
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(project_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=process_timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "failed",
+            "reason": "Desktop RPA process timed out",
+            "timeout_seconds": process_timeout_seconds,
+            "script_path": str(script_path),
+            "workbook_path": str(workbook_path),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": f"Desktop RPA process launch failed: {type(exc).__name__}: {exc}",
+            "script_path": str(script_path),
+            "workbook_path": str(workbook_path),
+        }
+
+    payload: dict | None = None
+    stdout_text = completed.stdout.strip()
+    if stdout_text:
+        try:
+            payload_candidate = json.loads(stdout_text)
+            if isinstance(payload_candidate, dict):
+                payload = payload_candidate
+        except Exception:
+            payload = None
+
+    rpa_result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(rpa_result, dict):
+        rpa_result = {}
+
+    status = rpa_result.get("status") if isinstance(rpa_result.get("status"), str) else None
+    report: dict = {
+        "status": status or ("failed" if completed.returncode != 0 else "unknown"),
+        "return_code": completed.returncode,
+        "workbook_path": str(workbook_path),
+        "script_path": str(script_path),
+        "timeout_seconds": process_timeout_seconds,
+    }
+
+    if isinstance(rpa_result.get("message"), str) and rpa_result.get("message"):
+        report["message"] = rpa_result.get("message")
+
+    if isinstance(rpa_result.get("reason"), str) and rpa_result.get("reason"):
+        report["reason"] = rpa_result.get("reason")
+
+    if isinstance(rpa_result.get("visible_windows"), list):
+        report["visible_windows"] = rpa_result.get("visible_windows")
+
+    if completed.stderr and completed.stderr.strip():
+        report["stderr"] = completed.stderr.strip()[:4000]
+
+    if isinstance(payload, dict):
+        report["payload"] = payload
+    elif stdout_text:
+        report["stdout"] = stdout_text[:4000]
+
+    return report
+
+
+def _resolve_config_secret(value: object, fallback_env: str) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            if stripped.lower().startswith("env:"):
+                env_name = stripped.split(":", 1)[1].strip()
+                if not env_name:
+                    return None
+                env_value = os.getenv(env_name)
+                if isinstance(env_value, str) and env_value.strip():
+                    return env_value.strip()
+                return None
+            return stripped
+
+    env_fallback = os.getenv(fallback_env)
+    if isinstance(env_fallback, str) and env_fallback.strip():
+        return env_fallback.strip()
+    return None
 
 
 def _validate_and_repair_loop(

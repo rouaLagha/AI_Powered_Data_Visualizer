@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 
 import streamlit as st
@@ -10,6 +12,9 @@ from src.rdl_to_twb.pipeline import run_conversion
 
 
 ROOT_DIR = Path(__file__).resolve().parent
+EXPECTED_PYTHON = ROOT_DIR / ".venv" / ("Scripts" if os.name == "nt" else "bin") / (
+    "python.exe" if os.name == "nt" else "python"
+)
 RDL_XSD_PATH = ROOT_DIR / "ReportDefinition.xsd"
 TWB_XSD_PATH = ROOT_DIR / "twb_2026.1.0.xsd"
 LOCAL_CONFIG_PATH = ROOT_DIR / "config" / "llm_config.json"
@@ -18,10 +23,35 @@ DEFAULT_CONFIG_PATH = (
 )
 
 
+def _enforce_expected_interpreter() -> None:
+    if not EXPECTED_PYTHON.exists():
+        return
+
+    current_python = Path(sys.executable).resolve()
+    expected_python = EXPECTED_PYTHON.resolve()
+    if current_python == expected_python:
+        return
+
+    st.error("Wrong Python interpreter detected for this workspace.")
+    st.code(
+        "\n".join(
+            [
+                f"Current:  {current_python}",
+                f"Expected: {expected_python}",
+                "",
+                "Start Streamlit with:",
+                f"{expected_python} -m streamlit run streamlit_app.py",
+            ]
+        )
+    )
+    st.stop()
+
+
 def main() -> None:
     st.set_page_config(page_title="RDL to TWB", page_icon="📊", layout="centered")
     st.title("RDL -> TWB Converter")
     st.caption("Simple interface to run the LLM multi-agent conversion pipeline")
+    _enforce_expected_interpreter()
 
     uploaded_file = st.file_uploader("Upload .rdl file", type=["rdl"])
 
@@ -83,6 +113,11 @@ def main() -> None:
             "agent1_raw_response",
             "generated_xml",
             "twb",
+            "hyper",
+            "twbx",
+            "tableau_extract_report",
+            "tableau_publish_report",
+            "tableau_rpa_publish_report",
             "pipeline_trace",
         ]
         for label in file_keys:
