@@ -11,6 +11,7 @@ from .models import ParsedDataSet, ParsedDataSource, ParsedField, ParsedReport, 
 FIELD_EXPR_RE = re.compile(r"Fields!([A-Za-z0-9_]+)\.Value", re.IGNORECASE)
 PARAM_EXPR_RE = re.compile(r"Parameters!([A-Za-z0-9_]+)\.Value", re.IGNORECASE)
 DATASET_EXPR_RE = re.compile(r"DataSetName\s*=\s*\"([^\"]+)\"", re.IGNORECASE)
+AGG_EXPR_RE = re.compile(r"\b(sum|avg|average|count|min|max|format|iif)\s*\(", re.IGNORECASE)
 
 
 def _ns_uri(root_tag: str) -> str:
@@ -609,8 +610,12 @@ def _extract_visual_properties(
     ns: str,
     visual_type: str,
     expressions: list[str],
+    container_section: str = "",
 ) -> dict[str, Any]:
     properties: dict[str, Any] = {}
+
+    if isinstance(container_section, str) and container_section.strip():
+        properties["container_section"] = container_section.strip()
 
     filters = _extract_filters(node, ns)
     if filters:
@@ -636,11 +641,41 @@ def _extract_visual_properties(
         text_values = _extract_textbox_values(node, ns)
         if text_values:
             properties["text_values"] = text_values
+        if _looks_kpi_textbox(expressions, text_values):
+            properties["semantic_hint"] = "kpi"
 
     if visual_type == "Tablix":
         tablix_details = _extract_tablix_details(node, ns)
         if tablix_details:
             properties["tablix"] = tablix_details
+
+    if visual_type == "GaugePanel":
+        gauge_value_expressions: list[str] = []
+        for value_node in _findall_by_local(node, "Value"):
+            if value_node.text is None:
+                continue
+            text = value_node.text.strip()
+            if text and _looks_like_expression(text):
+                gauge_value_expressions.append(text)
+        if gauge_value_expressions:
+            properties["gauge"] = {
+                "value_expressions": _unique_ordered(gauge_value_expressions),
+            }
+
+    if visual_type == "Image":
+        image_source = _text(node, _qn(ns, "Source")) or _find_first_text_by_local(node, {"Source"})
+        image_value = _text(node, _qn(ns, "Value")) or _find_first_text_by_local(node, {"Value"})
+        mime_type = _text(node, _qn(ns, "MIMEType")) or _find_first_text_by_local(node, {"MIMEType"})
+        sizing = _text(node, _qn(ns, "Sizing")) or _find_first_text_by_local(node, {"Sizing"})
+        image_payload = {
+            "source": image_source,
+            "value": image_value,
+            "mime_type": mime_type,
+            "sizing": sizing,
+        }
+        image_payload = {k: v for k, v in image_payload.items() if v not in (None, "")}
+        if image_payload:
+            properties["image"] = image_payload
 
     if visual_type in {"Chart", "Pie", "Doughnut", "Line", "Area", "Bar", "Scatter", "Shape"}:
         chart_details = _extract_chart_details(node, ns, visual_type)
@@ -650,10 +685,105 @@ def _extract_visual_properties(
     return properties
 
 
+def _looks_kpi_textbox(expressions: list[str], text_values: list[str]) -> bool:
+    if not isinstance(expressions, list):
+        expressions = []
+    if not isinstance(text_values, list):
+        text_values = []
+
+    if any(AGG_EXPR_RE.search(expr or "") for expr in expressions):
+        return True
+
+    if any(FIELD_EXPR_RE.search(expr or "") for expr in expressions):
+        hint_blob = " ".join(expressions + text_values).lower()
+        if any(token in hint_blob for token in ["sales", "quota", "amount", "kpi", "target", "variance", "quantity", "%"]):
+            return True
+
+    for value in text_values:
+        if not isinstance(value, str):
+            continue
+        if AGG_EXPR_RE.search(value) or FIELD_EXPR_RE.search(value):
+            return True
+
+    return False
+
+
+def _extract_embedded_visuals(
+    node: ET.Element,
+    ns: str,
+    supported: set[str],
+    allowed_visual_types: set[str] | None,
+    container_section: str,
+    parent_dataset_name: str | None,
+    parent_visual_name: str,
+) -> list[ParsedVisual]:
+    descendant_supported = {"Textbox", "Chart", "GaugePanel", "Image", "Map", "Line"}
+    descendant_supported = descendant_supported.intersection(supported)
+    if allowed_visual_types:
+        descendant_supported = descendant_supported.intersection(allowed_visual_types)
+    if not descendant_supported:
+        return []
+
+    visuals: list[ParsedVisual] = []
+    seen_names: dict[str, int] = {}
+
+    for element in node.iter():
+        if element is node:
+            continue
+
+        local = _local_name(element.tag)
+        if local not in descendant_supported:
+            continue
+
+        expressions = _collect_expressions(element)
+        if local == "Textbox":
+            text_values = _extract_textbox_values(element, ns)
+            if not _looks_kpi_textbox(expressions, text_values):
+                continue
+
+        child_name = element.attrib.get("Name") if isinstance(element.attrib.get("Name"), str) else ""
+        base_name = f"{parent_visual_name}_{child_name.strip() or local}".strip("_")
+        if not base_name:
+            base_name = f"{parent_visual_name}_{local}"
+        lower = base_name.lower()
+        seen_names[lower] = seen_names.get(lower, 0) + 1
+        resolved_name = base_name if seen_names[lower] == 1 else f"{base_name}_{seen_names[lower]}"
+
+        visual_type = local
+        if local == "Chart":
+            chart_subtype = _extract_chart_subtype(element)
+            if chart_subtype:
+                visual_type = chart_subtype
+
+        properties = _extract_visual_properties(
+            element,
+            ns,
+            visual_type,
+            expressions,
+            container_section=container_section,
+        )
+        properties["embedded_parent"] = parent_visual_name
+
+        visuals.append(
+            ParsedVisual(
+                name=resolved_name,
+                visual_type=visual_type,
+                dataset_name=_extract_dataset_name(element, ns) or parent_dataset_name,
+                expressions=expressions,
+                layout=_extract_layout(element, ns),
+                properties=properties,
+            )
+        )
+
+    return visuals
+
+
 def _parse_report_items(
     items_node: ET.Element,
     ns: str,
     allowed_visual_types: set[str] | None = None,
+    container_section: str = "Body",
+    parent_dataset_name: str | None = None,
 ) -> list[ParsedVisual]:
     visuals: list[ParsedVisual] = []
     default_supported = {
@@ -679,14 +809,31 @@ def _parse_report_items(
             if chart_subtype:
                 visual_type = chart_subtype
 
+        source_name = child.attrib.get("Name", local)
+        visual_name = source_name if isinstance(source_name, str) and source_name.strip() else local
+        section_prefix = container_section.strip()
+        if section_prefix and section_prefix.lower() != "body":
+            visual_name = f"{section_prefix}_{visual_name}"
+
         expressions = _collect_expressions(child)
+        dataset_name = _extract_dataset_name(child, ns) or parent_dataset_name
+        properties = _extract_visual_properties(
+            child,
+            ns,
+            visual_type,
+            expressions,
+            container_section=container_section,
+        )
+        if isinstance(source_name, str) and source_name.strip() and source_name.strip() != visual_name:
+            properties["source_name"] = source_name.strip()
+
         visual = ParsedVisual(
-            name=child.attrib.get("Name", local),
+            name=visual_name,
             visual_type=visual_type,
-            dataset_name=_extract_dataset_name(child, ns),
+            dataset_name=dataset_name,
             expressions=expressions,
             layout=_extract_layout(child, ns),
-            properties=_extract_visual_properties(child, ns, visual_type, expressions),
+            properties=properties,
         )
 
         nested_items = child.find(_qn(ns, "ReportItems"))
@@ -697,7 +844,29 @@ def _parse_report_items(
                 nested_items,
                 ns,
                 allowed_visual_types=allowed_visual_types,
+                container_section=container_section,
+                parent_dataset_name=dataset_name,
             )
+
+        if local in {"Tablix", "Rectangle"}:
+            embedded_visuals = _extract_embedded_visuals(
+                node=child,
+                ns=ns,
+                supported=supported,
+                allowed_visual_types=allowed_visual_types,
+                container_section=container_section,
+                parent_dataset_name=dataset_name,
+                parent_visual_name=visual_name,
+            )
+            if embedded_visuals:
+                existing = {c.name.strip().lower() for c in visual.children if isinstance(c.name, str)}
+                for child_visual in embedded_visuals:
+                    key = child_visual.name.strip().lower() if isinstance(child_visual.name, str) else ""
+                    if key and key in existing:
+                        continue
+                    if key:
+                        existing.add(key)
+                    visual.children.append(child_visual)
 
         visuals.append(visual)
 
@@ -799,14 +968,46 @@ def parse_rdl_file(
 
     # Visuals from all report sections and nested containers.
     visuals: list[ParsedVisual] = []
-    for body_items in root.findall(f".//{_qn(ns, 'Body')}/{_qn(ns, 'ReportItems')}"):
+    body_items_nodes = root.findall(f".//{_qn(ns, 'Body')}/{_qn(ns, 'ReportItems')}")
+    if not body_items_nodes:
+        for body_node in _findall_by_local(root, "Body"):
+            body_items = body_node.find(_qn(ns, "ReportItems"))
+            if body_items is None:
+                body_items = next(iter(_find_children_by_local(body_node, "ReportItems")), None)
+            if body_items is not None:
+                body_items_nodes.append(body_items)
+
+    for body_items in body_items_nodes:
         visuals.extend(
             _parse_report_items(
                 body_items,
                 ns,
                 allowed_visual_types=allowed_visual_types,
+                container_section="Body",
             )
         )
+
+    for section_local in ["PageHeader", "PageFooter"]:
+        section_nodes = root.findall(f".//{_qn(ns, section_local)}")
+        if not section_nodes:
+            section_nodes = _findall_by_local(root, section_local)
+
+        for section_node in section_nodes:
+            section_items = section_node.find(_qn(ns, "ReportItems"))
+            if section_items is None:
+                section_items = next(iter(_find_children_by_local(section_node, "ReportItems")), None)
+            if section_items is None:
+                continue
+
+            visuals.extend(
+                _parse_report_items(
+                    section_items,
+                    ns,
+                    allowed_visual_types=allowed_visual_types,
+                    container_section=section_local,
+                )
+            )
+
     report.visuals = visuals
 
     # Report-level metadata.

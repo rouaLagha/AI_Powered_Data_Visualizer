@@ -9,6 +9,7 @@ from .prompts import SEMANTIC_SYSTEM_PROMPT, build_semantic_user_prompt
 
 
 FIELD_EXPR_RE = re.compile(r"Fields!([A-Za-z0-9_]+)\.Value", re.IGNORECASE)
+PARAM_EXPR_RE = re.compile(r"Parameters!([A-Za-z0-9_]+)\.Value", re.IGNORECASE)
 
 
 def generate_semantic_models(
@@ -246,6 +247,9 @@ def _build_deterministic_semantic_payload(parsed_rdl: dict) -> dict:
                 "name": dataset_name,
                 "data_source_name": ds.get("data_source_name"),
                 "query": ds.get("query"),
+                "query_parameters": _as_list(ds.get("query_parameters")),
+                "filters": _as_list(ds.get("filters")),
+                "sort_expressions": _as_list(ds.get("sort_expressions")),
             }
         )
         for field in _as_list(ds.get("fields")):
@@ -321,14 +325,15 @@ def _build_deterministic_semantic_payload(parsed_rdl: dict) -> dict:
         pname = p.get("name")
         if not isinstance(pname, str) or not pname.strip():
             continue
-        used_in_datasets = _datasets_using_parameter(pname, data_sets)
-        if used_in_datasets:
-            parameter_usage.append(
-                {
-                    "parameter_name": pname,
-                    "dataset_names": used_in_datasets,
-                }
-            )
+        used_in_datasets, filtered_fields = _datasets_using_parameter(pname, data_sets)
+        if used_in_datasets or filtered_fields:
+            payload = {
+                "parameter_name": pname,
+                "dataset_names": used_in_datasets,
+            }
+            if filtered_fields:
+                payload["fields"] = filtered_fields
+            parameter_usage.append(payload)
 
     return {
         "data_model": {
@@ -368,13 +373,42 @@ def _flatten_visuals(visuals: list) -> list[dict]:
 
 def _extract_visual_field_refs(visual: dict) -> list[str]:
     refs: list[str] = []
+
+    def _add_field(field_name: str) -> None:
+        clean = field_name.strip()
+        if clean and clean not in refs:
+            refs.append(clean)
+
     for expr in _as_list(visual.get("expressions")):
         if not isinstance(expr, str):
             continue
         for match in FIELD_EXPR_RE.finditer(expr):
-            name = match.group(1)
-            if name not in refs:
-                refs.append(name)
+            _add_field(match.group(1))
+
+    properties = visual.get("properties") if isinstance(visual.get("properties"), dict) else {}
+    for field_name in _as_list(properties.get("field_references")):
+        if isinstance(field_name, str):
+            _add_field(field_name)
+
+    for filter_entry in _as_list(properties.get("filters")):
+        if not isinstance(filter_entry, dict):
+            continue
+        for candidate in [
+            filter_entry.get("expression"),
+            *(_as_list(filter_entry.get("values"))),
+        ]:
+            if not isinstance(candidate, str):
+                continue
+            for match in FIELD_EXPR_RE.finditer(candidate):
+                _add_field(match.group(1))
+
+    tablix = properties.get("tablix") if isinstance(properties.get("tablix"), dict) else {}
+    for cell_expr in _as_list(tablix.get("cell_expressions")):
+        if not isinstance(cell_expr, str):
+            continue
+        for match in FIELD_EXPR_RE.finditer(cell_expr):
+            _add_field(match.group(1))
+
     return refs
 
 
@@ -415,20 +449,75 @@ def _infer_visual_dataset_name(visual: dict, data_sets: list[dict]) -> str | Non
     return None
 
 
-def _datasets_using_parameter(parameter_name: str, data_sets: list[dict]) -> list[str]:
-    token = f"@{parameter_name}"
+def _datasets_using_parameter(parameter_name: str, data_sets: list[dict]) -> tuple[list[str], list[str]]:
+    token = f"@{parameter_name}".lower()
+    param_token = parameter_name.strip().lower()
     result: list[str] = []
+    filtered_fields: list[str] = []
+
+    def _add_field_from_text(text: str) -> None:
+        for match in FIELD_EXPR_RE.finditer(text):
+            name = match.group(1).strip()
+            if name and name not in filtered_fields:
+                filtered_fields.append(name)
+
     for ds in data_sets:
         if not isinstance(ds, dict):
             continue
+
+        used_here = False
+
         query = ds.get("query")
-        if not isinstance(query, str):
-            continue
-        if token.lower() in query.lower():
+        if isinstance(query, str) and token in query.lower():
+            used_here = True
+
+        for query_parameter in _as_list(ds.get("query_parameters")):
+            if not isinstance(query_parameter, dict):
+                continue
+            value = query_parameter.get("value")
+            if isinstance(value, str) and token in value.lower():
+                used_here = True
+            for pref in _as_list(query_parameter.get("parameter_references")):
+                if isinstance(pref, str) and pref.strip().lower() == param_token:
+                    used_here = True
+
+        for filter_entry in _as_list(ds.get("filters")):
+            if not isinstance(filter_entry, dict):
+                continue
+
+            filter_param_refs = _as_list(filter_entry.get("parameter_references"))
+            if any(isinstance(pref, str) and pref.strip().lower() == param_token for pref in filter_param_refs):
+                used_here = True
+                expression = filter_entry.get("expression")
+                if isinstance(expression, str):
+                    _add_field_from_text(expression)
+                for val in _as_list(filter_entry.get("values")):
+                    if isinstance(val, str):
+                        _add_field_from_text(val)
+
+            expression_text = filter_entry.get("expression")
+            if isinstance(expression_text, str):
+                for pref in PARAM_EXPR_RE.finditer(expression_text):
+                    if pref.group(1).strip().lower() == param_token:
+                        used_here = True
+                        _add_field_from_text(expression_text)
+
+            for filter_value in _as_list(filter_entry.get("values")):
+                if not isinstance(filter_value, str):
+                    continue
+                if token in filter_value.lower():
+                    used_here = True
+                    _add_field_from_text(filter_value)
+                for pref in PARAM_EXPR_RE.finditer(filter_value):
+                    if pref.group(1).strip().lower() == param_token:
+                        used_here = True
+                        _add_field_from_text(filter_value)
+
+        if used_here:
             dname = ds.get("name")
             if isinstance(dname, str) and dname.strip():
                 result.append(dname.strip())
-    return result
+    return result, filtered_fields
 
 
 def _as_list(value) -> list:

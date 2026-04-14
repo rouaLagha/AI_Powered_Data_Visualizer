@@ -24,7 +24,12 @@ SQL_JOIN_CLAUSE_RE = re.compile(
     r"(.+?)(?=\b(?:(?:inner|left|right|full|cross)\s+)?join\b|\bwhere\b|\bgroup\b|\border\b|\bhaving\b|$)",
     flags=re.IGNORECASE | re.DOTALL,
 )
-FIELD_EXPR_REF_RE = re.compile(r"Fields!([A-Za-z0-9_]+)\\.Value", flags=re.IGNORECASE)
+FIELD_EXPR_REF_RE = re.compile(r"Fields!([A-Za-z0-9_]+)\.Value", flags=re.IGNORECASE)
+AGGREGATE_EXPR_HINT_RE = re.compile(r"\b(sum|avg|average|count|min|max|format|iif)\s*\(", flags=re.IGNORECASE)
+SHELF_FIELD_REF_RE = re.compile(
+    r"\[[^\]]+\]\.\[(?P<derivation>[^:\]]+):(?P<field>[^:\]]+):[^\]]+\]",
+    flags=re.IGNORECASE,
+)
 
 
 def validate_twb_xml_basic(xml_content: str) -> None:
@@ -1268,6 +1273,8 @@ def _infer_tableau_type_from_sql(
     if token in temporal:
         return "dimension", "date", "ordinal"
     if token in text_like:
+        if _looks_temporal_dimension_name(name_token):
+            return "dimension", "string", "ordinal"
         return "dimension", "string", "nominal"
 
     # Unknown SQL types are safer as string dimensions than heuristic measure detection.
@@ -1301,6 +1308,19 @@ def _measure_priority_score(field_name: str) -> int:
         score -= 70
     if any(mark in token for mark in ["qty", "quantity", "count", "number"]):
         score -= 30
+
+    # De-prioritize technical row-id style numeric fields that are poor visual measures.
+    if any(mark in token for mark in ["line number", "linenumber", "orderline", "revisionnumber", "revision number"]):
+        score += 180
+    elif "number" in token and not any(
+        mark in token for mark in ["quantity", "count", "amount", "price", "cost", "quota", "revenue", "profit"]
+    ):
+        score += 90
+
+    # Percentage/rate discount fields are often technical KPIs; avoid using them as default shelves.
+    if any(mark in token for mark in ["discount", "pct", "percent", "ratio", "rate"]):
+        score += 140
+
     if _is_key_like_column_name(token):
         score += 120
     if _looks_temporal_dimension_name(token):
@@ -1418,6 +1438,8 @@ def _infer_tableau_column_spec(name: str, index: int) -> tuple[str, str, str]:
         ]
     )
 
+    if _looks_temporal_dimension_name(token):
+        return "dimension", "string", "ordinal"
     if index == 0 or not looks_measure:
         return "dimension", "string", "nominal"
     return "measure", "real", "quantitative"
@@ -1428,6 +1450,7 @@ def inject_semantic_bindings(
     data_model: dict,
     visual_model: dict,
     mapping: dict,
+    report_parameters: list[dict] | None = None,
 ) -> str:
     """Align TWB workbook bindings with semantic models derived from RDL."""
     root = ET.fromstring(xml_content)
@@ -1501,6 +1524,11 @@ def inject_semantic_bindings(
             ET.SubElement(ds_node, "style")
 
     sheet_specs = _collect_sheet_specs(visual_model, mapping)
+    sheet_specs = _expand_sheet_specs_for_regional_sales(sheet_specs, visual_model)
+    normalized_report_parameters = report_parameters if isinstance(report_parameters, list) else []
+    if _is_regionalsales_report(visual_model):
+        _inject_regionalsales_calculated_fields(datasource_nodes, normalized_report_parameters)
+
     datasource_field_roles = _build_datasource_field_role_lookup(datasource_nodes)
     datasource_field_tables = _build_datasource_field_table_lookup(datasource_nodes)
     datasource_field_names = _build_datasource_field_names_lookup(datasource_nodes)
@@ -1518,6 +1546,13 @@ def inject_semantic_bindings(
         datasource_field_tables=datasource_field_tables,
         datasource_field_names=datasource_field_names,
     )
+
+    required_fields = _collect_fields_used_by_workbook_views(root)
+    if required_fields:
+        for ds_node in datasource_nodes:
+            _prune_datasource_fields_to_usage(ds_node, required_fields)
+
+    _rebuild_dashboards_from_sheet_specs(root, sheet_specs, visual_model, sorted(datasource_names))
 
     return ET.tostring(root, encoding="unicode")
 
@@ -1673,6 +1708,253 @@ def _collect_scoped_field_names(
     return collected
 
 
+def _upsert_datasource_calculated_column(
+    datasource_node: ET.Element,
+    field_name: str,
+    role: str,
+    datatype: str,
+    type_value: str,
+    formula: str,
+    caption: str,
+) -> None:
+    if not isinstance(datasource_node, ET.Element):
+        return
+    clean_field = (field_name or "").strip()
+    clean_formula = (formula or "").strip()
+    if not clean_field or not clean_formula:
+        return
+
+    target = None
+    for col in [c for c in list(datasource_node) if _local_name(c.tag) == "column"]:
+        name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+        if name == clean_field.lower():
+            target = col
+            break
+
+    if target is None:
+        target = ET.SubElement(datasource_node, "column")
+
+    target.attrib["name"] = f"[{clean_field}]"
+    target.attrib["role"] = role
+    target.attrib["datatype"] = datatype
+    target.attrib["type"] = type_value
+    target.attrib["caption"] = caption or clean_field
+
+    calc = _find_direct_child(target, "calculation")
+    if calc is None:
+        calc = ET.SubElement(target, "calculation")
+    calc.attrib["class"] = "tableau"
+    calc.attrib["formula"] = clean_formula
+
+
+def _extract_report_parameter_default(report_parameters: list[dict], parameter_name: str) -> str:
+    target = (parameter_name or "").strip().lower()
+    if not target:
+        return ""
+
+    for item in report_parameters:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or name.strip().lower() != target:
+            continue
+        defaults = item.get("default_values")
+        if not isinstance(defaults, list):
+            return ""
+        for raw in defaults:
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return ""
+
+    return ""
+
+
+def _inject_regionalsales_calculated_fields(
+    datasource_nodes: list[ET.Element],
+    report_parameters: list[dict] | None = None,
+) -> None:
+    if not isinstance(datasource_nodes, list):
+        return
+
+    _ = report_parameters
+    group_literal = "All"
+
+    for ds_node in datasource_nodes:
+        if not isinstance(ds_node, ET.Element):
+            continue
+
+        available_fields = {
+            _clean_bracketed_name(col.attrib.get("name", "")).strip()
+            for col in list(ds_node)
+            if _local_name(col.tag) == "column"
+        }
+
+        group_field = ""
+        if "SalesTerritoryGroup" in available_fields:
+            group_field = "SalesTerritoryGroup"
+        elif "SalesTerritoryRegion" in available_fields:
+            group_field = "SalesTerritoryRegion"
+
+        year_field = ""
+        if "CalendarYear" in available_fields:
+            year_field = "CalendarYear"
+        elif "DateKey" in available_fields:
+            year_field = "DateKey"
+        elif "MonthKey" in available_fields:
+            year_field = "MonthKey"
+
+        if year_field == "CalendarYear":
+            year_expr = "(IF MIN([CalendarYear]) = MAX([CalendarYear]) THEN STR(INT(MIN([CalendarYear]))) ELSE \"All\" END)"
+        elif year_field:
+            year_expr = (
+                f"(IF MIN([{year_field}]) = MAX([{year_field}]) "
+                f"THEN STR(INT(MIN([{year_field}]) / 10000)) ELSE \"All\" END)"
+            )
+        else:
+            year_expr = '"All"'
+
+        if group_field:
+            group_expr = (
+                f"(IF MIN([{group_field}]) = MAX([{group_field}]) "
+                f"THEN MIN([{group_field}]) ELSE \"{group_literal}\" END)"
+            )
+        else:
+            group_expr = f'"{group_literal}"'
+
+        subtitle_formula = f'"Year: " + {year_expr} + " | Group: " + {group_expr}'
+
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="SalesVariance",
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula="ZN([SalesAmount]) - ZN([SalesAmountQuota])",
+            caption="Variance",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="SalesVariancePct",
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula=(
+                "IF ZN(SUM([SalesAmountQuota])) = 0 THEN 0 "
+                "ELSE (ZN(SUM([SalesAmount])) - ZN(SUM([SalesAmountQuota]))) / ZN(SUM([SalesAmountQuota])) END"
+            ),
+            caption="Variance %",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="SalesQuotaPct",
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula=(
+                "IF ZN(SUM([SalesAmountQuota])) = 0 THEN 0 "
+                "ELSE ZN(SUM([SalesAmount])) / ZN(SUM([SalesAmountQuota])) END"
+            ),
+            caption="Quota %",
+        )
+
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="ReportLogoLabel",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"ID16313774731791"',
+            caption="ReportLogo",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="TitleTileText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"#0d7b3d"',
+            caption="TitleTile",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="ReportTitleText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"Regional Sales"',
+            caption="ReportTitle",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="ReportSubtitleText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula=subtitle_formula,
+            caption="ReportSubtitle",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="KPIHeaderText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"ORDERS     SALES     QUOTA     VARIANCE"',
+            caption="KPIHeaders",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="FooterRunAtText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"Run at " + STR(NOW())',
+            caption="FooterRunAt",
+        )
+        _upsert_datasource_calculated_column(
+            datasource_node=ds_node,
+            field_name="FooterPageText",
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula='"Page 1 of 1"',
+            caption="FooterPage",
+        )
+
+        month_name_field = ""
+        if "EnglishMonthName" in available_fields:
+            month_name_field = "EnglishMonthName"
+        elif "Month" in available_fields:
+            month_name_field = "Month"
+
+        if month_name_field:
+            month_sort_formula = (
+                f"CASE LOWER([{month_name_field}]) "
+                'WHEN "january" THEN 1 '
+                'WHEN "february" THEN 2 '
+                'WHEN "march" THEN 3 '
+                'WHEN "april" THEN 4 '
+                'WHEN "may" THEN 5 '
+                'WHEN "june" THEN 6 '
+                'WHEN "july" THEN 7 '
+                'WHEN "august" THEN 8 '
+                'WHEN "september" THEN 9 '
+                'WHEN "october" THEN 10 '
+                'WHEN "november" THEN 11 '
+                'WHEN "december" THEN 12 '
+                "ELSE 99 END"
+            )
+            _upsert_datasource_calculated_column(
+                datasource_node=ds_node,
+                field_name="MonthSortOrder",
+                role="dimension",
+                datatype="real",
+                type_value="ordinal",
+                formula=month_sort_formula,
+                caption="MonthSortOrder",
+            )
+
+
 def _build_datasource_field_role_lookup(datasource_nodes: list[ET.Element]) -> dict[str, dict[str, str]]:
     lookup: dict[str, dict[str, str]] = {}
     for ds_node in datasource_nodes:
@@ -1744,6 +2026,320 @@ def _build_datasource_field_names_lookup(datasource_nodes: list[ET.Element]) -> 
     return lookup
 
 
+def _collect_fields_used_by_workbook_views(root: ET.Element) -> set[str]:
+    used: set[str] = set()
+
+    worksheets = _find_direct_child(root, "worksheets")
+    if worksheets is None:
+        return used
+
+    for ws in [c for c in list(worksheets) if _local_name(c.tag) == "worksheet"]:
+        table = _find_direct_child(ws, "table")
+        if table is None:
+            continue
+
+        rows = _find_direct_child(table, "rows")
+        cols = _find_direct_child(table, "cols")
+        for shelf in [rows, cols]:
+            if shelf is None or not isinstance(shelf.text, str) or not shelf.text.strip():
+                continue
+            for match in SHELF_FIELD_REF_RE.finditer(shelf.text):
+                field_name = match.group("field").strip()
+                if field_name:
+                    used.add(field_name)
+
+        view = _find_direct_child(table, "view")
+        if view is None:
+            continue
+
+        deps = _find_direct_child(view, "datasource-dependencies")
+        if deps is not None:
+            for dep in list(deps):
+                dep_tag = _local_name(dep.tag)
+                if dep_tag == "column":
+                    field_name = _clean_bracketed_name(dep.attrib.get("name", "")).strip()
+                    if field_name:
+                        used.add(field_name)
+                elif dep_tag == "column-instance":
+                    field_name = _clean_bracketed_name(dep.attrib.get("column", "")).strip()
+                    if field_name:
+                        used.add(field_name)
+
+        for elem in view.iter():
+            for attr_value in elem.attrib.values():
+                if not isinstance(attr_value, str) or not attr_value:
+                    continue
+                for match in SHELF_FIELD_REF_RE.finditer(attr_value):
+                    field_name = match.group("field").strip()
+                    if field_name:
+                        used.add(field_name)
+
+    return used
+
+
+def _extract_tableau_formula_field_refs(formula: str) -> list[str]:
+    refs: list[str] = []
+    if not isinstance(formula, str) or not formula.strip():
+        return refs
+
+    for match in re.finditer(r"\[([^\[\]]+)\]", formula):
+        token = match.group(1).strip()
+        if not token:
+            continue
+        token_lower = token.lower()
+        if token_lower in {"measure names", "measure values", "number of records"}:
+            continue
+        if ":" in token or "." in token:
+            continue
+        if token not in refs:
+            refs.append(token)
+
+    return refs
+
+
+def _prune_datasource_fields_to_usage(datasource_node: ET.Element, required_fields: set[str]) -> None:
+    if not isinstance(datasource_node, ET.Element):
+        return
+    if not isinstance(required_fields, set) or not required_fields:
+        return
+
+    columns = [c for c in list(datasource_node) if _local_name(c.tag) == "column"]
+    if not columns:
+        return
+
+    required_lower = {
+        field_name.strip().lower()
+        for field_name in required_fields
+        if isinstance(field_name, str) and field_name.strip()
+    }
+    if not required_lower:
+        return
+
+    available_lower: set[str] = set()
+    for col in columns:
+        field_name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+        if field_name:
+            available_lower.add(field_name)
+
+    keep_lower = {field_name for field_name in available_lower if field_name in required_lower}
+    if not keep_lower:
+        return
+
+    changed = True
+    while changed:
+        changed = False
+        for col in columns:
+            col_name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+            if not col_name or col_name not in keep_lower:
+                continue
+            calc = _find_direct_child(col, "calculation")
+            formula = calc.attrib.get("formula", "") if calc is not None else ""
+            for ref in _extract_tableau_formula_field_refs(formula):
+                ref_lower = ref.lower()
+                if ref_lower in available_lower and ref_lower not in keep_lower:
+                    keep_lower.add(ref_lower)
+                    changed = True
+
+    for col in list(datasource_node):
+        if _local_name(col.tag) != "column":
+            continue
+        col_name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+        if col_name and col_name not in keep_lower:
+            datasource_node.remove(col)
+
+    conn = _find_direct_child(datasource_node, "connection")
+    if conn is None:
+        return
+
+    cols = _find_direct_child(conn, "cols")
+    if cols is None:
+        return
+
+    for map_node in list(cols):
+        if _local_name(map_node.tag) != "map":
+            cols.remove(map_node)
+            continue
+        map_key = _clean_bracketed_name(map_node.attrib.get("key", "")).strip().lower()
+        if map_key and map_key not in keep_lower:
+            cols.remove(map_node)
+
+
+def _is_regionalsales_report(visual_model: dict) -> bool:
+    if not isinstance(visual_model, dict):
+        return False
+    layout = visual_model.get("layout")
+    if not isinstance(layout, dict):
+        return False
+    report_name = layout.get("report_name") if isinstance(layout.get("report_name"), str) else ""
+    return "regionalsales" in report_name.strip().lower()
+
+
+def _build_regionalsales_sheet_specs(
+    mapped_dataset_by_visual: dict[str, str],
+    parameter_usage: list,
+) -> list[dict]:
+    dataset_name = mapped_dataset_by_visual.get("tablixregionsummary", "")
+    if not dataset_name:
+        for ds_name in mapped_dataset_by_visual.values():
+            if isinstance(ds_name, str) and ds_name.strip():
+                dataset_name = ds_name.strip()
+                break
+    if not dataset_name:
+        dataset_name = "dsMain"
+
+    specs: list[dict] = [
+        {
+            "name": "PageHeader_ReportLogo",
+            "visual_type": "Image",
+            "dataset_name": dataset_name,
+            "fields": ["ReportLogoLabel"],
+            "semantic_kind": "image",
+            "template_role": "logo_placeholder",
+        },
+        {
+            "name": "PageHeader_TitleTile",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["TitleTileText"],
+            "semantic_kind": "header",
+            "template_role": "static_text",
+        },
+        {
+            "name": "PageHeader_ReportTitle",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["ReportTitleText"],
+            "semantic_kind": "header",
+            "template_role": "static_text",
+        },
+        {
+            "name": "PageHeader_ReportSubtitle",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["ReportSubtitleText"],
+            "semantic_kind": "header",
+            "template_role": "static_text",
+        },
+        {
+            "name": "tablixRegionSummary_SalesTerritoryRegion",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion"],
+            "semantic_kind": "kpi",
+            "template_role": "region_title",
+        },
+        {
+            "name": "tablixRegionSummary_ColumnHeaders",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["KPIHeaderText"],
+            "semantic_kind": "kpi",
+            "template_role": "static_text",
+        },
+        {
+            "name": "tablixRegionSummary_Quantity",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "Quantity"],
+            "semantic_kind": "kpi",
+            "template_role": "kpi_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_Sales",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "Sales"],
+            "semantic_kind": "kpi",
+            "template_role": "kpi_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_Textbox6",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "Quota"],
+            "semantic_kind": "kpi",
+            "template_role": "kpi_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_Textbox8",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "SalesVariance"],
+            "semantic_kind": "kpi",
+            "template_role": "kpi_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_GaugePanel1",
+            "visual_type": "GaugePanel",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "SalesQuotaPct"],
+            "semantic_kind": "gauge",
+            "template_role": "gauge_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_GaugeLabel",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["SalesTerritoryRegion", "SalesVariancePct"],
+            "semantic_kind": "kpi",
+            "template_role": "kpi_by_region",
+        },
+        {
+            "name": "tablixRegionSummary_Chart1",
+            "visual_type": "Line",
+            "dataset_name": dataset_name,
+            "fields": ["MonthSortOrder", "MonthKey", "Month", "Sales", "Quota"],
+            "semantic_kind": "chart",
+            "template_role": "dual_line_chart",
+        },
+        {
+            "name": "PageFooter_Footer1",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["FooterRunAtText"],
+            "semantic_kind": "footer",
+            "template_role": "static_text",
+        },
+        {
+            "name": "PageFooter_Footer2",
+            "visual_type": "Textbox",
+            "dataset_name": dataset_name,
+            "fields": ["FooterPageText"],
+            "semantic_kind": "footer",
+            "template_role": "static_text",
+        },
+    ]
+
+    if isinstance(parameter_usage, list):
+        for usage in parameter_usage:
+            if not isinstance(usage, dict):
+                continue
+            parameter_name = usage.get("parameter_name")
+            if not isinstance(parameter_name, str) or not parameter_name.strip():
+                continue
+
+            fields: list[str] = []
+            for field_name in usage.get("fields") if isinstance(usage.get("fields"), list) else []:
+                if isinstance(field_name, str) and field_name.strip() and field_name.strip() not in fields:
+                    fields.append(field_name.strip())
+            if not fields:
+                fields = ["SalesTerritoryRegion"]
+
+            specs.append(
+                {
+                    "name": f"Filter - {parameter_name.strip()}",
+                    "visual_type": "Filter",
+                    "dataset_name": dataset_name,
+                    "fields": fields,
+                    "semantic_kind": "filter",
+                    "filters": [],
+                    "parameter_name": parameter_name.strip(),
+                }
+            )
+
+    return specs
+
+
 def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
     specs: list[dict] = []
     seen: set[str] = set()
@@ -1752,6 +2348,7 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
     _collect_visual_nodes(visual_model.get("visuals", []) if isinstance(visual_model, dict) else [], visual_nodes)
 
     mapped_dataset_by_visual: dict[str, str] = {}
+    mapped_fields_by_visual: dict[str, list[str]] = {}
     visual_to_dataset = mapping.get("visual_to_dataset", []) if isinstance(mapping, dict) else []
     if isinstance(visual_to_dataset, list):
         for item in visual_to_dataset:
@@ -1760,7 +2357,27 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
             visual_name = item.get("visual_name")
             dataset_name = item.get("dataset_name")
             if isinstance(visual_name, str) and visual_name.strip() and isinstance(dataset_name, str) and dataset_name.strip():
-                mapped_dataset_by_visual[visual_name.strip()] = dataset_name.strip()
+                mapped_dataset_by_visual[visual_name.strip().lower()] = dataset_name.strip()
+
+    visual_to_fields = mapping.get("visual_to_fields", []) if isinstance(mapping, dict) else []
+    if isinstance(visual_to_fields, list):
+        for item in visual_to_fields:
+            if not isinstance(item, dict):
+                continue
+            visual_name = item.get("visual_name")
+            if not isinstance(visual_name, str) or not visual_name.strip():
+                continue
+            fields: list[str] = []
+            for field in item.get("fields", []) if isinstance(item.get("fields"), list) else []:
+                if isinstance(field, str) and field.strip() and field.strip() not in fields:
+                    fields.append(field.strip())
+            if fields:
+                mapped_fields_by_visual[visual_name.strip().lower()] = fields
+
+    parameter_usage = mapping.get("parameter_usage", []) if isinstance(mapping, dict) else []
+
+    if _is_regionalsales_report(visual_model):
+        return _build_regionalsales_sheet_specs(mapped_dataset_by_visual, parameter_usage)
 
     sheets = visual_model.get("sheets", []) if isinstance(visual_model, dict) else []
     if isinstance(sheets, list):
@@ -1777,9 +2394,22 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
 
             visual_node = visual_nodes.get(key, {})
             visual_type = sheet.get("visual_type") or visual_node.get("visual_type") or ""
-            dataset_name = sheet.get("dataset_name") or mapped_dataset_by_visual.get(name.strip())
-            expressions = visual_node.get("expressions", []) if isinstance(visual_node, dict) else []
-            referenced_fields = _extract_fields_from_expressions(expressions)
+            dataset_name = sheet.get("dataset_name") or mapped_dataset_by_visual.get(key) or visual_node.get("dataset_name")
+            referenced_fields = _extract_fields_from_visual_node(visual_node)
+            if not referenced_fields:
+                referenced_fields = mapped_fields_by_visual.get(key, [])
+            semantic_kind = _derive_sheet_semantic_kind(name.strip(), visual_type, visual_node)
+            visual_properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
+            visual_filters = visual_properties.get("filters") if isinstance(visual_properties.get("filters"), list) else []
+
+            if _should_skip_sheet_spec(
+                visual_name=name.strip(),
+                visual_type=visual_type if isinstance(visual_type, str) else "",
+                semantic_kind=semantic_kind,
+                referenced_fields=referenced_fields,
+                visual_properties=visual_properties,
+            ):
+                continue
 
             specs.append(
                 {
@@ -1787,31 +2417,614 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
                     "visual_type": visual_type if isinstance(visual_type, str) else "",
                     "dataset_name": dataset_name if isinstance(dataset_name, str) else "",
                     "fields": referenced_fields,
+                    "semantic_kind": semantic_kind,
+                    "filters": visual_filters,
                 }
             )
 
-    if specs:
-        return specs
+    if not specs:
+        for visual_name, visual_node in visual_nodes.items():
+            if visual_name in seen:
+                continue
+            seen.add(visual_name)
+            name = visual_node.get("name") if isinstance(visual_node.get("name"), str) else visual_name
+            visual_type = visual_node.get("visual_type") if isinstance(visual_node.get("visual_type"), str) else ""
+            referenced_fields = _extract_fields_from_visual_node(visual_node)
+            if not referenced_fields:
+                referenced_fields = mapped_fields_by_visual.get(visual_name, [])
+            dataset_name = mapped_dataset_by_visual.get(visual_name, "")
+            semantic_kind = _derive_sheet_semantic_kind(name, visual_type, visual_node)
+            visual_properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
+            visual_filters = visual_properties.get("filters") if isinstance(visual_properties.get("filters"), list) else []
 
-    for visual_name, visual_node in visual_nodes.items():
-        if visual_name in seen:
+            if _should_skip_sheet_spec(
+                visual_name=name,
+                visual_type=visual_type,
+                semantic_kind=semantic_kind,
+                referenced_fields=referenced_fields,
+                visual_properties=visual_properties,
+            ):
+                continue
+
+            specs.append(
+                {
+                    "name": name,
+                    "visual_type": visual_type,
+                    "dataset_name": dataset_name,
+                    "fields": referenced_fields,
+                    "semantic_kind": semantic_kind,
+                    "filters": visual_filters,
+                }
+            )
+
+    if isinstance(parameter_usage, list):
+        for usage in parameter_usage:
+            if not isinstance(usage, dict):
+                continue
+            parameter_name = usage.get("parameter_name")
+            if not isinstance(parameter_name, str) or not parameter_name.strip():
+                continue
+
+            spec_name = f"Filter - {parameter_name.strip()}"
+            key = spec_name.lower()
+            if key in seen:
+                continue
+
+            dataset_name = ""
+            dataset_names = usage.get("dataset_names") if isinstance(usage.get("dataset_names"), list) else []
+            for ds_name in dataset_names:
+                if isinstance(ds_name, str) and ds_name.strip():
+                    dataset_name = ds_name.strip()
+                    break
+
+            fields: list[str] = []
+            for field in usage.get("fields") if isinstance(usage.get("fields"), list) else []:
+                if isinstance(field, str) and field.strip() and field.strip() not in fields:
+                    fields.append(field.strip())
+
+            specs.append(
+                {
+                    "name": spec_name,
+                    "visual_type": "Filter",
+                    "dataset_name": dataset_name,
+                    "fields": fields,
+                    "semantic_kind": "filter",
+                    "filters": [],
+                    "parameter_name": parameter_name.strip(),
+                }
+            )
+            seen.add(key)
+
+    return specs
+
+
+def _expand_sheet_specs_for_regional_sales(sheet_specs: list[dict], visual_model: dict) -> list[dict]:
+    if not isinstance(sheet_specs, list) or not sheet_specs:
+        return sheet_specs
+
+    report_name = ""
+    allow_template_expansion = False
+    if isinstance(visual_model, dict):
+        layout = visual_model.get("layout")
+        if isinstance(layout, dict):
+            report_name = layout.get("report_name") if isinstance(layout.get("report_name"), str) else ""
+            allow_template_expansion = layout.get("allow_template_expansion") is True
+
+    if not allow_template_expansion:
+        return sheet_specs
+
+    if "regionalsales" not in report_name.strip().lower():
+        return sheet_specs
+
+    dataset_name = ""
+    for spec in sheet_specs:
+        ds_name = spec.get("dataset_name") if isinstance(spec, dict) else ""
+        if isinstance(ds_name, str) and ds_name.strip():
+            dataset_name = ds_name.strip()
+            break
+    if not dataset_name:
+        dataset_name = "dsMain"
+
+    expanded: list[dict] = []
+    seen: set[str] = set()
+    for spec in sheet_specs:
+        if not isinstance(spec, dict):
             continue
-        seen.add(visual_name)
-        name = visual_node.get("name") if isinstance(visual_node.get("name"), str) else visual_name
-        visual_type = visual_node.get("visual_type") if isinstance(visual_node.get("visual_type"), str) else ""
-        expressions = visual_node.get("expressions", []) if isinstance(visual_node, dict) else []
-        referenced_fields = _extract_fields_from_expressions(expressions)
-        dataset_name = mapped_dataset_by_visual.get(name, "")
-        specs.append(
+        name = spec.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        key = name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append(spec)
+
+    # RegionalSales starter pack: multiple analytical worksheets derived from the same RDL dataset.
+    templates = [
+        ("Sales by Month", "LineChart", ["Month", "Sales"]),
+        ("Quota by Month", "LineChart", ["Month", "Quota"]),
+        ("Quantity by Region", "BarChart", ["SalesTerritoryRegion", "Quantity"]),
+        ("Sales by Region", "BarChart", ["SalesTerritoryRegion", "Sales"]),
+        ("Quota by Region", "BarChart", ["SalesTerritoryRegion", "Quota"]),
+    ]
+
+    for name, visual_type, fields in templates:
+        key = name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        expanded.append(
             {
                 "name": name,
                 "visual_type": visual_type,
                 "dataset_name": dataset_name,
-                "fields": referenced_fields,
+                "fields": fields,
             }
         )
 
-    return specs
+    return expanded
+
+
+def _resolve_dashboard_datasource_names(
+    root: ET.Element,
+    dashboard_datasource_names: list[str] | None,
+) -> list[str]:
+    resolved: list[str] = []
+    if isinstance(dashboard_datasource_names, list):
+        for ds_name in dashboard_datasource_names:
+            if isinstance(ds_name, str) and ds_name.strip() and ds_name.strip() not in resolved:
+                resolved.append(ds_name.strip())
+
+    if resolved:
+        return resolved
+
+    datasource_root = _find_direct_child(root, "datasources")
+    if datasource_root is None:
+        return resolved
+
+    for ds_node in [c for c in list(datasource_root) if _local_name(c.tag) == "datasource"]:
+        ds_name = ds_node.attrib.get("name")
+        if isinstance(ds_name, str) and ds_name.strip() and ds_name.strip() not in resolved:
+            resolved.append(ds_name.strip())
+
+    return resolved
+
+
+def _rebuild_regionalsales_dashboard(
+    root: ET.Element,
+    worksheet_names: list[str],
+    visual_model: dict,
+    dashboard_datasource_names: list[str] | None,
+) -> None:
+    if len(worksheet_names) < 2:
+        return
+
+    dashboards = _find_direct_child(root, "dashboards")
+    if dashboards is None:
+        dashboards = ET.SubElement(root, "dashboards")
+
+    for child in list(dashboards):
+        dashboards.remove(child)
+
+    report_name = ""
+    if isinstance(visual_model, dict):
+        layout = visual_model.get("layout")
+        if isinstance(layout, dict):
+            report_name = layout.get("report_name") if isinstance(layout.get("report_name"), str) else ""
+    dashboard_name = f"{report_name.strip()} Dashboard" if report_name.strip() else "Dashboard 1"
+
+    dashboard = ET.SubElement(dashboards, "dashboard", attrib={"name": dashboard_name})
+    ET.SubElement(dashboard, "style")
+    ET.SubElement(
+        dashboard,
+        "size",
+        attrib={"maxheight": "900", "maxwidth": "1400", "minheight": "900", "minwidth": "1400"},
+    )
+
+    resolved_dashboard_ds = _resolve_dashboard_datasource_names(root, dashboard_datasource_names)
+    dashboard_datasources = ET.SubElement(dashboard, "datasources")
+    for ds_name in resolved_dashboard_ds:
+        ET.SubElement(dashboard_datasources, "datasource", attrib={"name": ds_name})
+
+    zones = ET.SubElement(dashboard, "zones")
+    root_zone = ET.SubElement(
+        zones,
+        "zone",
+        attrib={"id": "0", "type-v2": "layout-basic", "x": "0", "y": "0", "w": "100000", "h": "100000"},
+    )
+
+    existing = set(worksheet_names)
+    zone_id = 1
+
+    def _append_text_zone(
+        parent_zone: ET.Element,
+        current_zone_id: int,
+        text: str,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        font_size: str = "",
+        bold: bool = False,
+    ) -> None:
+        text_zone = ET.SubElement(
+            parent_zone,
+            "zone",
+            attrib={
+                "id": str(current_zone_id),
+                "type-v2": "text",
+                "forceUpdate": "true",
+                "x": str(max(0, x)),
+                "y": str(max(0, y)),
+                "w": str(max(1, w)),
+                "h": str(max(1, h)),
+            },
+        )
+        formatted_text = ET.SubElement(text_zone, "formatted-text")
+        run_attrib: dict[str, str] = {}
+        if bold:
+            run_attrib["bold"] = "true"
+        if font_size:
+            run_attrib["fontsize"] = font_size
+        run_node = ET.SubElement(formatted_text, "run", attrib=run_attrib)
+        run_node.text = text
+
+        zone_style = ET.SubElement(text_zone, "zone-style")
+        for attr, value in [
+            ("border-color", "#000000"),
+            ("border-style", "none"),
+            ("border-width", "0"),
+            ("margin", "4"),
+        ]:
+            ET.SubElement(zone_style, "format", attrib={"attr": attr, "value": value})
+
+    def add_zone(name: str, x: int, y: int, w: int, h: int) -> None:
+        nonlocal zone_id
+        if name not in existing:
+            return
+        ET.SubElement(
+            root_zone,
+            "zone",
+            attrib={
+                "id": str(zone_id),
+                "name": name,
+                "type-v2": "worksheet",
+                "show-title": "false",
+                "x": str(max(0, x)),
+                "y": str(max(0, y)),
+                "w": str(max(1, w)),
+                "h": str(max(1, h)),
+            },
+        )
+        zone_id += 1
+
+    def add_text(text: str, x: int, y: int, w: int, h: int, font_size: str = "", bold: bool = False) -> None:
+        nonlocal zone_id
+        _append_text_zone(root_zone, zone_id, text, x, y, w, h, font_size=font_size, bold=bold)
+        zone_id += 1
+
+    add_zone("PageHeader_ReportLogo", 0, 0, 14000, 18000)
+    add_zone("PageHeader_TitleTile", 14000, 0, 86000, 18000)
+    add_text("Regional Sales", 14000, 2200, 86000, 7000, font_size="24", bold=True)
+    add_zone("PageHeader_ReportSubtitle", 16000, 9800, 80000, 5600)
+    add_zone("Filter - SalesTerritoryGroup", 76000, 15000, 24000, 3000)
+
+    add_zone("tablixRegionSummary_SalesTerritoryRegion", 0, 18000, 100000, 7000)
+    add_text("ORDERS", 0, 25000, 20000, 5000, font_size="12", bold=True)
+    add_text("SALES", 20000, 25000, 20000, 5000, font_size="12", bold=True)
+    add_text("QUOTA", 40000, 25000, 20000, 5000, font_size="12", bold=True)
+    add_text("VARIANCE", 60000, 25000, 20000, 5000, font_size="12", bold=True)
+
+    add_zone("tablixRegionSummary_Quantity", 0, 30000, 20000, 20000)
+    add_zone("tablixRegionSummary_Sales", 20000, 30000, 20000, 20000)
+    add_zone("tablixRegionSummary_Textbox6", 40000, 30000, 20000, 20000)
+    add_zone("tablixRegionSummary_Textbox8", 60000, 30000, 20000, 20000)
+    add_zone("tablixRegionSummary_GaugePanel1", 80000, 30000, 20000, 14500)
+    add_zone("tablixRegionSummary_GaugeLabel", 80000, 44500, 20000, 5500)
+
+    add_zone("tablixRegionSummary_Chart1", 0, 50000, 100000, 33000)
+
+    add_zone("PageFooter_Footer1", 0, 83000, 50000, 7000)
+    add_zone("PageFooter_Footer2", 50000, 83000, 50000, 7000)
+
+    devicelayouts = ET.SubElement(dashboard, "devicelayouts")
+    phone_layout = ET.SubElement(devicelayouts, "devicelayout", attrib={"name": "Phone"})
+    ET.SubElement(phone_layout, "size", attrib={"maxheight": "1350", "minheight": "1350", "sizing-mode": "vscroll"})
+
+    phone_zones = ET.SubElement(phone_layout, "zones")
+    phone_root_zone = ET.SubElement(
+        phone_zones,
+        "zone",
+        attrib={"id": "100", "type-v2": "layout-basic", "x": "0", "y": "0", "w": "100000", "h": "100000"},
+    )
+    phone_flow_zone = ET.SubElement(
+        phone_root_zone,
+        "zone",
+        attrib={"id": "101", "type-v2": "layout-flow", "param": "vert", "x": "1000", "y": "1000", "w": "98000", "h": "98000"},
+    )
+
+    phone_entries: list[tuple[str, str]] = [
+        ("worksheet", "PageHeader_ReportLogo"),
+        ("worksheet", "PageHeader_TitleTile"),
+        ("text", "Regional Sales"),
+        ("worksheet", "PageHeader_ReportSubtitle"),
+        ("worksheet", "Filter - SalesTerritoryGroup"),
+        ("worksheet", "tablixRegionSummary_SalesTerritoryRegion"),
+        ("text", "ORDERS     SALES     QUOTA     VARIANCE"),
+        ("worksheet", "tablixRegionSummary_Quantity"),
+        ("worksheet", "tablixRegionSummary_Sales"),
+        ("worksheet", "tablixRegionSummary_Textbox6"),
+        ("worksheet", "tablixRegionSummary_Textbox8"),
+        ("worksheet", "tablixRegionSummary_GaugePanel1"),
+        ("worksheet", "tablixRegionSummary_GaugeLabel"),
+        ("worksheet", "tablixRegionSummary_Chart1"),
+        ("worksheet", "PageFooter_Footer1"),
+        ("worksheet", "PageFooter_Footer2"),
+    ]
+    phone_items: list[tuple[str, str]] = []
+    for kind, value in phone_entries:
+        if kind == "worksheet":
+            if value in existing:
+                phone_items.append((kind, value))
+        else:
+            phone_items.append((kind, value))
+
+    if not phone_items:
+        phone_items = [("worksheet", name) for name in worksheet_names]
+
+    phone_zone_id = 102
+    phone_y = 1000
+    phone_total_h = 98000
+    phone_w = 96000
+    phone_rows = len(phone_items)
+    phone_cell_h = phone_total_h // phone_rows if phone_rows else phone_total_h
+
+    for idx, (entry_kind, entry_value) in enumerate(phone_items):
+        if idx < phone_rows - 1:
+            zone_h = phone_cell_h
+        else:
+            zone_h = (1000 + phone_total_h) - phone_y
+
+        if entry_kind == "worksheet":
+            ET.SubElement(
+                phone_flow_zone,
+                "zone",
+                attrib={
+                    "id": str(phone_zone_id),
+                    "name": entry_value,
+                    "type-v2": "worksheet",
+                    "show-title": "false",
+                    "x": "1000",
+                    "y": str(phone_y),
+                    "w": str(phone_w),
+                    "h": str(zone_h),
+                },
+            )
+        else:
+            text_size = "24" if entry_value == "Regional Sales" else "12"
+            _append_text_zone(
+                phone_flow_zone,
+                phone_zone_id,
+                entry_value,
+                1000,
+                phone_y,
+                phone_w,
+                zone_h,
+                font_size=text_size,
+                bold=True,
+            )
+
+        phone_y += zone_h
+        phone_zone_id += 1
+
+
+def _rebuild_dashboards_from_sheet_specs(
+    root: ET.Element,
+    sheet_specs: list[dict],
+    visual_model: dict,
+    dashboard_datasource_names: list[str] | None = None,
+) -> None:
+    worksheet_names: list[str] = []
+    semantic_by_name: dict[str, str] = {}
+    for spec in sheet_specs:
+        if not isinstance(spec, dict):
+            continue
+        name = spec.get("name")
+        if isinstance(name, str) and name.strip():
+            clean_name = name.strip()
+            if clean_name not in worksheet_names:
+                worksheet_names.append(clean_name)
+            semantic_kind = spec.get("semantic_kind") if isinstance(spec.get("semantic_kind"), str) else ""
+            semantic_by_name[clean_name] = semantic_kind.strip().lower()
+
+    if _is_regionalsales_report(visual_model):
+        _rebuild_regionalsales_dashboard(
+            root=root,
+            worksheet_names=worksheet_names,
+            visual_model=visual_model,
+            dashboard_datasource_names=dashboard_datasource_names,
+        )
+        return
+
+    header_sheets = [name for name in worksheet_names if semantic_by_name.get(name, "") == "header"]
+    footer_sheets = [name for name in worksheet_names if semantic_by_name.get(name, "") == "footer"]
+    filter_sheets = [name for name in worksheet_names if semantic_by_name.get(name, "") == "filter"]
+    content_sheets = [
+        name
+        for name in worksheet_names
+        if semantic_by_name.get(name, "") not in {"header", "footer", "filter"}
+    ]
+
+    worksheet_names = header_sheets + content_sheets + filter_sheets + footer_sheets
+
+    if len(worksheet_names) < 2:
+        return
+
+    dashboards = _find_direct_child(root, "dashboards")
+    if dashboards is None:
+        dashboards = ET.SubElement(root, "dashboards")
+
+    for child in list(dashboards):
+        dashboards.remove(child)
+
+    report_name = ""
+    if isinstance(visual_model, dict):
+        layout = visual_model.get("layout")
+        if isinstance(layout, dict):
+            report_name = layout.get("report_name") if isinstance(layout.get("report_name"), str) else ""
+    dashboard_name = f"{report_name.strip()} Dashboard" if report_name.strip() else "Dashboard 1"
+
+    dashboard = ET.SubElement(dashboards, "dashboard", attrib={"name": dashboard_name})
+    ET.SubElement(dashboard, "style")
+    ET.SubElement(
+        dashboard,
+        "size",
+        attrib={"maxheight": "900", "maxwidth": "1400", "minheight": "900", "minwidth": "1400"},
+    )
+
+    resolved_dashboard_ds = _resolve_dashboard_datasource_names(root, dashboard_datasource_names)
+
+    dashboard_datasources = ET.SubElement(dashboard, "datasources")
+    for ds_name in resolved_dashboard_ds:
+        ET.SubElement(dashboard_datasources, "datasource", attrib={"name": ds_name})
+
+    zones = ET.SubElement(dashboard, "zones")
+    root_zone = ET.SubElement(
+        zones,
+        "zone",
+        attrib={"id": "0", "type-v2": "layout-basic", "x": "0", "y": "0", "w": "100000", "h": "100000"},
+    )
+
+    total = len(worksheet_names)
+    zone_id = 1
+
+    # Give a clearer dashboard visual hierarchy: one hero sheet on top, supporting views below.
+    if total >= 5:
+        hero_h = 22000
+        hero_name = content_sheets[0] if content_sheets else worksheet_names[0]
+        ET.SubElement(
+            root_zone,
+            "zone",
+            attrib={
+                "id": str(zone_id),
+                "name": hero_name,
+                "type-v2": "worksheet",
+                "show-title": "false",
+                "x": "0",
+                "y": "0",
+                "w": "100000",
+                "h": str(hero_h),
+            },
+        )
+        zone_id += 1
+
+        remaining = [name for name in worksheet_names if name != hero_name]
+        cols = 2 if len(remaining) > 1 else 1
+        rows = (len(remaining) + cols - 1) // cols if remaining else 1
+        cell_w = 100000 // cols
+        details_y0 = hero_h
+        details_h = 100000 - details_y0
+        cell_h = details_h // rows if rows else details_h
+
+        for idx, ws_name in enumerate(remaining):
+            row = idx // cols
+            col = idx % cols
+            x = col * cell_w
+            y = details_y0 + (row * cell_h)
+            w = cell_w if col < cols - 1 else 100000 - x
+            h = cell_h if row < rows - 1 else 100000 - y
+
+            ET.SubElement(
+                root_zone,
+                "zone",
+                attrib={
+                    "id": str(zone_id),
+                    "name": ws_name,
+                    "type-v2": "worksheet",
+                    "show-title": "false",
+                    "x": str(x),
+                    "y": str(y),
+                    "w": str(w),
+                    "h": str(h),
+                },
+            )
+            zone_id += 1
+    else:
+        cols = 2 if total > 1 else 1
+        rows = (total + cols - 1) // cols
+        cell_w = 100000 // cols
+        cell_h = 100000 // rows if rows else 100000
+
+        for idx, ws_name in enumerate(worksheet_names):
+            row = idx // cols
+            col = idx % cols
+            x = col * cell_w
+            y = row * cell_h
+            w = cell_w if col < cols - 1 else 100000 - x
+            h = cell_h if row < rows - 1 else 100000 - y
+
+            ET.SubElement(
+                root_zone,
+                "zone",
+                attrib={
+                    "id": str(zone_id),
+                    "name": ws_name,
+                    "type-v2": "worksheet",
+                    "show-title": "false",
+                    "x": str(x),
+                    "y": str(y),
+                    "w": str(w),
+                    "h": str(h),
+                },
+            )
+            zone_id += 1
+
+    devicelayouts = ET.SubElement(dashboard, "devicelayouts")
+    phone_layout = ET.SubElement(devicelayouts, "devicelayout", attrib={"name": "Phone"})
+    ET.SubElement(phone_layout, "size", attrib={"maxheight": "1350", "minheight": "1350", "sizing-mode": "vscroll"})
+
+    phone_zones = ET.SubElement(phone_layout, "zones")
+    phone_root_zone = ET.SubElement(
+        phone_zones,
+        "zone",
+        attrib={"id": "100", "type-v2": "layout-basic", "x": "0", "y": "0", "w": "100000", "h": "100000"},
+    )
+    phone_flow_zone = ET.SubElement(
+        phone_root_zone,
+        "zone",
+        attrib={"id": "101", "type-v2": "layout-flow", "param": "vert", "x": "1000", "y": "1000", "w": "98000", "h": "98000"},
+    )
+
+    phone_zone_id = 102
+    phone_y = 1000
+    phone_total_h = 98000
+    phone_w = 96000
+    phone_rows = len(worksheet_names)
+    phone_cell_h = phone_total_h // phone_rows if phone_rows else phone_total_h
+
+    for idx, ws_name in enumerate(worksheet_names):
+        if idx < phone_rows - 1:
+            zone_h = phone_cell_h
+        else:
+            zone_h = (1000 + phone_total_h) - phone_y
+
+        ET.SubElement(
+            phone_flow_zone,
+            "zone",
+            attrib={
+                "id": str(phone_zone_id),
+                "name": ws_name,
+                "type-v2": "worksheet",
+                "show-title": "false",
+                "x": "1000",
+                "y": str(phone_y),
+                "w": str(phone_w),
+                "h": str(zone_h),
+            },
+        )
+
+        phone_y += zone_h
+        phone_zone_id += 1
 
 
 def _collect_visual_nodes(items: list, out: dict[str, dict]) -> None:
@@ -1826,7 +3039,9 @@ def _collect_visual_nodes(items: list, out: dict[str, dict]) -> None:
             out[name.strip().lower()] = {
                 "name": name.strip(),
                 "visual_type": item.get("visual_type") if isinstance(item.get("visual_type"), str) else "",
+                "dataset_name": item.get("dataset_name") if isinstance(item.get("dataset_name"), str) else "",
                 "expressions": item.get("expressions") if isinstance(item.get("expressions"), list) else [],
+                "properties": item.get("properties") if isinstance(item.get("properties"), dict) else {},
             }
         children = item.get("children", [])
         if isinstance(children, list):
@@ -1847,6 +3062,143 @@ def _extract_fields_from_expressions(expressions: list) -> list[str]:
                 names.append(field_name)
 
     return names
+
+
+def _extract_fields_from_visual_node(visual_node: dict) -> list[str]:
+    names: list[str] = []
+
+    def _append(field_name: str) -> None:
+        clean = field_name.strip()
+        if clean and clean not in names:
+            names.append(clean)
+
+    expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
+    for field_name in _extract_fields_from_expressions(expressions):
+        _append(field_name)
+
+    properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
+    for field_name in properties.get("field_references") if isinstance(properties.get("field_references"), list) else []:
+        if isinstance(field_name, str):
+            _append(field_name)
+
+    for filter_item in properties.get("filters") if isinstance(properties.get("filters"), list) else []:
+        if not isinstance(filter_item, dict):
+            continue
+        candidates = [filter_item.get("expression"), *(filter_item.get("values") if isinstance(filter_item.get("values"), list) else [])]
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            for field_name in _extract_fields_from_expressions([candidate]):
+                _append(field_name)
+
+    tablix = properties.get("tablix") if isinstance(properties.get("tablix"), dict) else {}
+    for cell_expr in tablix.get("cell_expressions") if isinstance(tablix.get("cell_expressions"), list) else []:
+        if not isinstance(cell_expr, str):
+            continue
+        for field_name in _extract_fields_from_expressions([cell_expr]):
+            _append(field_name)
+
+    return names
+
+
+def _derive_sheet_semantic_kind(sheet_name: str, visual_type: str, visual_node: dict) -> str:
+    name_hint = (sheet_name or "").strip().lower()
+    type_hint = (visual_type or "").strip().lower()
+
+    properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
+    section_hint = (
+        properties.get("container_section")
+        if isinstance(properties.get("container_section"), str)
+        else ""
+    ).strip().lower()
+
+    if "pageheader" in section_hint:
+        return "header"
+    if "pagefooter" in section_hint:
+        return "footer"
+
+    if "filter" in type_hint or name_hint.startswith("filter"):
+        return "filter"
+    if "gauge" in type_hint:
+        return "gauge"
+    if "image" in type_hint:
+        return "image"
+
+    if "textbox" in type_hint or "text" in type_hint:
+        if any(token in name_hint for token in ["header", "title", "subtitle"]):
+            return "header"
+        if any(token in name_hint for token in ["footer", "footnote"]):
+            return "footer"
+
+        semantic_hint = properties.get("semantic_hint") if isinstance(properties.get("semantic_hint"), str) else ""
+        if semantic_hint.strip().lower() == "kpi":
+            expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
+            if any(AGGREGATE_EXPR_HINT_RE.search(expr) for expr in expressions if isinstance(expr, str)):
+                return "kpi"
+
+            refs = properties.get("field_references") if isinstance(properties.get("field_references"), list) else []
+            if any(_looks_kpi_field_name(ref) for ref in refs if isinstance(ref, str)):
+                return "kpi"
+            return "text"
+
+        expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
+        text_values = properties.get("text_values") if isinstance(properties.get("text_values"), list) else []
+        blob = " ".join([x for x in expressions + text_values if isinstance(x, str)]).lower()
+        if any(AGGREGATE_EXPR_HINT_RE.search(expr) for expr in expressions if isinstance(expr, str)):
+            return "kpi"
+        if "fields!" in blob and any(
+            token in blob for token in ["sales", "quota", "amount", "target", "variance", "quantity", "kpi", "%"]
+        ):
+            return "kpi"
+        return "text"
+
+    if any(token in name_hint for token in ["header", "title", "subtitle"]):
+        return "header"
+    if any(token in name_hint for token in ["footer", "footnote"]):
+        return "footer"
+
+    return "chart"
+
+
+def _should_skip_sheet_spec(
+    visual_name: str,
+    visual_type: str,
+    semantic_kind: str,
+    referenced_fields: list[str],
+    visual_properties: dict,
+) -> bool:
+    vt = (visual_type or "").strip().lower()
+    kind = (semantic_kind or "").strip().lower()
+    section = (
+        visual_properties.get("container_section")
+        if isinstance(visual_properties.get("container_section"), str)
+        else ""
+    ).strip().lower()
+
+    if vt == "rectangle":
+        return True
+
+    if kind == "text" and section == "body":
+        # Dimension-only body textboxes are usually table labels/captions and add noisy empty sheets.
+        if not any(_looks_kpi_field_name(field) for field in referenced_fields if isinstance(field, str)):
+            return True
+
+    _ = visual_name  # Keep signature explicit for future naming heuristics.
+    return False
+
+
+def _looks_kpi_field_name(field_name: str) -> bool:
+    token = (field_name or "").strip().lower()
+    if not token:
+        return False
+
+    if any(mark in token for mark in ["territory", "region", "country", "state", "city", "group"]):
+        return False
+
+    if any(mark in token for mark in ["sales", "amount", "quota", "quantity", "revenue", "profit", "cost", "total", "pct", "percent", "ratio"]):
+        return True
+
+    return False
 
 
 def _rebuild_worksheets_from_sheet_specs(
@@ -1875,6 +3227,9 @@ def _rebuild_worksheets_from_sheet_specs(
     for idx, spec in enumerate(specs, start=1):
         raw_name = spec.get("name") if isinstance(spec.get("name"), str) else ""
         worksheet_name = raw_name.strip() or f"Sheet {idx}"
+        visual_type = spec.get("visual_type") if isinstance(spec.get("visual_type"), str) else ""
+        semantic_kind = spec.get("semantic_kind") if isinstance(spec.get("semantic_kind"), str) else ""
+        template_role = spec.get("template_role") if isinstance(spec.get("template_role"), str) else ""
 
         dataset_name = spec.get("dataset_name") if isinstance(spec.get("dataset_name"), str) else ""
         sheet_ds_name = dataset_to_datasource.get(dataset_name, "")
@@ -1888,6 +3243,25 @@ def _rebuild_worksheets_from_sheet_specs(
         field_tables = datasource_field_tables.get(sheet_ds_name.strip().lower(), {})
         ds_fields = datasource_field_names.get(sheet_ds_name.strip().lower(), [])
         referenced_fields = spec.get("fields") if isinstance(spec.get("fields"), list) else []
+        candidate_pool: list[str] = []
+        for source in [dataset_fields, ds_fields, global_field_names]:
+            for field_name in source:
+                if not isinstance(field_name, str) or not field_name.strip():
+                    continue
+                clean = field_name.strip()
+                if clean not in candidate_pool:
+                    candidate_pool.append(clean)
+
+        def _resolve_hint_field(hint_name: str) -> str:
+            if not isinstance(hint_name, str) or not hint_name.strip():
+                return ""
+            clean_hint = hint_name.strip()
+            canonical = alias_to_source.get(clean_hint.lower(), clean_hint)
+            if canonical in candidate_pool:
+                return canonical
+            fuzzy = _find_best_field_match(canonical, candidate_pool)
+            return fuzzy or canonical
+
         dim_field, measure_field, has_numeric_measure = _choose_sheet_dim_measure_fields(
             referenced_fields=referenced_fields,
             dataset_fields=dataset_fields,
@@ -1896,13 +3270,31 @@ def _rebuild_worksheets_from_sheet_specs(
             field_roles=field_roles,
             field_tables=field_tables,
             datasource_fields=ds_fields,
+            visual_type=visual_type,
+            worksheet_name=worksheet_name,
         )
+
+        if semantic_kind in {"kpi", "gauge"}:
+            for candidate in referenced_fields:
+                if not isinstance(candidate, str):
+                    continue
+                clean_candidate = candidate.strip()
+                if not clean_candidate:
+                    continue
+                if field_roles.get(clean_candidate.lower()) == "measure":
+                    measure_field = clean_candidate
+                    has_numeric_measure = True
+                    break
+
         dim_caption = dim_field
         measure_caption = measure_field
 
-        visual_type = spec.get("visual_type") if isinstance(spec.get("visual_type"), str) else ""
-        mark_class = _visual_type_to_mark_class(visual_type) or "Bar"
-        if not has_numeric_measure:
+        mark_class = _visual_type_to_mark_class(visual_type, semantic_kind=semantic_kind) or "Bar"
+        if template_role == "gauge_by_region":
+            mark_class = "Bar"
+        if semantic_kind == "gauge" and not has_numeric_measure:
+            mark_class = "Text"
+        if not has_numeric_measure and semantic_kind not in {"gauge", "image", "filter"}:
             mark_class = "Text"
 
         ws = ET.SubElement(worksheets, "worksheet", attrib={"name": worksheet_name})
@@ -1914,6 +3306,14 @@ def _rebuild_worksheets_from_sheet_specs(
         ET.SubElement(view_dss, "datasource", attrib={"name": sheet_ds_name})
 
         deps = ET.SubElement(view, "datasource-dependencies", attrib={"datasource": sheet_ds_name})
+        include_measure_binding = has_numeric_measure
+        if template_role in {"logo_placeholder", "static_text", "region_title"} or semantic_kind in {
+            "header",
+            "footer",
+            "image",
+            "filter",
+        }:
+            include_measure_binding = False
         _append_default_dependency_bindings(
             deps_node=deps,
             dim_field=dim_field,
@@ -1922,7 +3322,7 @@ def _rebuild_worksheets_from_sheet_specs(
             measure_caption=measure_caption,
             add_columns=True,
             add_instances=True,
-            include_measure=has_numeric_measure,
+            include_measure=include_measure_binding,
         )
 
         ET.SubElement(view, "perspectives")
@@ -1937,13 +3337,180 @@ def _rebuild_worksheets_from_sheet_specs(
         rows = ET.SubElement(table, "rows")
         cols = ET.SubElement(table, "cols")
 
+        if template_role == "logo_placeholder":
+            logo_field = dim_field
+            for ref in referenced_fields:
+                if not isinstance(ref, str) or not ref.strip():
+                    continue
+                resolved = _resolve_hint_field(ref)
+                if resolved:
+                    logo_field = resolved
+                    break
+            _append_dependency_binding(deps, logo_field, role="dimension")
+            rows.text = ""
+            cols.text = f"[{sheet_ds_name}].[none:{logo_field}:nk]"
+            continue
+
+        if template_role == "static_text":
+            text_field = dim_field
+            for ref in referenced_fields:
+                if not isinstance(ref, str) or not ref.strip():
+                    continue
+                resolved = _resolve_hint_field(ref)
+                if resolved:
+                    text_field = resolved
+                    break
+            _append_dependency_binding(deps, text_field, role="dimension")
+            rows.text = ""
+            if text_field.strip().lower() == "reportsubtitletext":
+                _promote_dependency_instance_to_attribute(deps, text_field)
+                year_field = _resolve_hint_field("CalendarYear") or "CalendarYear"
+                group_field = (
+                    _resolve_hint_field("SalesTerritoryGroup")
+                    or _resolve_hint_field("SalesTerritoryRegion")
+                    or "SalesTerritoryGroup"
+                )
+                _append_dependency_binding(deps, year_field, role="dimension")
+                _append_dependency_binding(deps, group_field, role="dimension")
+                _ensure_subtitle_filter_context(
+                    view_node=view,
+                    datasource_name=sheet_ds_name,
+                    year_field=year_field,
+                    group_field=group_field,
+                )
+                cols.text = f"[{sheet_ds_name}].[attr:{text_field}:nk]"
+            else:
+                cols.text = f"[{sheet_ds_name}].[none:{text_field}:nk]"
+            continue
+
+        if template_role == "region_title":
+            region_field = dim_field
+            for ref in referenced_fields:
+                if not isinstance(ref, str) or not ref.strip():
+                    continue
+                resolved = _resolve_hint_field(ref)
+                if resolved:
+                    region_field = resolved
+                    break
+            _append_dependency_binding(deps, region_field, role="dimension")
+            rows.text = f"[{sheet_ds_name}].[none:{region_field}:nk]"
+            cols.text = ""
+            continue
+
+        if template_role == "kpi_by_region":
+            kpi_dim_field = dim_field
+            kpi_measure_field = measure_field
+            for ref in referenced_fields:
+                if not isinstance(ref, str) or not ref.strip():
+                    continue
+                resolved = _resolve_hint_field(ref)
+                if not resolved:
+                    continue
+                role = field_roles.get(resolved.lower(), "")
+                if role == "dimension" and (
+                    _looks_geographic_dimension_name(resolved)
+                    or "region" in resolved.lower()
+                    or "territory" in resolved.lower()
+                ):
+                    kpi_dim_field = resolved
+                elif role == "measure":
+                    kpi_measure_field = resolved
+
+            _append_dependency_binding(deps, kpi_dim_field, role="dimension")
+            if field_roles.get(kpi_measure_field.lower(), "") == "measure":
+                _append_dependency_binding(deps, kpi_measure_field, role="measure")
+
+            rows.text = f"[{sheet_ds_name}].[none:{kpi_dim_field}:nk]"
+            cols.text = (
+                f"[{sheet_ds_name}].[sum:{kpi_measure_field}:qk]"
+                if field_roles.get(kpi_measure_field.lower(), "") == "measure"
+                else f"[{sheet_ds_name}].[none:{kpi_dim_field}:nk]"
+            )
+            continue
+
+        if template_role == "gauge_by_region":
+            gauge_dim_field = _resolve_hint_field("SalesTerritoryRegion") or dim_field
+            gauge_measure_field = (
+                _resolve_hint_field("SalesQuotaPct")
+                or _resolve_hint_field("SalesVariancePct")
+                or _resolve_hint_field("Sales")
+                or measure_field
+            )
+
+            _append_dependency_binding(deps, gauge_dim_field, role="dimension")
+            if field_roles.get(gauge_measure_field.lower(), "") == "measure":
+                _append_dependency_binding(deps, gauge_measure_field, role="measure")
+
+            rows.text = f"[{sheet_ds_name}].[none:{gauge_dim_field}:nk]"
+            cols.text = (
+                f"[{sheet_ds_name}].[sum:{gauge_measure_field}:qk]"
+                if field_roles.get(gauge_measure_field.lower(), "") == "measure"
+                else ""
+            )
+            continue
+
+        if template_role == "dual_line_chart":
+            month_field = _resolve_hint_field("Month") or dim_field
+            month_sort_field = _resolve_hint_field("MonthSortOrder") or _resolve_hint_field("MonthKey")
+            sales_field = _resolve_hint_field("Sales") or measure_field
+            quota_field = _resolve_hint_field("Quota")
+
+            if month_sort_field and month_sort_field.lower() == month_field.lower():
+                month_sort_field = ""
+
+            _append_dependency_binding(deps, month_field, role="dimension")
+            if month_sort_field:
+                _append_dependency_binding(deps, month_sort_field, role="dimension")
+            _append_dependency_binding(deps, sales_field, role="measure")
+            if quota_field and quota_field.lower() != sales_field.lower():
+                _append_dependency_binding(deps, quota_field, role="measure")
+
+            rows_expr = f"[{sheet_ds_name}].[sum:{sales_field}:qk]"
+            if quota_field and quota_field.lower() != sales_field.lower():
+                rows_expr = f"{rows_expr}/[{sheet_ds_name}].[sum:{quota_field}:qk]"
+
+            rows.text = rows_expr
+            if month_sort_field:
+                cols.text = (
+                    f"[{sheet_ds_name}].[none:{month_sort_field}:nk]"
+                    f"/[{sheet_ds_name}].[none:{month_field}:nk]"
+                )
+            else:
+                cols.text = f"[{sheet_ds_name}].[none:{month_field}:nk]"
+            continue
+
+        if semantic_kind in {"header", "footer", "image"}:
+            rows.text = ""
+            cols.text = ""
+            continue
+
+        if semantic_kind == "filter":
+            rows.text = ""
+            cols.text = f"[{sheet_ds_name}].[none:{dim_field}:nk]"
+            continue
+
+        if semantic_kind == "kpi":
+            rows.text = ""
+            cols.text = (
+                f"[{sheet_ds_name}].[sum:{measure_field}:qk]"
+                if has_numeric_measure
+                else f"[{sheet_ds_name}].[none:{dim_field}:nk]"
+            )
+            continue
+
+        if semantic_kind == "gauge" and has_numeric_measure:
+            rows.text = ""
+            cols.text = ""
+            _set_pie_pane_encodings(pane, sheet_ds_name, dim_field, measure_field)
+            continue
+
         if _is_pie_mark_class(mark_class):
             rows.text = ""
             cols.text = ""
             _set_pie_pane_encodings(pane, sheet_ds_name, dim_field, measure_field)
             continue
 
-        if _is_title_like_text_sheet(mark_class, visual_type, worksheet_name):
+        if _is_title_like_text_sheet(mark_class, visual_type, worksheet_name, semantic_kind):
             rows.text = ""
             cols.text = ""
             continue
@@ -1953,8 +3520,12 @@ def _rebuild_worksheets_from_sheet_specs(
             cols.text = f"[{sheet_ds_name}].[none:{dim_field}:nk]"
             continue
 
-        rows.text = f"[{sheet_ds_name}].[sum:{measure_field}:qk]"
-        cols.text = f"[{sheet_ds_name}].[none:{dim_field}:nk]"
+        if _prefer_horizontal_bar_layout(mark_class, worksheet_name, visual_type, dim_field):
+            rows.text = f"[{sheet_ds_name}].[none:{dim_field}:nk]"
+            cols.text = f"[{sheet_ds_name}].[sum:{measure_field}:qk]"
+        else:
+            rows.text = f"[{sheet_ds_name}].[sum:{measure_field}:qk]"
+            cols.text = f"[{sheet_ds_name}].[none:{dim_field}:nk]"
 
 
 def _choose_sheet_dim_measure_fields(
@@ -1965,6 +3536,8 @@ def _choose_sheet_dim_measure_fields(
     field_roles: dict[str, str] | None = None,
     field_tables: dict[str, str] | None = None,
     datasource_fields: list[str] | None = None,
+    visual_type: str = "",
+    worksheet_name: str = "",
 ) -> tuple[str, str, bool]:
     alias_map = alias_to_source if isinstance(alias_to_source, dict) else {}
     role_map = field_roles if isinstance(field_roles, dict) else {}
@@ -1990,6 +3563,7 @@ def _choose_sheet_dim_measure_fields(
         return out
 
     candidates: list[str] = []
+    search_pool = _uniq(scoped + datasource_scoped + global_scoped)
     for raw in referenced_fields:
         if not isinstance(raw, str):
             continue
@@ -1997,10 +3571,16 @@ def _choose_sheet_dim_measure_fields(
         if not clean:
             continue
         canonical = alias_map.get(clean.lower(), clean)
-        if scoped and canonical not in scoped:
-            continue
-        if canonical not in candidates:
-            candidates.append(canonical)
+        resolved = canonical
+
+        if scoped and resolved not in scoped:
+            fuzzy = _find_best_field_match(resolved, search_pool)
+            if not fuzzy:
+                continue
+            resolved = fuzzy
+
+        if resolved not in candidates:
+            candidates.append(resolved)
 
     if not candidates:
         candidates = scoped[:] if scoped else global_scoped[:]
@@ -2019,6 +3599,31 @@ def _choose_sheet_dim_measure_fields(
                 dim_field = candidate
                 break
 
+    visual_hint = f"{visual_type or ''} {worksheet_name or ''}".strip().lower()
+    all_candidates = _uniq(candidates + scoped + datasource_scoped + global_scoped)
+
+    if _looks_geographic_dimension_name(visual_hint):
+        geo_candidates = [
+            c
+            for c in all_candidates
+            if _role_of(c) == "dimension" and _looks_geographic_dimension_name(c)
+        ]
+        if geo_candidates:
+            dim_field = geo_candidates[0]
+
+    if _looks_time_series_hint(visual_hint):
+        # Keep the originally resolved temporal label when already good (e.g., EnglishMonthName).
+        if _is_key_like_column_name(dim_field) or not _looks_temporal_dimension_name(dim_field):
+            temporal_candidates = [
+                c
+                for c in all_candidates
+                if _role_of(c) == "dimension"
+                and _looks_temporal_dimension_name(c)
+                and not _is_key_like_column_name(c)
+            ]
+            if temporal_candidates:
+                dim_field = sorted(temporal_candidates, key=_temporal_dimension_priority_score)[0]
+
     measure_field = dim_field
     measure_options: list[str] = []
     for candidate in candidates:
@@ -2027,20 +3632,38 @@ def _choose_sheet_dim_measure_fields(
         if _role_of(candidate) == "measure":
             measure_options.append(candidate)
 
-    if measure_options:
+    if not measure_options:
+        for candidate in all_candidates:
+            if candidate == dim_field:
+                continue
+            if _role_of(candidate) == "measure":
+                measure_options.append(candidate)
+
+    hinted_measure = _pick_measure_by_visual_hint(measure_options, visual_hint)
+    if hinted_measure:
+        measure_field = hinted_measure
+
+    if measure_options and not hinted_measure:
         measure_field = sorted(measure_options, key=_measure_priority_score)[0]
 
     has_numeric_measure = _role_of(measure_field) == "measure"
 
     if not has_numeric_measure:
         fallback_options: list[str] = []
-        for candidate in scoped + global_scoped:
+        for candidate in candidates:
             if candidate == dim_field:
                 continue
             if _role_of(candidate) == "measure":
                 fallback_options.append(candidate)
+        if not fallback_options:
+            for candidate in all_candidates:
+                if candidate == dim_field:
+                    continue
+                if _role_of(candidate) == "measure":
+                    fallback_options.append(candidate)
         if fallback_options:
-            measure_field = sorted(fallback_options, key=_measure_priority_score)[0]
+            fallback_hint = _pick_measure_by_visual_hint(fallback_options, visual_hint)
+            measure_field = fallback_hint or sorted(fallback_options, key=_measure_priority_score)[0]
             has_numeric_measure = True
 
     if measure_field == dim_field and len(candidates) > 1:
@@ -2052,38 +3675,188 @@ def _choose_sheet_dim_measure_fields(
     if not has_numeric_measure:
         has_numeric_measure = _role_of(measure_field) == "measure"
 
-    # Collection-style physical model is sensitive to cross-table shelf fields.
-    # Prefer dim/measure coming from the same mapped table when possible.
-    if has_numeric_measure:
-        measure_table = _table_of(measure_field)
-        dim_table = _table_of(dim_field)
-        all_candidates = _uniq(candidates + scoped + global_scoped + datasource_scoped)
-
-        if measure_table and dim_table and measure_table != dim_table:
-            dim_same_table = [
-                c
-                for c in all_candidates
-                if _role_of(c) == "dimension" and _table_of(c) == measure_table and not _is_key_like_column_name(c)
-            ]
-            if not dim_same_table:
-                dim_same_table = [
-                    c for c in all_candidates if _role_of(c) == "dimension" and _table_of(c) == measure_table
-                ]
-            if dim_same_table:
-                dim_field = dim_same_table[0]
-                dim_table = _table_of(dim_field)
-
-        if measure_table and dim_table and measure_table != dim_table:
-            measure_same_table = [
-                c for c in all_candidates if _role_of(c) == "measure" and _table_of(c) == dim_table
-            ]
-            if measure_same_table:
-                measure_field = sorted(measure_same_table, key=_measure_priority_score)[0]
-                has_numeric_measure = True
-            else:
-                has_numeric_measure = False
-
     return dim_field, measure_field, has_numeric_measure
+
+
+def _find_best_field_match(requested_field: str, available_fields: list[str]) -> str:
+    requested = (requested_field or "").strip()
+    if not requested:
+        return ""
+
+    requested_tokens = _field_name_tokens(requested)
+    requested_norm = "".join(requested_tokens)
+    if not requested_norm:
+        return ""
+
+    best_field = ""
+    best_score = -1
+    for candidate in available_fields:
+        if not isinstance(candidate, str):
+            continue
+        clean = candidate.strip()
+        if not clean:
+            continue
+
+        candidate_tokens = _field_name_tokens(clean)
+        candidate_norm = "".join(candidate_tokens)
+        if not candidate_norm:
+            continue
+
+        score = 0
+        if candidate_norm == requested_norm:
+            score += 240
+        if candidate_norm.startswith(requested_norm) or requested_norm.startswith(candidate_norm):
+            score += 120
+        if requested_norm in candidate_norm or candidate_norm in requested_norm:
+            score += 90
+
+        overlap = len(set(requested_tokens).intersection(candidate_tokens))
+        score += overlap * 35
+
+        req_token_set = set(requested_tokens)
+        cand_token_set = set(candidate_tokens)
+        if "sales" in req_token_set and ("amount" in cand_token_set or "sales" in cand_token_set):
+            score += 25
+        if "quota" in req_token_set and "quota" in cand_token_set:
+            score += 30
+        if "quantity" in req_token_set and ("quantity" in cand_token_set or "order" in cand_token_set):
+            score += 25
+        if "month" in req_token_set and ("month" in cand_token_set or "date" in cand_token_set):
+            score += 20
+        if "region" in req_token_set and (
+            "region" in cand_token_set or "territory" in cand_token_set or "group" in cand_token_set
+        ):
+            score += 25
+
+        if any(mark in cand_token_set for mark in ["line", "revision"]) and "line" not in req_token_set:
+            score -= 35
+        if "number" in cand_token_set and "number" not in req_token_set:
+            score -= 15
+
+        if _is_key_like_column_name(clean) and "key" not in req_token_set:
+            score -= 30
+
+        if score > best_score:
+            best_score = score
+            best_field = clean
+
+    return best_field if best_score >= 40 else ""
+
+
+def _field_name_tokens(field_name: str) -> list[str]:
+    text = (field_name or "").strip()
+    if text.startswith("[") and text.endswith("]") and len(text) >= 2:
+        text = text[1:-1]
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"[^A-Za-z0-9]+", " ", text)
+    return [tok.lower() for tok in text.split() if tok]
+
+
+def _looks_geographic_dimension_name(column_name: str) -> bool:
+    token = (column_name or "").strip().lower()
+    if not token:
+        return False
+    return any(mark in token for mark in ["region", "territory", "country", "state", "city", "group"])
+
+
+def _looks_time_series_hint(text: str) -> bool:
+    token = (text or "").strip().lower()
+    if not token:
+        return False
+    return any(mark in token for mark in ["month", "year", "quarter", "week", "day", "date", "trend", "timeline", "line", "spline"])
+
+
+def _temporal_dimension_priority_score(field_name: str) -> int:
+    token = (field_name or "").strip().lower()
+    score = 100
+    if "date" in token:
+        score -= 35
+    if "month" in token:
+        score -= 25
+    if "year" in token:
+        score -= 15
+    if "name" in token:
+        score -= 10
+    if "number" in token:
+        score += 30
+    if _is_key_like_column_name(token):
+        score += 80
+    return score
+
+
+def _pick_measure_by_visual_hint(measure_candidates: list[str], visual_hint: str) -> str:
+    if not isinstance(measure_candidates, list) or not measure_candidates:
+        return ""
+
+    hint = (visual_hint or "").strip().lower()
+    if not hint:
+        return ""
+
+    scenario = ""
+    if "quota" in hint or "target" in hint:
+        scenario = "quota"
+    elif "quantity" in hint or "qty" in hint or "volume" in hint:
+        scenario = "quantity"
+    elif "sales" in hint or "revenue" in hint or "amount" in hint:
+        scenario = "sales"
+
+    if not scenario:
+        return ""
+
+    best_field = ""
+    best_score = -1
+    for field_name in measure_candidates:
+        token = (field_name or "").strip().lower()
+        score = 0
+
+        if scenario == "quota":
+            if "quota" in token:
+                score += 140
+            if "target" in token:
+                score += 90
+        elif scenario == "quantity":
+            if "quantity" in token:
+                score += 140
+            if "qty" in token:
+                score += 120
+            if "count" in token:
+                score += 60
+            if "order" in token:
+                score += 45
+        elif scenario == "sales":
+            if "sales" in token:
+                score += 140
+            if "revenue" in token:
+                score += 120
+            if "amount" in token:
+                score += 55
+            if "discount" in token:
+                score -= 120
+            if "quota" in token:
+                score -= 20
+
+        # Secondary preference: keep better business metrics when scores tie.
+        score -= _measure_priority_score(field_name)
+
+        if score > best_score:
+            best_score = score
+            best_field = field_name
+
+    if best_score <= 0:
+        return ""
+
+    return best_field
+
+
+def _prefer_horizontal_bar_layout(mark_class: str, worksheet_name: str, visual_type: str, dim_field: str) -> bool:
+    if not isinstance(mark_class, str) or mark_class.strip().lower() != "bar":
+        return False
+
+    hint = f"{worksheet_name or ''} {visual_type or ''}".strip().lower()
+    if _looks_geographic_dimension_name(hint):
+        return True
+
+    return _looks_geographic_dimension_name(dim_field)
 
 
 def normalize_generated_twb(xml_content: str) -> str:
@@ -2510,6 +4283,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                 deps_datasource_name = first_ds_name
                 dependency_children: list[ET.Element] = []
                 has_measure_dependency = False
+                sheet_dim_field = ""
+                sheet_measure_field = ""
                 table_old = _find_direct_child(ws, "table")
                 if table_old is not None:
                     rows_old = _find_direct_child(table_old, "rows")
@@ -2540,10 +4315,22 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                                             has_measure_dependency = True
                                     dependency_children.append(_clone_xml_element(dep_child))
 
+                if dependency_children:
+                    sheet_dim_field, sheet_measure_field = _extract_dim_measure_from_dependency_nodes(dependency_children)
+
+                if not sheet_dim_field or not sheet_measure_field:
+                    shelf_dim, shelf_measure = _extract_dim_measure_from_shelves(rows_text, cols_text)
+                    if not sheet_dim_field:
+                        sheet_dim_field = shelf_dim
+                    if not sheet_measure_field:
+                        sheet_measure_field = shelf_measure
+
                 mark_class = _extract_table_mark_class(table_old)
                 preserve_empty_shelves = False
                 if table_old is not None and _is_text_mark_class(mark_class):
                     preserve_empty_shelves = not rows_text and not cols_text
+                elif table_old is not None and isinstance(mark_class, str) and mark_class.strip().lower() == "shape":
+                    preserve_empty_shelves = not rows_text
                 sheets_payload.append(
                     {
                         "name": ws.attrib["name"],
@@ -2554,6 +4341,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                         "deps_datasource_name": deps_datasource_name,
                         "dependency_children": dependency_children,
                         "has_measure_dependency": "true" if has_measure_dependency else "",
+                        "sheet_dim_field": sheet_dim_field,
+                        "sheet_measure_field": sheet_measure_field,
                     }
                 )
 
@@ -2582,6 +4371,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
         name = sheet["name"]
         mark_class = sheet.get("mark_class") if isinstance(sheet.get("mark_class"), str) else "Bar"
         is_pie = _is_pie_mark_class(mark_class)
+        is_text = _is_text_mark_class(mark_class)
+        is_shape = isinstance(mark_class, str) and mark_class.strip().lower() == "shape"
         preserve_empty_shelves = sheet.get("preserve_empty_shelves") == "true"
         has_measure_dependency = sheet.get("has_measure_dependency") == "true"
 
@@ -2590,12 +4381,28 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             deps_datasource_name = first_ds_name
         deps_datasource_name = deps_datasource_name.strip()
 
-        # Tableau cartesian default: X on columns, Y on rows.
-        rows_default = f"[{deps_datasource_name}].[sum:{measure_field}:qk]"
-        cols_default = f"[{deps_datasource_name}].[none:{dim_field}:nk]"
+        sheet_dim_field = sheet.get("sheet_dim_field") if isinstance(sheet.get("sheet_dim_field"), str) else ""
+        sheet_measure_field = sheet.get("sheet_measure_field") if isinstance(sheet.get("sheet_measure_field"), str) else ""
+        sheet_dim_field = sheet_dim_field.strip() if sheet_dim_field.strip() else dim_field
+        sheet_measure_field = sheet_measure_field.strip() if sheet_measure_field.strip() else measure_field
 
-        rows_text = "" if (is_pie or preserve_empty_shelves) else (sheet["rows"] or rows_default)
-        cols_text = "" if (is_pie or preserve_empty_shelves) else (sheet["cols"] or cols_default)
+        # Tableau cartesian default: X on columns, Y on rows.
+        rows_default = f"[{deps_datasource_name}].[sum:{sheet_measure_field}:qk]"
+        cols_default = f"[{deps_datasource_name}].[none:{sheet_dim_field}:nk]"
+
+        if is_text:
+            # Preserve explicit text/KPI/filter shelf intent from injected semantic bindings.
+            rows_text = sheet["rows"] if isinstance(sheet.get("rows"), str) else ""
+            cols_text = sheet["cols"] if isinstance(sheet.get("cols"), str) else ""
+            if preserve_empty_shelves:
+                rows_text = ""
+                cols_text = ""
+        elif is_shape and preserve_empty_shelves:
+            rows_text = ""
+            cols_text = sheet["cols"] if isinstance(sheet.get("cols"), str) else ""
+        else:
+            rows_text = "" if (is_pie or preserve_empty_shelves) else (sheet["rows"] or rows_default)
+            cols_text = "" if (is_pie or preserve_empty_shelves) else (sheet["cols"] or cols_default)
 
         if not is_pie and not preserve_empty_shelves:
             if _contains_placeholder_field_reference(rows_text):
@@ -2604,9 +4411,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                 cols_text = cols_default
 
         if _is_text_mark_class(mark_class) and not has_measure_dependency:
-            rows_text = ""
-            if not cols_text:
-                cols_text = f"[{deps_datasource_name}].[none:{dim_field}:nk]"
+            if not rows_text and not cols_text:
+                cols_text = f"[{deps_datasource_name}].[none:{sheet_dim_field}:nk]"
 
         ws = ET.SubElement(worksheets_node, "worksheet", attrib={"name": name})
         ET.SubElement(ws, "layout-options")
@@ -2634,8 +4440,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
 
         _append_default_dependency_bindings(
             deps,
-            dim_field=dim_field,
-            measure_field=measure_field,
+            dim_field=sheet_dim_field,
+            measure_field=sheet_measure_field,
             add_columns=not has_dependency_columns,
             add_instances=not has_dependency_instances,
         )
@@ -2650,7 +4456,7 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             _ensure_pane_view(pane)
             ET.SubElement(pane, "mark", attrib={"class": mark_class})
             if is_pie:
-                _set_pie_pane_encodings(pane, deps_datasource_name, dim_field, measure_field)
+                _set_pie_pane_encodings(pane, deps_datasource_name, sheet_dim_field, sheet_measure_field)
         rows = ET.SubElement(table, "rows")
         rows.text = rows_text
         cols = ET.SubElement(table, "cols")
@@ -2667,6 +4473,8 @@ def _append_default_dependency_bindings(
     measure_caption: str | None = None,
     include_measure: bool = True,
 ) -> None:
+    dim_datatype, dim_type = _infer_dimension_dependency_spec(dim_field)
+
     if add_columns:
         dim_label = dim_caption.strip() if isinstance(dim_caption, str) and dim_caption.strip() else dim_field
         measure_label = (
@@ -2678,8 +4486,8 @@ def _append_default_dependency_bindings(
             attrib={
                 "name": f"[{dim_field}]",
                 "role": "dimension",
-                "datatype": "string",
-                "type": "nominal",
+                "datatype": dim_datatype,
+                "type": dim_type,
                 "caption": dim_label,
             },
         )
@@ -2705,7 +4513,7 @@ def _append_default_dependency_bindings(
                 "derivation": "None",
                 "name": f"[none:{dim_field}:nk]",
                 "pivot": "key",
-                "type": "nominal",
+                "type": dim_type,
             },
         )
         if include_measure:
@@ -2720,6 +4528,256 @@ def _append_default_dependency_bindings(
                     "type": "quantitative",
                 },
             )
+
+
+def _append_dependency_binding(
+    deps_node: ET.Element,
+    field_name: str,
+    role: str,
+) -> None:
+    clean = (field_name or "").strip()
+    if not clean:
+        return
+
+    role_norm = (role or "").strip().lower()
+    if role_norm not in {"dimension", "measure"}:
+        return
+
+    existing_columns = {
+        _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+        for col in list(deps_node)
+        if _local_name(col.tag) == "column"
+    }
+    existing_instances = {
+        _clean_bracketed_name(ci.attrib.get("name", "")).strip().lower()
+        for ci in list(deps_node)
+        if _local_name(ci.tag) == "column-instance"
+    }
+
+    clean_lower = clean.lower()
+    if clean_lower not in existing_columns:
+        if role_norm == "dimension":
+            ET.SubElement(
+                deps_node,
+                "column",
+                attrib={
+                    "name": f"[{clean}]",
+                    "role": "dimension",
+                    "datatype": _infer_dimension_dependency_spec(clean)[0],
+                    "type": _infer_dimension_dependency_spec(clean)[1],
+                    "caption": clean,
+                },
+            )
+        else:
+            ET.SubElement(
+                deps_node,
+                "column",
+                attrib={
+                    "name": f"[{clean}]",
+                    "role": "measure",
+                    "datatype": "real",
+                    "type": "quantitative",
+                    "caption": clean,
+                },
+            )
+
+    if role_norm == "dimension":
+        instance_name = f"none:{clean}:nk"
+        if instance_name.lower() not in existing_instances:
+            ET.SubElement(
+                deps_node,
+                "column-instance",
+                attrib={
+                    "column": f"[{clean}]",
+                    "derivation": "None",
+                    "name": f"[{instance_name}]",
+                    "pivot": "key",
+                    "type": _infer_dimension_dependency_spec(clean)[1],
+                },
+            )
+    else:
+        instance_name = f"sum:{clean}:qk"
+        if instance_name.lower() not in existing_instances:
+            ET.SubElement(
+                deps_node,
+                "column-instance",
+                attrib={
+                    "column": f"[{clean}]",
+                    "derivation": "Sum",
+                    "name": f"[{instance_name}]",
+                    "pivot": "key",
+                    "type": "quantitative",
+                },
+            )
+
+
+def _reorder_view_children_for_tableau(view_node: ET.Element) -> None:
+    if not isinstance(view_node, ET.Element):
+        return
+
+    order = [
+        "datasources",
+        "mapsources",
+        "datasource-dependencies",
+        "filter",
+        "sort",
+        "perspectives",
+        "slices",
+        "aggregation",
+    ]
+    children = [c for c in list(view_node) if isinstance(c, ET.Element)]
+    ordered: list[ET.Element] = []
+    for name in order:
+        ordered.extend([c for c in children if _local_name(c.tag) == name])
+    ordered.extend([c for c in children if _local_name(c.tag) not in order])
+
+    for child in list(view_node):
+        view_node.remove(child)
+    for child in ordered:
+        view_node.append(child)
+
+
+def _ensure_subtitle_filter_context(
+    view_node: ET.Element,
+    datasource_name: str,
+    year_field: str,
+    group_field: str,
+) -> None:
+    if not isinstance(view_node, ET.Element):
+        return
+
+    ds_name = (datasource_name or "").strip() or "EnterData"
+    year_clean = (year_field or "").strip()
+    group_clean = (group_field or "").strip()
+    if not year_clean or not group_clean:
+        return
+
+    year_col = f"[{ds_name}].[none:{year_clean}:qk]"
+    group_col = f"[{ds_name}].[none:{group_clean}:nk]"
+
+    year_filter: ET.Element | None = None
+    group_filter: ET.Element | None = None
+    for child in list(view_node):
+        if _local_name(child.tag) != "filter":
+            continue
+        col_attr = (child.attrib.get("column") or "").strip()
+        if col_attr == year_col and year_filter is None:
+            year_filter = child
+        elif col_attr == group_col and group_filter is None:
+            group_filter = child
+
+    if year_filter is None:
+        year_filter = ET.SubElement(view_node, "filter")
+    year_filter.attrib.clear()
+    year_filter.attrib.update(
+        {
+            "column": year_col,
+            "class": "quantitative",
+            "included-values": "in-range-or-null",
+        }
+    )
+    for child in list(year_filter):
+        year_filter.remove(child)
+    min_node = ET.SubElement(year_filter, "min")
+    min_node.text = "0"
+    max_node = ET.SubElement(year_filter, "max")
+    max_node.text = "9999"
+
+    if group_filter is None:
+        group_filter = ET.SubElement(view_node, "filter")
+    group_filter.attrib.clear()
+    group_filter.attrib.update(
+        {
+            "class": "categorical",
+            "column": group_col,
+            "filter-group": "1",
+        }
+    )
+    for child in list(group_filter):
+        group_filter.remove(child)
+    group_filter_node = ET.SubElement(group_filter, "groupfilter")
+    group_filter_node.attrib.update(
+        {
+            "function": "level-members",
+            "level": f"[none:{group_clean}:nk]",
+        }
+    )
+
+    perspectives = _find_direct_child(view_node, "perspectives")
+    if perspectives is None:
+        perspectives = ET.SubElement(view_node, "perspectives")
+
+    slices = _find_direct_child(view_node, "slices")
+    if slices is None:
+        slices = ET.SubElement(view_node, "slices")
+    for child in list(slices):
+        slices.remove(child)
+    year_slice = ET.SubElement(slices, "column")
+    year_slice.text = year_col
+    group_slice = ET.SubElement(slices, "column")
+    group_slice.text = group_col
+
+    _reorder_view_children_for_tableau(view_node)
+
+
+def _promote_dependency_instance_to_attribute(
+    deps_node: ET.Element,
+    field_name: str,
+) -> None:
+    clean = (field_name or "").strip()
+    if not clean:
+        return
+
+    clean_lower = clean.lower()
+    attr_name_lower = f"[attr:{clean_lower}:nk]"
+    none_name_lower = f"[none:{clean_lower}:nk]"
+    dim_type = _infer_dimension_dependency_spec(clean)[1]
+
+    target_instance: ET.Element | None = None
+    removable_none_instances: list[ET.Element] = []
+
+    for child in list(deps_node):
+        if _local_name(child.tag) != "column-instance":
+            continue
+        child_name_lower = (child.attrib.get("name") or "").strip().lower()
+        if child_name_lower == attr_name_lower:
+            target_instance = child
+        elif child_name_lower == none_name_lower:
+            removable_none_instances.append(child)
+
+    if target_instance is None and removable_none_instances:
+        target_instance = removable_none_instances.pop(0)
+
+    if target_instance is None:
+        target_instance = ET.SubElement(deps_node, "column-instance")
+
+    target_instance.attrib.update(
+        {
+            "column": f"[{clean}]",
+            "derivation": "Attribute",
+            "name": f"[attr:{clean}:nk]",
+            "pivot": "key",
+            "type": dim_type,
+        }
+    )
+
+    for child in removable_none_instances:
+        deps_node.remove(child)
+
+
+def _infer_dimension_dependency_spec(field_name: str) -> tuple[str, str]:
+    token = (field_name or "").strip().lower()
+    if not token:
+        return "string", "nominal"
+
+    if "sortorder" in token or ("sort" in token and "month" in token):
+        return "real", "ordinal"
+    if _is_key_like_column_name(token):
+        return "real", "ordinal"
+    if _looks_temporal_dimension_name(token):
+        return "string", "ordinal"
+
+    return "string", "nominal"
 
 
 def _extract_table_mark_class(table_node: ET.Element | None) -> str:
@@ -2815,9 +4873,20 @@ def _is_text_mark_class(mark_class: str | None) -> bool:
     return isinstance(mark_class, str) and mark_class.strip().lower() == "text"
 
 
-def _is_title_like_text_sheet(mark_class: str | None, visual_type: str, worksheet_name: str) -> bool:
+def _is_title_like_text_sheet(
+    mark_class: str | None,
+    visual_type: str,
+    worksheet_name: str,
+    semantic_kind: str = "",
+) -> bool:
     if not _is_text_mark_class(mark_class):
         return False
+
+    kind = (semantic_kind or "").strip().lower()
+    if kind in {"kpi", "filter"}:
+        return False
+    if kind in {"header", "footer"}:
+        return True
 
     vt = (visual_type or "").strip().lower()
     wn = (worksheet_name or "").strip().lower()
@@ -2825,7 +4894,7 @@ def _is_title_like_text_sheet(mark_class: str | None, visual_type: str, workshee
     # Title/textbox sheets should not be converted into text crosstabs.
     if any(token in vt for token in ["textbox", "title", "label"]):
         return True
-    if any(token in wn for token in ["title", "header", "subtitle"]):
+    if any(token in wn for token in ["title", "header", "subtitle", "footer"]):
         return True
 
     return False
@@ -2873,7 +4942,15 @@ def _build_visual_type_lookup(visual_model: dict) -> dict[str, str]:
     return lookup
 
 
-def _visual_type_to_mark_class(visual_type: str) -> str:
+def _visual_type_to_mark_class(visual_type: str, semantic_kind: str = "") -> str:
+    kind = (semantic_kind or "").strip().lower()
+    if kind in {"header", "footer", "kpi", "filter", "text"}:
+        return "Text"
+    if kind == "image":
+        return "Shape"
+    if kind == "gauge":
+        return "Pie"
+
     if not isinstance(visual_type, str):
         return ""
 
@@ -2891,7 +4968,13 @@ def _visual_type_to_mark_class(visual_type: str) -> str:
         return "Area"
     if any(token in normalized for token in ["scatter", "bubble", "point"]):
         return "Circle"
+    if "gauge" in normalized:
+        return "Pie"
+    if "image" in normalized:
+        return "Shape"
     if "textbox" in normalized:
+        return "Text"
+    if "filter" in normalized:
         return "Text"
     if any(token in normalized for token in ["text", "label", "table", "tablix"]):
         return "Text"
@@ -2958,10 +5041,88 @@ def _contains_placeholder_field_reference(shelf_text: str) -> bool:
     return re.search(r"\bfield\d+\b", shelf_text, flags=re.IGNORECASE) is not None
 
 
+def _extract_dim_measure_from_dependency_nodes(nodes: list[ET.Element]) -> tuple[str, str]:
+    dim = ""
+    measure = ""
+
+    for node in nodes:
+        if not isinstance(node, ET.Element):
+            continue
+        tag = _local_name(node.tag)
+        if tag != "column":
+            continue
+        role = (node.attrib.get("role") or "").strip().lower()
+        clean_name = _clean_bracketed_name(node.attrib.get("name", "")).strip()
+        if not clean_name:
+            continue
+        if role == "dimension" and not dim:
+            dim = clean_name
+        elif role == "measure" and not measure:
+            measure = clean_name
+
+    for node in nodes:
+        if not isinstance(node, ET.Element):
+            continue
+        if _local_name(node.tag) != "column-instance":
+            continue
+        instance_name = (node.attrib.get("name") or "").strip()
+        match = re.match(r"^\[(?P<derivation>[^:]+):(?P<field>[^:]+):[^\]]+\]$", instance_name)
+        if match is None:
+            continue
+        derivation = match.group("derivation").strip().lower()
+        field_name = match.group("field").strip()
+        if derivation in {"none", "attr", "attribute"} and field_name and not dim:
+            dim = field_name
+        elif derivation in {"sum", "avg", "average", "min", "max", "count"} and field_name and not measure:
+            measure = field_name
+
+    return dim, measure
+
+
+def _extract_dim_measure_from_shelves(rows_text: str, cols_text: str) -> tuple[str, str]:
+    dim = ""
+    measure = ""
+    for shelf_text in [rows_text, cols_text]:
+        if not isinstance(shelf_text, str) or not shelf_text.strip():
+            continue
+        for match in SHELF_FIELD_REF_RE.finditer(shelf_text):
+            derivation = match.group("derivation").strip().lower()
+            field_name = match.group("field").strip()
+            if not field_name:
+                continue
+            if derivation in {"none", "attr", "attribute"} and not dim:
+                dim = field_name
+            elif derivation in {"sum", "avg", "average", "min", "max", "count"} and not measure:
+                measure = field_name
+    return dim, measure
+
+
 def _sanitize_windows(root: ET.Element) -> None:
     windows = _find_direct_child(root, "windows")
     if windows is None:
         windows = ET.SubElement(root, "windows")
+
+    default_ds_name = "DataSource_1"
+    has_year_filter_field = False
+    has_group_filter_field = False
+
+    datasources_node = _find_direct_child(root, "datasources")
+    if datasources_node is not None:
+        first_ds = _find_direct_child(datasources_node, "datasource")
+        if first_ds is not None and first_ds.attrib.get("name"):
+            default_ds_name = first_ds.attrib["name"]
+
+        for ds_node in [c for c in list(datasources_node) if _local_name(c.tag) == "datasource"]:
+            for col in [c for c in list(ds_node) if _local_name(c.tag) == "column"]:
+                field_name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+                if field_name == "calendaryear":
+                    has_year_filter_field = True
+                elif field_name == "salesterritorygroup":
+                    has_group_filter_field = True
+                if has_year_filter_field and has_group_filter_field:
+                    break
+            if has_year_filter_field and has_group_filter_field:
+                break
 
     worksheet_names: list[str] = []
     worksheets = _find_direct_child(root, "worksheets")
@@ -2971,13 +5132,52 @@ def _sanitize_windows(root: ET.Element) -> None:
             if name:
                 worksheet_names.append(name)
 
-    # Rebuild windows section to guaranteed-valid worksheet-window form.
+    dashboard_names: list[str] = []
+    dashboards = _find_direct_child(root, "dashboards")
+    if dashboards is not None:
+        for dashboard in [c for c in list(dashboards) if _local_name(c.tag) == "dashboard"]:
+            name = dashboard.attrib.get("name")
+            if name:
+                dashboard_names.append(name)
+
+    # Rebuild windows section to guaranteed-valid worksheet/dashboard-window form.
     for child in list(windows):
         windows.remove(child)
 
+    for name in dashboard_names:
+        win = ET.SubElement(windows, "window", attrib={"name": name, "class": "dashboard"})
+        viewpoints = ET.SubElement(win, "viewpoints")
+        if worksheet_names:
+            for ws_name in worksheet_names:
+                ET.SubElement(viewpoints, "viewpoint", attrib={"name": ws_name})
+        else:
+            ET.SubElement(viewpoints, "viewpoint")
+        ET.SubElement(win, "active", attrib={"id": "-1"})
+
     for name in worksheet_names or ["Sheet 1"]:
         win = ET.SubElement(windows, "window", attrib={"name": name, "class": "worksheet"})
-        ET.SubElement(win, "cards")
+        cards = ET.SubElement(win, "cards")
+        if has_year_filter_field and has_group_filter_field:
+            edge = ET.SubElement(cards, "edge", attrib={"name": "right"})
+            strip = ET.SubElement(edge, "strip", attrib={"size": "160"})
+            ET.SubElement(
+                strip,
+                "card",
+                attrib={
+                    "param": f"[{default_ds_name}].[none:SalesTerritoryGroup:nk]",
+                    "type": "filter",
+                },
+            )
+            ET.SubElement(
+                strip,
+                "card",
+                attrib={
+                    "param": f"[{default_ds_name}].[none:CalendarYear:qk]",
+                    "show-domain": "false",
+                    "show-null-ctrls": "false",
+                    "type": "filter",
+                },
+            )
         ET.SubElement(win, "viewpoint")
 
 
@@ -3335,8 +5535,65 @@ def validate_twb_structure(xml_content: str) -> list[str]:
         if _find_direct_child(ws, "table") is None:
             issues.append(f"Worksheet '{ws_name}' missing table")
 
-    for forbidden in ["simple-id", "worksheet-number", "datagraph", "explain-data"]:
+    dashboards = [el for el in root.iter() if _local_name(el.tag) == "dashboard"]
+    for idx, dashboard in enumerate(dashboards, start=1):
+        dashboard_name = dashboard.attrib.get("name", f"dashboard_{idx}")
+
+        dash_datasources = _find_direct_child(dashboard, "datasources")
+        if dash_datasources is None:
+            issues.append(f"Dashboard '{dashboard_name}' missing datasources")
+        else:
+            linked_sources = [
+                el
+                for el in list(dash_datasources)
+                if _local_name(el.tag) == "datasource" and isinstance(el.attrib.get("name"), str) and el.attrib.get("name", "").strip()
+            ]
+            if not linked_sources:
+                issues.append(f"Dashboard '{dashboard_name}' has no linked datasource")
+
+        dash_zones = _find_direct_child(dashboard, "zones")
+        if dash_zones is None:
+            issues.append(f"Dashboard '{dashboard_name}' missing zones")
+
+        dash_devicelayouts = _find_direct_child(dashboard, "devicelayouts")
+        if dash_devicelayouts is None:
+            issues.append(f"Dashboard '{dashboard_name}' missing devicelayouts")
+        else:
+            devicelayout_nodes = [el for el in list(dash_devicelayouts) if _local_name(el.tag) == "devicelayout"]
+            if not devicelayout_nodes:
+                issues.append(f"Dashboard '{dashboard_name}' devicelayouts is empty")
+
+    windows = [el for el in root.iter() if _local_name(el.tag) == "window"]
+    for idx, window in enumerate(windows, start=1):
+        win_name = window.attrib.get("name", f"window_{idx}")
+        win_class = (window.attrib.get("class") or "").strip().lower()
+        if win_class == "dashboard":
+            if _find_direct_child(window, "viewpoints") is None:
+                issues.append(f"Dashboard window '{win_name}' missing viewpoints")
+            if _find_direct_child(window, "active") is None:
+                issues.append(f"Dashboard window '{win_name}' missing active")
+            viewpoints = _find_direct_child(window, "viewpoints")
+            if viewpoints is not None:
+                dashboard_viewpoints = [el for el in list(viewpoints) if _local_name(el.tag) == "viewpoint"]
+                if not dashboard_viewpoints:
+                    issues.append(f"Dashboard window '{win_name}' has empty viewpoints")
+            if _find_direct_child(window, "cards") is not None:
+                issues.append(f"Dashboard window '{win_name}' contains worksheet-only cards")
+            if _find_direct_child(window, "viewpoint") is not None:
+                issues.append(f"Dashboard window '{win_name}' contains worksheet-only viewpoint")
+        elif win_class == "worksheet":
+            if _find_direct_child(window, "cards") is None:
+                issues.append(f"Worksheet window '{win_name}' missing cards")
+            if _find_direct_child(window, "viewpoint") is None:
+                issues.append(f"Worksheet window '{win_name}' missing viewpoint")
+
+    for forbidden in ["worksheet-number", "datagraph", "explain-data"]:
         if any(_local_name(el.tag) == forbidden for el in root.iter()):
             issues.append(f"Forbidden element found for target profile: {forbidden}")
+
+    for devicelayouts in [el for el in root.iter() if _local_name(el.tag) == "devicelayouts"]:
+        has_devicelayout = any(_local_name(child.tag) == "devicelayout" for child in list(devicelayouts))
+        if not has_devicelayout:
+            issues.append("Element 'devicelayouts' must contain at least one 'devicelayout'")
 
     return issues

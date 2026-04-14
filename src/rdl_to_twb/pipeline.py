@@ -117,6 +117,7 @@ def run_conversion(
         data_model=data_model,
         visual_model=visual_model,
         mapping=mapping,
+        report_parameters=parsed_payload.get("report_parameters", []),
     )
 
     xml_content, issues = _validate_and_repair_loop(
@@ -406,11 +407,23 @@ def _compact_visual_properties(properties: dict) -> dict:
 
     compact: dict[str, object] = {}
 
-    for key in ["field_references", "parameter_references", "text_values", "hidden_expression"]:
+    for key in [
+        "field_references",
+        "parameter_references",
+        "text_values",
+        "hidden_expression",
+        "container_section",
+        "semantic_hint",
+    ]:
         value = properties.get(key)
         if isinstance(value, list):
             compact[key] = value[:20]
         elif value not in (None, ""):
+            compact[key] = value
+
+    for key in ["image", "gauge"]:
+        value = properties.get(key)
+        if isinstance(value, dict) and value:
             compact[key] = value
 
     for key in ["filters", "sort_expressions", "groups"]:
