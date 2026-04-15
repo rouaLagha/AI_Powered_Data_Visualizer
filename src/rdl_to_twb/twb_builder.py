@@ -4,6 +4,11 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
+try:
+    import winreg  # type: ignore[attr-defined]
+except Exception:
+    winreg = None
+
 
 SQL_TABLE_REF_RE = re.compile(
     r"\b(?:from|join)\s+((?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$]*)){0,2})",
@@ -77,10 +82,17 @@ def inject_datasource_connections(
 
     for index, ds in enumerate(data_sources, start=1):
         ds_name = ds.get("name") or f"DataSource_{index}"
-        provider = (ds.get("provider") or "").lower()
-        provider_class = _provider_to_tableau_class(provider)
+        provider_raw = ds.get("provider") or ""
+        provider = provider_raw.lower()
         conn_string = ds.get("connection_string") or ""
         parsed_conn = _parse_connection_string(conn_string)
+        provider_class = _provider_to_tableau_class(provider, conn_string)
+        if provider_class == "snowflake":
+            parsed_conn = _enrich_snowflake_connection_details(parsed_conn)
+            parsed_conn = _normalize_snowflake_connection_identifiers(parsed_conn)
+            if not parsed_conn.get("server"):
+                # DSN-only sources without resolved host cannot use Tableau's native Snowflake connector.
+                provider_class = "genericodbc"
         security_type = (ds.get("security_type") or "").lower()
         credential_retrieval = (ds.get("credential_retrieval") or "").lower()
         windows_credentials = ds.get("windows_credentials")
@@ -91,6 +103,12 @@ def inject_datasource_connections(
             datasource_node.set("caption", ds_name)
         datasource_node.attrib.setdefault("inline", "true")
         datasource_node.attrib.setdefault("hasconnection", "true")
+        datasource_node.attrib.setdefault("version", "18.1")
+
+        aliases_node = _find_direct_child(datasource_node, "aliases")
+        if aliases_node is None:
+            aliases_node = ET.SubElement(datasource_node, "aliases")
+        aliases_node.attrib["enabled"] = "yes"
 
         connection_node = datasource_node.find("connection")
         if connection_node is None:
@@ -113,7 +131,18 @@ def inject_datasource_connections(
                 provider_class=provider_class,
                 server_name=parsed_conn.get("server") or "",
             )
-            for attr in ["server", "dbname", "port", "authentication", "username", "odbc-connect-string-extras"]:
+            for attr in [
+                "server",
+                "dbname",
+                "port",
+                "schema",
+                "warehouse",
+                "role",
+                "authenticator",
+                "authentication",
+                "username",
+                "odbc-connect-string-extras",
+            ]:
                 connection_node.attrib.pop(attr, None)
 
         if parsed_conn.get("server"):
@@ -122,7 +151,21 @@ def inject_datasource_connections(
             target_connection.set("dbname", parsed_conn["dbname"])
         if parsed_conn.get("port"):
             target_connection.set("port", parsed_conn["port"])
-        if parsed_conn.get("odbc_connect_string_extras"):
+        if provider_class == "snowflake":
+            target_connection.set("odbc-connect-string-extras", "")
+            target_connection.set("max-varchar-size", "")
+            target_connection.set("one-time-sql", "")
+            target_connection.set("temp-table-detection", "optimized")
+        if provider_class == "snowflake" and parsed_conn.get("schema"):
+            target_connection.set("schema", parsed_conn["schema"])
+        if provider_class == "snowflake" and parsed_conn.get("warehouse"):
+            target_connection.set("warehouse", parsed_conn["warehouse"])
+        if provider_class == "snowflake" and parsed_conn.get("role"):
+            target_connection.set("role", parsed_conn["role"])
+            target_connection.set("service", parsed_conn["role"])
+        if provider_class == "snowflake" and parsed_conn.get("authenticator"):
+            target_connection.set("authenticator", parsed_conn["authenticator"])
+        if provider_class != "snowflake" and parsed_conn.get("odbc_connect_string_extras"):
             target_connection.set("odbc-connect-string-extras", parsed_conn["odbc_connect_string_extras"])
 
         authentication = _map_tableau_authentication(
@@ -131,11 +174,20 @@ def inject_datasource_connections(
             windows_credentials=windows_credentials,
             connection_string=conn_string,
             user_name=user_name,
+            provider_class=provider_class,
         )
         if authentication:
-            target_connection.set("authentication", authentication)
-        if authentication == "username-password" and isinstance(user_name, str) and user_name.strip():
-            target_connection.set("username", user_name.strip())
+            if provider_class == "snowflake" and authentication == "username-password":
+                target_connection.set("authentication", "Username Password")
+            else:
+                target_connection.set("authentication", authentication)
+        resolved_user_name = ""
+        if isinstance(user_name, str) and user_name.strip():
+            resolved_user_name = user_name.strip()
+        elif isinstance(parsed_conn.get("username"), str) and parsed_conn["username"].strip():
+            resolved_user_name = parsed_conn["username"].strip()
+        if authentication == "username-password" and resolved_user_name:
+            target_connection.set("username", resolved_user_name)
 
         related_sets = _datasets_for_datasource(
             data_sets,
@@ -172,6 +224,9 @@ def inject_datasource_connections(
                 relation_connection_name=relation_connection,
                 table_refs=table_refs,
                 join_specs=join_specs,
+                provider_class=provider_class,
+                default_dbname=parsed_conn.get("dbname") or "",
+                default_schema=parsed_conn.get("schema") or "",
             )
             has_relation = True
         elif _find_direct_child(connection_node, "relation") is not None:
@@ -229,6 +284,8 @@ def _looks_federated_connection(connection_node: ET.Element) -> bool:
 
 
 def _should_prefer_federated_connection(provider_class: str, parsed_conn: dict[str, str]) -> bool:
+    if provider_class == "snowflake":
+        return bool(parsed_conn.get("server") or parsed_conn.get("dbname") or parsed_conn.get("schema"))
     if provider_class != "sqlserver":
         return False
     return bool(parsed_conn.get("server") or parsed_conn.get("dbname"))
@@ -547,6 +604,24 @@ def _clean_sql_identifier(value: str) -> str:
     return text.strip()
 
 
+def _normalize_snowflake_identifier_token(value: str) -> str:
+    """Return Snowflake-safe identifier token casing for unquoted names."""
+    token = _clean_sql_identifier(value)
+    if not token:
+        return ""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", token):
+        return token.upper()
+    return token
+
+
+def _normalize_snowflake_connection_identifiers(parsed_conn: dict[str, str]) -> dict[str, str]:
+    normalized = dict(parsed_conn)
+    for key in ["dbname", "schema", "warehouse", "role"]:
+        if normalized.get(key):
+            normalized[key] = _normalize_snowflake_identifier_token(normalized[key])
+    return normalized
+
+
 def _collect_dataset_field_specs(data_sets: list[dict]) -> list[dict[str, str | None]]:
     specs: list[dict[str, str | None]] = []
     seen: set[str] = set()
@@ -616,15 +691,46 @@ def _collect_dataset_field_specs(data_sets: list[dict]) -> list[dict[str, str | 
     return specs
 
 
-def _normalize_table_reference(table_ref: str) -> str:
-    parts = [p.strip() for p in (table_ref or "").split(".") if p.strip()]
-    normalized: list[str] = []
-    for part in parts:
-        clean = part[1:-1].strip() if part.startswith("[") and part.endswith("]") else part.strip("[] ")
-        if clean:
-            normalized.append(f"[{clean}]")
-    if not normalized:
+def _normalize_table_reference(
+    table_ref: str,
+    provider_class: str = "",
+    default_dbname: str = "",
+    default_schema: str = "",
+) -> str:
+    clean_parts = [_clean_sql_identifier(p) for p in (table_ref or "").split(".") if p.strip()]
+    clean_parts = [p for p in clean_parts if p]
+    if not clean_parts:
         return "[UnknownTable]"
+
+    provider = (provider_class or "").strip().lower()
+    dbname = _clean_sql_identifier(default_dbname)
+    schema = _clean_sql_identifier(default_schema)
+
+    if provider == "snowflake":
+        clean_parts = [_normalize_snowflake_identifier_token(p) for p in clean_parts]
+        dbname = _normalize_snowflake_identifier_token(dbname)
+        schema = _normalize_snowflake_identifier_token(schema)
+
+        if len(clean_parts) >= 3:
+            tail = clean_parts[-3:]
+            return ".".join(f"[{part}]" for part in tail)
+
+        if len(clean_parts) == 2:
+            first, second = clean_parts
+            if dbname and first.lower() != dbname.lower():
+                return f"[{dbname}].[{first}].[{second}]"
+            return f"[{first}].[{second}]"
+
+        table_only = clean_parts[0]
+        if dbname and schema:
+            return f"[{dbname}].[{schema}].[{table_only}]"
+        if schema:
+            return f"[{schema}].[{table_only}]"
+        if dbname:
+            return f"[{dbname}].[{table_only}]"
+        return f"[{table_only}]"
+
+    normalized = [f"[{part}]" for part in clean_parts]
     if len(normalized) == 1:
         # SQL Server fallback: unqualified table names are commonly in dbo schema.
         return f"[dbo].{normalized[0]}"
@@ -646,6 +752,9 @@ def _align_federated_relations_to_tables(
     relation_connection_name: str,
     table_refs: list[str],
     join_specs: list[dict[str, str]] | None = None,
+    provider_class: str = "",
+    default_dbname: str = "",
+    default_schema: str = "",
 ) -> None:
     for child in list(connection_node):
         if _local_name(child.tag) == "relation":
@@ -655,7 +764,12 @@ def _align_federated_relations_to_tables(
     table_by_name: dict[str, str] = {}
     for table_ref in table_refs[:24]:
         name = _relation_name_from_table_reference(table_ref)
-        norm = _normalize_table_reference(table_ref)
+        norm = _normalize_table_reference(
+            table_ref=table_ref,
+            provider_class=provider_class,
+            default_dbname=default_dbname,
+            default_schema=default_schema,
+        )
         if name not in table_by_name:
             table_items.append((name, norm))
             table_by_name[name] = norm
@@ -2857,7 +2971,7 @@ def _rebuild_dashboards_from_sheet_specs(
 
     worksheet_names = header_sheets + content_sheets + filter_sheets + footer_sheets
 
-    if len(worksheet_names) < 2:
+    if len(worksheet_names) < 1:
         return
 
     dashboards = _find_direct_child(root, "dashboards")
@@ -3176,6 +3290,10 @@ def _should_skip_sheet_spec(
     ).strip().lower()
 
     if vt == "rectangle":
+        return True
+
+    # Keep page header/footer content out of worksheet tabs.
+    if kind in {"header", "footer"}:
         return True
 
     if kind == "text" and section == "body":
@@ -4009,7 +4127,18 @@ def _find_or_create_datasource(datasources_node: ET.Element, datasource_name: st
     )
 
 
-def _provider_to_tableau_class(provider: str) -> str:
+def _looks_like_snowflake_connection(provider: str, connection_string: str) -> bool:
+    provider_token = (provider or "").strip().lower()
+    conn = (connection_string or "").strip().lower()
+
+    if "snowflake" in provider_token:
+        return True
+    return "snowflake" in conn
+
+
+def _provider_to_tableau_class(provider: str, connection_string: str = "") -> str:
+    if _looks_like_snowflake_connection(provider, connection_string):
+        return "snowflake"
     if "sql" in provider:
         return "sqlserver"
     if "oracle" in provider:
@@ -4030,8 +4159,17 @@ def _parse_connection_string(connection_string: str) -> dict[str, str]:
         key, value = part.split("=", 1)
         kv[key.strip().lower()] = value.strip()
 
-    server = kv.get("data source") or kv.get("server") or kv.get("address") or ""
-    dbname = kv.get("initial catalog") or kv.get("database") or kv.get("dbname") or ""
+    dsn = kv.get("dsn") or kv.get("odbc dsn") or ""
+    account = kv.get("account") or ""
+    server = kv.get("data source") or kv.get("server") or kv.get("host") or kv.get("address") or ""
+    if not server and account:
+        server = f"{account}.snowflakecomputing.com"
+    dbname = kv.get("initial catalog") or kv.get("database") or kv.get("dbname") or kv.get("db") or ""
+    schema = kv.get("schema") or kv.get("current schema") or ""
+    username = kv.get("uid") or kv.get("user id") or kv.get("user") or kv.get("username") or ""
+    warehouse = kv.get("warehouse") or ""
+    role = kv.get("role") or ""
+    authenticator = kv.get("authenticator") or ""
 
     port = ""
     # SQL Server style: server,1433
@@ -4068,11 +4206,88 @@ def _parse_connection_string(connection_string: str) -> dict[str, str]:
         extras_parts.append(f"{key.strip()}={value.strip()}")
 
     return {
+        "dsn": dsn,
         "server": server,
         "dbname": dbname,
         "port": port,
+        "schema": schema,
+        "username": username,
+        "warehouse": warehouse,
+        "role": role,
+        "authenticator": authenticator,
         "odbc_connect_string_extras": ";".join(extras_parts),
     }
+
+
+def _enrich_snowflake_connection_details(parsed_conn: dict[str, str]) -> dict[str, str]:
+    enriched = dict(parsed_conn)
+    dsn_name = (enriched.get("dsn") or "").strip()
+    if not dsn_name:
+        return enriched
+
+    dsn_values = _resolve_windows_odbc_dsn(dsn_name)
+    if not dsn_values:
+        return enriched
+
+    for key in ["server", "dbname", "schema", "username", "warehouse", "role", "authenticator"]:
+        if not enriched.get(key) and dsn_values.get(key):
+            enriched[key] = dsn_values[key]
+
+    return enriched
+
+
+def _resolve_windows_odbc_dsn(dsn_name: str) -> dict[str, str]:
+    if winreg is None:
+        return {}
+
+    candidate_paths = [
+        fr"Software\ODBC\ODBC.INI\{dsn_name}",
+        fr"Software\WOW6432Node\ODBC\ODBC.INI\{dsn_name}",
+    ]
+    hives = [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]
+
+    values: dict[str, str] = {}
+
+    def _read_value(key_obj, name: str) -> str:
+        try:
+            raw, _ = winreg.QueryValueEx(key_obj, name)
+        except OSError:
+            return ""
+        return str(raw).strip() if raw is not None else ""
+
+    for hive in hives:
+        for reg_path in candidate_paths:
+            try:
+                with winreg.OpenKey(hive, reg_path) as key_obj:
+                    server = _read_value(key_obj, "SERVER") or _read_value(key_obj, "HOST")
+                    account = _read_value(key_obj, "ACCOUNT")
+                    if not server and account:
+                        server = f"{account}.snowflakecomputing.com"
+
+                    if server:
+                        values.setdefault("server", server)
+                    database = _read_value(key_obj, "DATABASE") or _read_value(key_obj, "DB")
+                    if database:
+                        values.setdefault("dbname", database)
+                    schema = _read_value(key_obj, "SCHEMA")
+                    if schema:
+                        values.setdefault("schema", schema)
+                    user = _read_value(key_obj, "UID") or _read_value(key_obj, "USER") or _read_value(key_obj, "USERNAME")
+                    if user:
+                        values.setdefault("username", user)
+                    warehouse = _read_value(key_obj, "WAREHOUSE")
+                    if warehouse:
+                        values.setdefault("warehouse", warehouse)
+                    role = _read_value(key_obj, "ROLE")
+                    if role:
+                        values.setdefault("role", role)
+                    authenticator = _read_value(key_obj, "AUTHENTICATOR")
+                    if authenticator:
+                        values.setdefault("authenticator", authenticator)
+            except OSError:
+                continue
+
+    return values
 
 
 def _map_tableau_authentication(
@@ -4081,8 +4296,28 @@ def _map_tableau_authentication(
     windows_credentials: bool | None,
     connection_string: str,
     user_name: str | None,
+    provider_class: str = "",
 ) -> str:
     conn = (connection_string or "").lower()
+    provider = (provider_class or "").strip().lower()
+
+    has_conn_user = bool(re.search(r"(^|;)\s*(?:user id|uid|user|username)\s*=", conn))
+    has_conn_password = bool(re.search(r"(^|;)\s*(?:pwd|password)\s*=", conn))
+    has_explicit_user = bool(isinstance(user_name, str) and user_name.strip())
+
+    # When credentials are explicitly present in the connection string, prefer username/password.
+    if has_conn_user or has_conn_password or has_explicit_user:
+        if credential_retrieval == "prompt":
+            return "prompt"
+        return "username-password"
+
+    # Snowflake ODBC sources are credential-based in this pipeline; avoid SQL-Server SSPI defaults.
+    if provider == "snowflake" or _looks_like_snowflake_connection(provider, conn):
+        if credential_retrieval == "prompt":
+            return "prompt"
+        if credential_retrieval == "store" or has_conn_user or has_conn_password or has_explicit_user:
+            return "username-password"
+        return "username-password"
 
     if security_type == "windows":
         return "sspi"
@@ -4102,7 +4337,7 @@ def _map_tableau_authentication(
         return "sspi"
     if "integrated security=true" in conn or "integrated security=sspi" in conn or "trusted_connection=true" in conn:
         return "sspi"
-    if "user id=" in conn or "uid=" in conn or (isinstance(user_name, str) and user_name.strip()):
+    if has_conn_user or has_explicit_user:
         return "username-password"
 
     # Conservative default for SQL Server-like local environments.

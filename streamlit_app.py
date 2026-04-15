@@ -61,6 +61,11 @@ def main() -> None:
     )
 
     output_dir_str = st.text_input("Output folder", value=str(ROOT_DIR / "output"))
+    publish_enabled = st.checkbox(
+        "Enable publish stage (extract + publish + desktop RPA)",
+        value=False,
+        help="Disable this for conversion-only tests.",
+    )
 
     if st.button("Convert", type="primary", disabled=uploaded_file is None):
         if uploaded_file is None:
@@ -79,6 +84,7 @@ def main() -> None:
                         twb_xsd_path=TWB_XSD_PATH,
                         output_dir=Path(output_dir_str),
                         config_path=Path(config_path_str),
+                        publish_enabled=publish_enabled,
                     )
                 except Exception as exc:
                     st.error(f"Conversion failed: {exc}")

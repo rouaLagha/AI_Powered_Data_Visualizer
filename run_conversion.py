@@ -36,6 +36,11 @@ def main() -> None:
         default=str(DEFAULT_CONFIG_PATH),
         help="Path to LLM config JSON",
     )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Run conversion only and skip extract/publish/RPA stages",
+    )
 
     args = parser.parse_args()
 
@@ -45,6 +50,7 @@ def main() -> None:
         twb_xsd_path=Path(args.twb_xsd),
         output_dir=Path(args.output_dir),
         config_path=Path(args.config),
+        publish_enabled=not args.no_publish,
     )
 
     print("Conversion complete. Files generated:")

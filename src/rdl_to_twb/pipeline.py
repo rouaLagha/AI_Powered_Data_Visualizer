@@ -34,6 +34,7 @@ def run_conversion(
     twb_xsd_path: str | Path,
     output_dir: str | Path,
     config_path: str | Path | None = None,
+    publish_enabled: bool | None = None,
 ) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +144,13 @@ def run_conversion(
     pipeline_trace.append("TWB file written")
 
     tableau_cfg = cfg.get("tableau_server") if isinstance(cfg, dict) else None
+    configured_publish_enabled = bool(tableau_cfg.get("enabled", False)) if isinstance(tableau_cfg, dict) else False
+    effective_publish_enabled = configured_publish_enabled if publish_enabled is None else bool(publish_enabled)
+
+    if publish_enabled is not None and isinstance(tableau_cfg, dict):
+        tableau_cfg = dict(tableau_cfg)
+        tableau_cfg["enabled"] = effective_publish_enabled
+
     fail_on_publish_error = bool(tableau_cfg.get("fail_on_error", False)) if isinstance(tableau_cfg, dict) else False
     publish_input_path = Path(twb_path)
     tableau_extract_report: dict = {
@@ -151,7 +159,15 @@ def run_conversion(
         "publish_input_path": str(publish_input_path),
     }
 
-    if isinstance(tableau_cfg, dict) and bool(tableau_cfg.get("enabled", False)):
+    if not effective_publish_enabled:
+        tableau_extract_report = {
+            "status": "skipped",
+            "reason": "Publish stage disabled for conversion-only run",
+            "publish_input_path": str(publish_input_path),
+        }
+        pipeline_trace.append("Publish stage skipped (conversion-only mode)")
+
+    if isinstance(tableau_cfg, dict) and effective_publish_enabled:
         requested_format = str(tableau_cfg.get("file_format") or "twb").strip().lower()
         server_url = str(tableau_cfg.get("server_url") or "").strip().lower()
         twbx_required_for_publish = bool(
@@ -293,62 +309,76 @@ def run_conversion(
         "workbook_path": str(publish_input_path),
     }
 
-    try:
-        tableau_publish_report = publish_workbook_if_configured(
+    if effective_publish_enabled:
+        try:
+            tableau_publish_report = publish_workbook_if_configured(
+                workbook_path=publish_input_path,
+                tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+            )
+            publish_status = tableau_publish_report.get("status")
+            if publish_status == "published":
+                pipeline_trace.append("Tableau Server publish succeeded")
+            elif publish_status == "skipped":
+                pipeline_trace.append("Tableau Server publish skipped")
+            elif publish_status == "manual_upload_required":
+                pipeline_trace.append("Tableau Public manual upload required")
+            else:
+                pipeline_trace.append(f"Tableau Server publish status: {publish_status}")
+        except Exception as exc:
+            tableau_publish_report = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "workbook_path": str(publish_input_path),
+            }
+            publish_status = "failed"
+            pipeline_trace.append(
+                "Tableau Server publish failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+            if fail_on_publish_error:
+                raise
+
+        run_rpa, rpa_reason = _should_run_desktop_rpa(
+            tableau_cfg=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+            publish_status=publish_status if isinstance(publish_status, str) else None,
             workbook_path=publish_input_path,
-            tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
         )
-        publish_status = tableau_publish_report.get("status")
-        if publish_status == "published":
-            pipeline_trace.append("Tableau Server publish succeeded")
-        elif publish_status == "skipped":
-            pipeline_trace.append("Tableau Server publish skipped")
-        elif publish_status == "manual_upload_required":
-            pipeline_trace.append("Tableau Public manual upload required")
+        if run_rpa:
+            tableau_rpa_report = _run_desktop_rpa_publish(
+                workbook_path=publish_input_path,
+                tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+            )
+            tableau_publish_report["desktop_rpa_attempted"] = True
+            tableau_publish_report["desktop_rpa_reason"] = "triggered"
+            tableau_publish_report["desktop_rpa_status"] = tableau_rpa_report.get("status")
+            if tableau_rpa_report.get("status") == "published":
+                tableau_publish_report["rest_status"] = publish_status
+                tableau_publish_report["status"] = "published"
+                tableau_publish_report["publish_channel"] = "desktop_rpa"
+                pipeline_trace.append("Tableau Public publish succeeded via Desktop RPA")
+            else:
+                pipeline_trace.append(
+                    "Tableau Public Desktop RPA attempted "
+                    f"(status={tableau_rpa_report.get('status')}, reason={tableau_rpa_report.get('reason')})"
+                )
         else:
-            pipeline_trace.append(f"Tableau Server publish status: {publish_status}")
-    except Exception as exc:
+            tableau_rpa_report["reason"] = rpa_reason
+            tableau_publish_report["desktop_rpa_attempted"] = False
+            tableau_publish_report["desktop_rpa_reason"] = rpa_reason
+    else:
         tableau_publish_report = {
-            "status": "failed",
-            "error_type": type(exc).__name__,
-            "error": str(exc),
+            "status": "skipped",
+            "reason": "Publish stage disabled for conversion-only run",
+            "workbook_path": str(publish_input_path),
+            "desktop_rpa_attempted": False,
+            "desktop_rpa_reason": "publish_disabled",
+        }
+        tableau_rpa_report = {
+            "status": "skipped",
+            "reason": "publish_disabled",
             "workbook_path": str(publish_input_path),
         }
-        publish_status = "failed"
-        pipeline_trace.append(
-            "Tableau Server publish failed "
-            f"({type(exc).__name__}: {exc})"
-        )
-        if fail_on_publish_error:
-            raise
-
-    run_rpa, rpa_reason = _should_run_desktop_rpa(
-        tableau_cfg=tableau_cfg if isinstance(tableau_cfg, dict) else None,
-        publish_status=publish_status if isinstance(publish_status, str) else None,
-        workbook_path=publish_input_path,
-    )
-    if run_rpa:
-        tableau_rpa_report = _run_desktop_rpa_publish(
-            workbook_path=publish_input_path,
-            tableau_config=tableau_cfg if isinstance(tableau_cfg, dict) else None,
-        )
-        tableau_publish_report["desktop_rpa_attempted"] = True
-        tableau_publish_report["desktop_rpa_reason"] = "triggered"
-        tableau_publish_report["desktop_rpa_status"] = tableau_rpa_report.get("status")
-        if tableau_rpa_report.get("status") == "published":
-            tableau_publish_report["rest_status"] = publish_status
-            tableau_publish_report["status"] = "published"
-            tableau_publish_report["publish_channel"] = "desktop_rpa"
-            pipeline_trace.append("Tableau Public publish succeeded via Desktop RPA")
-        else:
-            pipeline_trace.append(
-                "Tableau Public Desktop RPA attempted "
-                f"(status={tableau_rpa_report.get('status')}, reason={tableau_rpa_report.get('reason')})"
-            )
-    else:
-        tableau_rpa_report["reason"] = rpa_reason
-        tableau_publish_report["desktop_rpa_attempted"] = False
-        tableau_publish_report["desktop_rpa_reason"] = rpa_reason
 
     _write_json(output_dir / "tableau_extract_report.json", tableau_extract_report)
     _write_json(output_dir / "tableau_publish_report.json", tableau_publish_report)
