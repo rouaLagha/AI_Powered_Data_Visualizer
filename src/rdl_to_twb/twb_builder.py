@@ -105,14 +105,16 @@ def inject_datasource_connections(
         datasource_node.attrib.setdefault("hasconnection", "true")
         datasource_node.attrib.setdefault("version", "18.1")
 
+        connection_node = _find_direct_child(datasource_node, "connection")
+        if connection_node is None:
+            connection_node = ET.SubElement(datasource_node, "connection")
+
         aliases_node = _find_direct_child(datasource_node, "aliases")
         if aliases_node is None:
             aliases_node = ET.SubElement(datasource_node, "aliases")
         aliases_node.attrib["enabled"] = "yes"
 
-        connection_node = datasource_node.find("connection")
-        if connection_node is None:
-            connection_node = ET.SubElement(datasource_node, "connection")
+        _ensure_datasource_connection_before_aliases(datasource_node)
 
         keep_federated = _looks_federated_connection(connection_node)
         prefer_federated = _should_prefer_federated_connection(provider_class, parsed_conn)
@@ -246,7 +248,12 @@ def inject_datasource_connections(
 
         if catalog_source:
             # Strict mode: when DB catalog exists, datasource columns come only from DB metadata.
-            _upsert_datasource_columns_from_catalog(datasource_node, catalog_source, prune_existing=True)
+            _upsert_datasource_columns_from_catalog(
+                datasource_node=datasource_node,
+                catalog_source=catalog_source,
+                table_refs=table_refs,
+                prune_existing=True,
+            )
         else:
             _upsert_datasource_columns_from_datasets(
                 datasource_node,
@@ -256,6 +263,12 @@ def inject_datasource_connections(
         if connection_class == "federated":
             if catalog_source:
                 _upsert_cols_map_from_catalog(
+                    datasource_node=datasource_node,
+                    connection_node=connection_node,
+                    catalog_source=catalog_source,
+                    table_refs=table_refs,
+                )
+                _upsert_metadata_records_from_catalog(
                     datasource_node=datasource_node,
                     connection_node=connection_node,
                     catalog_source=catalog_source,
@@ -1220,72 +1233,214 @@ def _catalog_join_specs(catalog_source: dict | None) -> list[dict[str, str]]:
     return out
 
 
-def _upsert_datasource_columns_from_catalog(
-    datasource_node: ET.Element,
-    catalog_source: dict,
-    prune_existing: bool = True,
-) -> None:
-    tables = catalog_source.get("tables") if isinstance(catalog_source, dict) else None
-    if not isinstance(tables, list):
+def _datasource_column_insert_index(datasource_node: ET.Element) -> int:
+    """Return the insertion index where datasource <column> nodes remain schema-valid."""
+    anchor_tags = {
+        "layout",
+        "style",
+        "semantic-values",
+        "object-graph",
+    }
+
+    children = list(datasource_node)
+    for index, child in enumerate(children):
+        if _local_name(child.tag) in anchor_tags:
+            return index
+    return len(children)
+
+
+def _insert_datasource_column(datasource_node: ET.Element, attrs: dict[str, str]) -> ET.Element:
+    column_node = ET.Element("column", attrib=attrs)
+    insert_at = _datasource_column_insert_index(datasource_node)
+    datasource_node.insert(insert_at, column_node)
+    return column_node
+
+
+def _normalize_datasource_column_order(datasource_node: ET.Element) -> None:
+    """Move all direct datasource <column> nodes before layout/semantic-values/object-graph."""
+    columns = [child for child in list(datasource_node) if _local_name(child.tag) == "column"]
+    if not columns:
         return
 
-    allowed_names: set[str] = set()
+    for column in columns:
+        datasource_node.remove(column)
+
+    insert_at = _datasource_column_insert_index(datasource_node)
+    for offset, column in enumerate(columns):
+        datasource_node.insert(insert_at + offset, column)
+
+
+def _catalog_table_name_key(value: str) -> str:
+    return _clean_bracketed_name(str(value or "")).strip().lower()
+
+
+def _ordered_catalog_tables(catalog_source: dict, table_refs: list[str] | None = None) -> list[dict]:
+    tables = catalog_source.get("tables") if isinstance(catalog_source, dict) else None
+    if not isinstance(tables, list):
+        return []
+
+    refs = table_refs if isinstance(table_refs, list) else []
+    by_name: dict[str, dict] = {}
     for table in tables:
         if not isinstance(table, dict):
             continue
-        columns = table.get("columns")
+        table_name = table.get("name")
+        if not isinstance(table_name, str) or not table_name.strip():
+            continue
+        key = _catalog_table_name_key(table_name)
+        by_name.setdefault(key, table)
+
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for table_ref in refs:
+        if not isinstance(table_ref, str) or not table_ref.strip():
+            continue
+        relation_name = _relation_name_from_table_reference(table_ref)
+        key = _catalog_table_name_key(relation_name)
+        table = by_name.get(key)
+        if table is None or key in seen:
+            continue
+        ordered.append(table)
+        seen.add(key)
+
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        table_name = table.get("name")
+        if not isinstance(table_name, str) or not table_name.strip():
+            continue
+        key = _catalog_table_name_key(table_name)
+        if key in seen:
+            continue
+        ordered.append(table)
+        seen.add(key)
+
+    return ordered
+
+
+def _build_catalog_exposed_column_specs(
+    catalog_source: dict,
+    table_refs: list[str] | None = None,
+) -> list[dict[str, object]]:
+    ordered_tables = _ordered_catalog_tables(catalog_source, table_refs)
+    if not ordered_tables:
+        return []
+
+    duplicate_counts: dict[str, int] = {}
+    for table in ordered_tables:
+        columns = table.get("columns") if isinstance(table, dict) else None
         if not isinstance(columns, list):
             continue
         for column in columns:
             if not isinstance(column, dict):
                 continue
             col_name = column.get("name")
-            if isinstance(col_name, str) and col_name.strip():
-                allowed_names.add(col_name.strip().lower())
+            if not isinstance(col_name, str) or not col_name.strip():
+                continue
+            key = col_name.strip().lower()
+            duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
 
-    existing_by_name: dict[str, ET.Element] = {}
-    for child in [c for c in list(datasource_node) if _local_name(c.tag) == "column"]:
-        clean_name = _clean_bracketed_name(child.attrib.get("name", "")).strip().lower()
-        if prune_existing and clean_name and clean_name not in allowed_names:
-            datasource_node.remove(child)
-            continue
-        if clean_name and clean_name not in existing_by_name:
-            existing_by_name[clean_name] = child
+    seen_per_name: dict[str, int] = {}
+    specs: list[dict[str, object]] = []
+    ordinal = 0
 
-    seen_names: set[str] = set(existing_by_name.keys())
-    for table in tables:
+    for table in ordered_tables:
         if not isinstance(table, dict):
             continue
+        table_name = table.get("name")
         columns = table.get("columns")
-        if not isinstance(columns, list):
+        if not isinstance(table_name, str) or not table_name.strip() or not isinstance(columns, list):
             continue
+        table_clean = table_name.strip()
 
-        for index, column in enumerate(columns):
+        for column in columns:
             if not isinstance(column, dict):
                 continue
             col_name = column.get("name")
             if not isinstance(col_name, str) or not col_name.strip():
                 continue
 
-            clean_name = col_name.strip()
-            key = clean_name.lower()
-            if key in seen_names:
-                continue
-            seen_names.add(key)
+            base_name = col_name.strip()
+            key = base_name.lower()
+            occurrence = seen_per_name.get(key, 0) + 1
+            seen_per_name[key] = occurrence
 
-            role, datatype, ctype = _infer_tableau_type_from_sql(
-                column_name=clean_name,
-                sql_data_type=column.get("data_type"),
-                index=index,
+            exposed_name = base_name
+            if duplicate_counts.get(key, 0) > 1 and occurrence > 1:
+                exposed_name = f"{base_name} ({table_clean})"
+
+            specs.append(
+                {
+                    "table_name": table_clean,
+                    "column_name": base_name,
+                    "exposed_name": exposed_name,
+                    "data_type": column.get("data_type"),
+                    "is_nullable": bool(column.get("is_nullable", True)),
+                    "ordinal": ordinal,
+                }
             )
+            ordinal += 1
 
-            attrs = {
-                "name": f"[{clean_name}]",
-                "role": role,
-                "datatype": datatype,
-                "type": ctype,
-            }
-            ET.SubElement(datasource_node, "column", attrib=attrs)
+    return specs
+
+
+def _upsert_datasource_columns_from_catalog(
+    datasource_node: ET.Element,
+    catalog_source: dict,
+    table_refs: list[str] | None = None,
+    prune_existing: bool = True,
+) -> None:
+    specs = _build_catalog_exposed_column_specs(catalog_source, table_refs)
+    if not specs:
+        return
+
+    allowed_names = {
+        str(spec.get("exposed_name") or "").strip().lower()
+        for spec in specs
+        if str(spec.get("exposed_name") or "").strip()
+    }
+
+    existing_by_name: dict[str, ET.Element] = {}
+    for child in [c for c in list(datasource_node) if _local_name(c.tag) == "column"]:
+        raw_name = str(child.attrib.get("name", "") or "")
+        is_table_object_column = raw_name.strip().lower().startswith("[__tableau_internal_object_id__].")
+        clean_name = _clean_bracketed_name(child.attrib.get("name", "")).strip().lower()
+        if prune_existing and clean_name and clean_name not in allowed_names and not is_table_object_column:
+            datasource_node.remove(child)
+            continue
+        if clean_name and clean_name not in existing_by_name:
+            existing_by_name[clean_name] = child
+
+    for spec in specs:
+        exposed_name = str(spec.get("exposed_name") or "").strip()
+        base_name = str(spec.get("column_name") or exposed_name).strip()
+        if not exposed_name or not base_name:
+            continue
+
+        ordinal = spec.get("ordinal")
+        index = int(ordinal) if isinstance(ordinal, int) else 0
+        role, datatype, ctype = _infer_tableau_type_from_sql(
+            column_name=base_name,
+            sql_data_type=spec.get("data_type"),
+            index=index,
+        )
+
+        attrs = {
+            "name": f"[{exposed_name}]",
+            "role": role,
+            "datatype": datatype,
+            "type": ctype,
+        }
+
+        existing = existing_by_name.get(exposed_name.lower())
+        if existing is None:
+            _insert_datasource_column(datasource_node, attrs)
+            continue
+
+        for key, value in attrs.items():
+            existing.attrib[key] = value
+
+    _normalize_datasource_column_order(datasource_node)
 
 
 def _upsert_cols_map_from_catalog(
@@ -1294,8 +1449,8 @@ def _upsert_cols_map_from_catalog(
     catalog_source: dict,
     table_refs: list[str],
 ) -> None:
-    tables = catalog_source.get("tables") if isinstance(catalog_source, dict) else None
-    if not isinstance(tables, list):
+    specs = _build_catalog_exposed_column_specs(catalog_source, table_refs)
+    if not specs:
         return
 
     cols_node = _find_direct_child(connection_node, "cols")
@@ -1312,33 +1467,206 @@ def _upsert_cols_map_from_catalog(
         if _local_name(child.tag) == "map":
             cols_node.remove(child)
 
-    key_counts: dict[str, int] = {}
-    for table in tables:
-        if not isinstance(table, dict):
+    for spec in specs:
+        table_clean = str(spec.get("table_name") or "").strip()
+        base = str(spec.get("column_name") or "").strip()
+        exposed = str(spec.get("exposed_name") or "").strip()
+        if not table_clean or not base or not exposed:
             continue
-        table_name = table.get("name")
-        columns = table.get("columns")
-        if not isinstance(table_name, str) or not table_name.strip() or not isinstance(columns, list):
+
+        map_key = f"[{exposed}]"
+        map_value = f"[{table_clean}].[{base}]"
+        ET.SubElement(cols_node, "map", attrib={"key": map_key, "value": map_value})
+
+
+def _upsert_metadata_records_from_catalog(
+    datasource_node: ET.Element,
+    connection_node: ET.Element,
+    catalog_source: dict,
+    table_refs: list[str],
+) -> None:
+    specs = _build_catalog_exposed_column_specs(catalog_source, table_refs)
+    if not specs:
+        return
+
+    allowed_local_names = {
+        f"[{str(spec.get('exposed_name') or '').strip()}]".lower()
+        for spec in specs
+        if str(spec.get("exposed_name") or "").strip()
+    }
+
+    metadata_node = _find_direct_child(connection_node, "metadata-records")
+    if metadata_node is None:
+        metadata_node = ET.SubElement(connection_node, "metadata-records")
+
+    existing_by_local_name: dict[str, ET.Element] = {}
+    for record in [c for c in list(metadata_node) if _local_name(c.tag) == "metadata-record"]:
+        local_name_node = _find_direct_child(record, "local-name")
+        local_name = ""
+        if local_name_node is not None and isinstance(local_name_node.text, str):
+            local_name = local_name_node.text.strip().lower()
+        if local_name and local_name not in allowed_local_names:
+            metadata_node.remove(record)
             continue
-        table_clean = table_name.strip()
+        if local_name and local_name in existing_by_local_name:
+            # Keep the first occurrence to avoid duplicated metadata definitions.
+            metadata_node.remove(record)
+            continue
+        if local_name and local_name not in existing_by_local_name:
+            existing_by_local_name[local_name] = record
 
-        for column in columns:
-            if not isinstance(column, dict):
-                continue
-            col_name = column.get("name")
-            if not isinstance(col_name, str) or not col_name.strip():
-                continue
-            base = col_name.strip()
-            key_counts[base.lower()] = key_counts.get(base.lower(), 0) + 1
+    table_object_ids = _build_table_object_id_lookup_from_object_graph(datasource_node)
 
-            # Keep only canonical field keys to match exposed datasource columns.
-            if key_counts[base.lower()] > 1:
-                continue
+    for index, spec in enumerate(specs, start=1):
+        table_name = str(spec.get("table_name") or "").strip()
+        column_name = str(spec.get("column_name") or "").strip()
+        exposed_name = str(spec.get("exposed_name") or "").strip()
+        if not table_name or not column_name or not exposed_name:
+            continue
 
-            map_key = f"[{base}]"
+        local_name = f"[{exposed_name}]"
+        record = existing_by_local_name.get(local_name.lower())
+        if record is None:
+            record = ET.SubElement(metadata_node, "metadata-record", attrib={"class": "column"})
+            existing_by_local_name[local_name.lower()] = record
+        else:
+            record.attrib["class"] = "column"
 
-            map_value = f"[{table_clean}].[{base}]"
-            ET.SubElement(cols_node, "map", attrib={"key": map_key, "value": map_value})
+        local_type = _metadata_local_type_from_sql(spec.get("data_type"))
+        remote_type = _metadata_remote_type_from_sql(spec.get("data_type"))
+        object_id = table_object_ids.get(_catalog_table_name_key(table_name), "")
+
+        _upsert_metadata_record_text(record, "remote-name", column_name)
+        if remote_type:
+            _upsert_metadata_record_text(record, "remote-type", remote_type)
+        _upsert_metadata_record_text(record, "local-name", local_name)
+        _upsert_metadata_record_text(record, "parent-name", f"[{table_name}]")
+        _upsert_metadata_record_text(record, "remote-alias", column_name)
+        _upsert_metadata_record_text(record, "ordinal", str(index))
+        _upsert_metadata_record_text(record, "local-type", local_type)
+        _upsert_metadata_record_text(record, "aggregation", _metadata_default_aggregation(local_type))
+        contains_null = "true" if bool(spec.get("is_nullable", True)) else "false"
+        _upsert_metadata_record_text(record, "contains-null", contains_null)
+        if object_id:
+            _upsert_metadata_record_text(record, "object-id", f"[{object_id}]")
+        else:
+            stale_object_id = _find_direct_child(record, "object-id")
+            if stale_object_id is not None:
+                record.remove(stale_object_id)
+
+
+def _build_table_object_id_lookup_from_object_graph(datasource_node: ET.Element) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+
+    object_graph = _find_direct_child(datasource_node, "object-graph")
+    if object_graph is None:
+        return lookup
+
+    objects_node = _find_direct_child(object_graph, "objects")
+    if objects_node is None:
+        return lookup
+
+    for object_node in [c for c in list(objects_node) if _local_name(c.tag) == "object"]:
+        object_id = str(object_node.attrib.get("id", "") or "").strip()
+        if not object_id:
+            continue
+
+        caption = str(object_node.attrib.get("caption", "") or "").strip()
+        if caption:
+            lookup.setdefault(_catalog_table_name_key(caption), object_id)
+
+        properties = _find_direct_child(object_node, "properties")
+        relation = _find_direct_child(properties, "relation") if properties is not None else None
+        if relation is None:
+            continue
+
+        relation_name = str(relation.attrib.get("name", "") or "").strip()
+        if relation_name:
+            lookup.setdefault(_catalog_table_name_key(relation_name), object_id)
+
+        table_ref = str(relation.attrib.get("table", "") or "").strip()
+        table_leaf = _table_leaf_from_relation_reference(table_ref)
+        if table_leaf:
+            lookup.setdefault(_catalog_table_name_key(table_leaf), object_id)
+
+    return lookup
+
+
+def _table_leaf_from_relation_reference(table_ref: str) -> str:
+    tokens = re.findall(r"\[([^\]]+)\]", table_ref or "")
+    if tokens:
+        return tokens[-1].strip()
+
+    parts = [p.strip() for p in (table_ref or "").split(".") if p.strip()]
+    if not parts:
+        return ""
+    return _clean_sql_identifier(parts[-1])
+
+
+def _upsert_metadata_record_text(record: ET.Element, local_name: str, value: str) -> None:
+    node = _find_direct_child(record, local_name)
+    if node is None:
+        node = ET.SubElement(record, local_name)
+    node.text = value
+
+
+def _metadata_local_type_from_sql(sql_data_type: object) -> str:
+    token = str(sql_data_type or "").strip().lower()
+    if token in {"bigint", "int", "smallint", "tinyint"}:
+        return "integer"
+    if token in {"decimal", "numeric", "float", "real", "money", "smallmoney"}:
+        return "real"
+    if token in {"bit", "boolean", "bool"}:
+        return "boolean"
+    if token in {"date"}:
+        return "date"
+    if token in {"datetime", "datetime2", "smalldatetime", "datetimeoffset", "time"}:
+        return "datetime"
+    return "string"
+
+
+def _metadata_default_aggregation(local_type: str) -> str:
+    token = str(local_type or "").strip().lower()
+    if token in {"integer", "real"}:
+        return "Sum"
+    if token in {"date", "datetime"}:
+        return "Year"
+    return "Count"
+
+
+def _metadata_remote_type_from_sql(sql_data_type: object) -> str:
+    token = str(sql_data_type or "").strip().lower()
+    mapping = {
+        "tinyint": "17",
+        "smallint": "2",
+        "int": "3",
+        "bigint": "-5",
+        "bit": "-7",
+        "bool": "-7",
+        "boolean": "-7",
+        "real": "5",
+        "float": "5",
+        "decimal": "131",
+        "numeric": "131",
+        "money": "131",
+        "smallmoney": "131",
+        "date": "7",
+        "datetime": "7",
+        "datetime2": "7",
+        "smalldatetime": "7",
+        "datetimeoffset": "7",
+        "time": "7",
+        "char": "130",
+        "nchar": "130",
+        "varchar": "130",
+        "nvarchar": "130",
+        "text": "130",
+        "ntext": "130",
+        "xml": "130",
+        "uniqueidentifier": "130",
+        "sysname": "130",
+    }
+    return mapping.get(token, "")
 
 
 def _infer_tableau_type_from_sql(
@@ -1349,11 +1677,13 @@ def _infer_tableau_type_from_sql(
     token = str(sql_data_type or "").strip().lower()
     name_token = str(column_name or "").strip()
 
-    numeric = {
+    integer_numeric = {
         "bigint",
         "int",
         "smallint",
         "tinyint",
+    }
+    real_numeric = {
         "decimal",
         "numeric",
         "float",
@@ -1376,7 +1706,13 @@ def _infer_tableau_type_from_sql(
         "sysname",
     }
 
-    if token in numeric:
+    if token in integer_numeric:
+        if _is_key_like_column_name(name_token):
+            return "dimension", "integer", "ordinal"
+        if _looks_temporal_dimension_name(name_token):
+            return "dimension", "integer", "ordinal"
+        return "measure", "integer", "quantitative"
+    if token in real_numeric:
         if _is_key_like_column_name(name_token):
             return "dimension", "real", "nominal"
         if _looks_temporal_dimension_name(name_token):
@@ -1502,19 +1838,15 @@ def _upsert_datasource_columns_from_datasets(
         }
         if caption.strip():
             attrs["caption"] = caption.strip()
-        created.append(
-            ET.SubElement(
-                datasource_node,
-                "column",
-                attrib=attrs,
-            )
-        )
+        created.append(_insert_datasource_column(datasource_node, attrs))
 
     has_measure = any((c.attrib.get("role") or "").lower() == "measure" for c in created)
     if not has_measure and len(created) > 1:
         created[1].attrib["role"] = "measure"
         created[1].attrib["datatype"] = "real"
         created[1].attrib["type"] = "quantitative"
+
+    _normalize_datasource_column_order(datasource_node)
 
 
 def _columns_look_placeholder(columns: list[ET.Element]) -> bool:
@@ -5489,6 +5821,23 @@ def _find_direct_child(parent: ET.Element, local_name: str) -> ET.Element | None
         if _local_name(child.tag) == local_name:
             return child
     return None
+
+
+def _ensure_datasource_connection_before_aliases(datasource_node: ET.Element) -> None:
+    connection_node = _find_direct_child(datasource_node, "connection")
+    aliases_node = _find_direct_child(datasource_node, "aliases")
+    if connection_node is None or aliases_node is None:
+        return
+
+    children = list(datasource_node)
+    connection_index = children.index(connection_node)
+    aliases_index = children.index(aliases_node)
+    if connection_index < aliases_index:
+        return
+
+    datasource_node.remove(connection_node)
+    aliases_index = list(datasource_node).index(aliases_node)
+    datasource_node.insert(aliases_index, connection_node)
 
 
 def _clone_xml_element(node: ET.Element) -> ET.Element:

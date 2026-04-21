@@ -1,0 +1,34 @@
+{
+  "timestamp_utc": "2026-04-17T08:15:33.400421+00:00",
+  "stage": "apply_patch",
+  "source_file": "RegionalSales.rdl",
+  "query": "remove CalenderYear filter",
+  "patch_validated": {
+    "operations": [
+      {
+        "op": "remove_query_condition",
+        "target_dataset": null,
+        "condition_text": "CalenderYear"
+      },
+      {
+        "op": "remove_query_parameter",
+        "target_dataset": null,
+        "parameter": "@CalenderYear"
+      },
+      {
+        "op": "remove_report_parameter",
+        "parameter": "CalenderYear"
+      },
+      {
+        "op": "remove_expression_references",
+        "parameter": "CalenderYear"
+      }
+    ]
+  },
+  "operation_logs": [
+    "No query condition matched for 'CalenderYear' in scope <all datasets>",
+    "No query parameter matched for '@CalenderYear' in scope <all datasets>",
+    "No report parameter definition matched for parameter=CalenderYear",
+    "No expression references found for parameter=CalenderYear"
+  ]
+}

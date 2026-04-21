@@ -1,0 +1,26 @@
+{
+  "timestamp_utc": "2026-04-13T10:08:11.960825+00:00",
+  "stage": "generate_patch",
+  "llm_mode": "llm",
+  "source_file": "RegionalSales.rdl",
+  "query": "remove the CalendarYear parameter",
+  "patch_raw": {
+    "operations": [
+      {
+        "op": "remove_filter",
+        "target_dataset": null,
+        "field": "CalendarYear",
+        "value_kind": "parameter"
+      }
+    ]
+  },
+  "patch_validated": {
+    "operations": [
+      {
+        "op": "remove_filter",
+        "target_dataset": null,
+        "field": "CalendarYear"
+      }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "timestamp_utc": "2026-04-13T09:41:27.169040+00:00",
+  "stage": "apply_patch",
+  "source_file": "my_test05.rdl",
+  "query": "Change the chart type from a bar chart to a line chart.",
+  "patch_validated": {
+    "operations": [
+      {
+        "op": "change_chart_type",
+        "target": "chart",
+        "to": "Line"
+      }
+    ]
+  },
+  "operation_logs": [
+    "Changed chart type for target=chart to Line"
+  ]
+}

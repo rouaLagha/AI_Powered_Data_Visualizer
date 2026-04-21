@@ -32,6 +32,9 @@ class ParsedDataSource:
     credential_retrieval: str | None = None
     windows_credentials: bool | None = None
     user_name: str | None = None
+    data_source_reference: str | None = None
+    provider_class: str | None = None
+    connection_info: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +72,9 @@ class ParsedReport:
                     "credential_retrieval": ds.credential_retrieval,
                     "windows_credentials": ds.windows_credentials,
                     "user_name": ds.user_name,
+                    "data_source_reference": ds.data_source_reference,
+                    "provider_class": ds.provider_class,
+                    "connection_info": ds.connection_info,
                 }
                 for ds in self.data_sources
             ],

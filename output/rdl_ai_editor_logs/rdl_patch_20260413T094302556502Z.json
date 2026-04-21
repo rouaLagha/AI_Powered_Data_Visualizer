@@ -1,0 +1,25 @@
+{
+  "timestamp_utc": "2026-04-13T09:43:02.556502+00:00",
+  "stage": "generate_patch",
+  "llm_mode": "llm",
+  "source_file": "RegionalSales.rdl",
+  "query": "Change the chart type from a line chart to a bar chart.",
+  "patch_raw": {
+    "operations": [
+      {
+        "op": "change_chart_type",
+        "target": "chart",
+        "to": "bar"
+      }
+    ]
+  },
+  "patch_validated": {
+    "operations": [
+      {
+        "op": "change_chart_type",
+        "target": "chart",
+        "to": "Bar"
+      }
+    ]
+  }
+}

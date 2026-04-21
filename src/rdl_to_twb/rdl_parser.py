@@ -67,6 +67,193 @@ def _unique_ordered(values: list[str]) -> list[str]:
     return output
 
 
+def _parse_bool(value: str | None) -> bool | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _normalize_connection_key(key: str) -> str:
+    return re.sub(r"[\s_\-]+", " ", key.strip().lower())
+
+
+def _parse_connection_attributes(connection_string: str | None) -> dict[str, str]:
+    if not isinstance(connection_string, str):
+        return {}
+
+    attributes: dict[str, str] = {}
+    for part in connection_string.split(";"):
+        token = part.strip()
+        if not token or "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        normalized_key = _normalize_connection_key(key)
+        normalized_value = value.strip()
+        if not normalized_key or not normalized_value:
+            continue
+        attributes.setdefault(normalized_key, normalized_value)
+    return attributes
+
+
+def _conn_value(attributes: dict[str, str], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        candidate = attributes.get(_normalize_connection_key(key))
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _extract_server_and_port(server_value: str | None) -> tuple[str, str]:
+    server = (server_value or "").strip()
+    if not server:
+        return "", ""
+
+    if "," in server:
+        host, candidate_port = server.split(",", 1)
+        candidate_port = candidate_port.strip()
+        if re.fullmatch(r"\d+", candidate_port):
+            return host.strip(), candidate_port
+
+    if server.count(":") == 1:
+        host, candidate_port = server.split(":", 1)
+        candidate_port = candidate_port.strip()
+        if re.fullmatch(r"\d+", candidate_port):
+            return host.strip(), candidate_port
+
+    return server, ""
+
+
+def _looks_like_snowflake_data_source(
+    provider: str | None,
+    connection_string: str | None,
+    connection_attributes: dict[str, str],
+    data_source_reference: str | None = None,
+) -> bool:
+    provider_token = (provider or "").strip().lower()
+    connection_text = (connection_string or "").strip().lower()
+    reference_text = (data_source_reference or "").strip().lower()
+
+    if "snowflake" in provider_token:
+        return True
+    if "snowflake" in connection_text:
+        return True
+    if "snowflake" in reference_text:
+        return True
+
+    driver = _conn_value(connection_attributes, ("driver",)) or ""
+    dsn = _conn_value(connection_attributes, ("dsn", "odbc dsn")) or ""
+    if "snowflake" in driver.lower() or "snowflake" in dsn.lower():
+        return True
+
+    return any(
+        _conn_value(connection_attributes, (key,))
+        for key in ("account", "warehouse", "authenticator")
+    )
+
+
+def _infer_provider_class(
+    provider: str | None,
+    connection_string: str | None,
+    connection_attributes: dict[str, str],
+    data_source_reference: str | None = None,
+) -> str:
+    provider_token = (provider or "").strip().lower()
+
+    if _looks_like_snowflake_data_source(
+        provider=provider,
+        connection_string=connection_string,
+        connection_attributes=connection_attributes,
+        data_source_reference=data_source_reference,
+    ):
+        return "snowflake"
+    if "sql" in provider_token:
+        return "sqlserver"
+    if "oracle" in provider_token:
+        return "oracle"
+    if "postgres" in provider_token:
+        return "postgres"
+    if "mysql" in provider_token:
+        return "mysql"
+    return "genericodbc"
+
+
+def _build_connection_info(
+    provider: str | None,
+    provider_class: str,
+    connection_string: str | None,
+    connection_attributes: dict[str, str],
+    data_source_reference: str | None,
+    user_name: str | None,
+) -> dict[str, Any]:
+    dsn = _conn_value(connection_attributes, ("dsn", "odbc dsn"))
+    account = _conn_value(connection_attributes, ("account",))
+
+    server_hint = _conn_value(
+        connection_attributes,
+        ("data source", "server", "host", "address", "network address"),
+    )
+    is_snowflake = provider_class == "snowflake" or _looks_like_snowflake_data_source(
+        provider=provider,
+        connection_string=connection_string,
+        connection_attributes=connection_attributes,
+        data_source_reference=data_source_reference,
+    )
+    if not server_hint and account and is_snowflake:
+        server_hint = f"{account}.snowflakecomputing.com"
+
+    server, parsed_port = _extract_server_and_port(server_hint)
+    port = _conn_value(connection_attributes, ("port", "tcp port")) or parsed_port
+
+    database = _conn_value(connection_attributes, ("initial catalog", "database", "dbname", "db"))
+    schema = _conn_value(connection_attributes, ("schema", "current schema"))
+    username = (user_name or "").strip() or _conn_value(
+        connection_attributes,
+        ("uid", "user id", "user", "username"),
+    )
+    warehouse = _conn_value(connection_attributes, ("warehouse",))
+    role = _conn_value(connection_attributes, ("role",))
+    authenticator = _conn_value(connection_attributes, ("authenticator",))
+
+    info: dict[str, Any] = {
+        "provider_class": provider_class,
+        "cloud_platform": "snowflake" if is_snowflake else None,
+        "data_source_reference": data_source_reference,
+        "dsn": dsn,
+        "account": account,
+        "server": server,
+        "port": port,
+        "database": database,
+        "schema": schema,
+        "warehouse": warehouse,
+        "role": role,
+        "authenticator": authenticator,
+        "username": username,
+        "uses_dsn": bool(dsn),
+        "has_password_in_connection_string": bool(_conn_value(connection_attributes, ("pwd", "password"))),
+    }
+
+    cleaned: dict[str, Any] = {}
+    for key, value in info.items():
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                cleaned[key] = stripped
+            continue
+        if isinstance(value, bool):
+            if value:
+                cleaned[key] = value
+            continue
+        if value is not None:
+            cleaned[key] = value
+
+    return cleaned
+
+
 def _looks_like_expression(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -888,20 +1075,57 @@ def parse_rdl_file(
     )
 
     # Data sources
-    for ds in root.findall(f".//{_qn(ns, 'DataSource')}"):
+    data_source_nodes = root.findall(f".//{_qn(ns, 'DataSource')}")
+    if not data_source_nodes:
+        data_source_nodes = _findall_by_local(root, "DataSource")
+
+    for ds in data_source_nodes:
         name = ds.attrib.get("Name", "UnnamedDataSource")
         conn_props = ds.find(_qn(ns, "ConnectionProperties"))
-        provider = _text(conn_props, _qn(ns, "DataProvider")) if conn_props is not None else None
-        connection_string = _text(conn_props, _qn(ns, "ConnectString")) if conn_props is not None else None
-        integrated_security = _text(conn_props, _qn(ns, "IntegratedSecurity")) if conn_props is not None else None
-        credential_retrieval = _text(ds, _qn(ns, "CredentialRetrieval"))
+        if conn_props is None:
+            conn_props = next(iter(_find_children_by_local(ds, "ConnectionProperties")), None)
+
+        provider = (
+            (_text(conn_props, _qn(ns, "DataProvider")) if conn_props is not None else None)
+            or (_find_first_text_by_local(conn_props, {"DataProvider"}) if conn_props is not None else None)
+        )
+        connection_string = (
+            (_text(conn_props, _qn(ns, "ConnectString")) if conn_props is not None else None)
+            or (_find_first_text_by_local(conn_props, {"ConnectString"}) if conn_props is not None else None)
+        )
+        integrated_security = (
+            (_text(conn_props, _qn(ns, "IntegratedSecurity")) if conn_props is not None else None)
+            or (_find_first_text_by_local(conn_props, {"IntegratedSecurity"}) if conn_props is not None else None)
+        )
+        data_source_reference = _text(ds, _qn(ns, "DataSourceReference")) or _find_first_text_by_local(
+            ds,
+            {"DataSourceReference"},
+        )
+        credential_retrieval = _text(ds, _qn(ns, "CredentialRetrieval")) or _find_first_text_by_local(
+            ds,
+            {"CredentialRetrieval"},
+        )
         windows_credentials_text = _text(ds, _qn(ns, "WindowsCredentials"))
         if windows_credentials_text is None:
             windows_credentials_text = _find_first_text_by_local(ds, {"WindowsCredentials"})
-        windows_credentials = (
-            windows_credentials_text.lower() == "true" if isinstance(windows_credentials_text, str) else None
-        )
+        windows_credentials = _parse_bool(windows_credentials_text)
         user_name = _text(ds, _qn(ns, "UserName")) or _find_first_text_by_local(ds, {"UserName"})
+
+        connection_attributes = _parse_connection_attributes(connection_string)
+        provider_class = _infer_provider_class(
+            provider=provider,
+            connection_string=connection_string,
+            connection_attributes=connection_attributes,
+            data_source_reference=data_source_reference,
+        )
+        connection_info = _build_connection_info(
+            provider=provider,
+            provider_class=provider_class,
+            connection_string=connection_string,
+            connection_attributes=connection_attributes,
+            data_source_reference=data_source_reference,
+            user_name=user_name,
+        )
 
         security_type = _classify_security_type(
             connection_string=connection_string,
@@ -909,6 +1133,10 @@ def parse_rdl_file(
             credential_retrieval=credential_retrieval,
             windows_credentials=windows_credentials,
             user_name=user_name,
+            provider=provider,
+            provider_class=provider_class,
+            connection_attributes=connection_attributes,
+            data_source_reference=data_source_reference,
         )
 
         report.data_sources.append(
@@ -920,6 +1148,9 @@ def parse_rdl_file(
                 credential_retrieval=credential_retrieval,
                 windows_credentials=windows_credentials,
                 user_name=user_name,
+                data_source_reference=data_source_reference,
+                provider_class=provider_class,
+                connection_info=connection_info,
             )
         )
 
@@ -1041,19 +1272,46 @@ def _classify_security_type(
     credential_retrieval: str | None,
     windows_credentials: bool | None,
     user_name: str | None,
+    provider: str | None = None,
+    provider_class: str | None = None,
+    connection_attributes: dict[str, str] | None = None,
+    data_source_reference: str | None = None,
 ) -> str:
     retrieval = (credential_retrieval or "").strip().lower()
     integrated = (integrated_security or "").strip().lower()
     conn = (connection_string or "").lower()
 
+    attributes = connection_attributes or _parse_connection_attributes(connection_string)
+    inferred_provider_class = (provider_class or "").strip().lower()
+    is_snowflake = inferred_provider_class == "snowflake" or _looks_like_snowflake_data_source(
+        provider=provider,
+        connection_string=connection_string,
+        connection_attributes=attributes,
+        data_source_reference=data_source_reference,
+    )
+
+    has_conn_user = bool(_conn_value(attributes, ("uid", "user id", "user", "username"))) or bool(
+        re.search(r"(^|;)\s*(?:user id|uid|user|username)\s*=", conn)
+    )
+    has_conn_password = bool(_conn_value(attributes, ("pwd", "password"))) or bool(
+        re.search(r"(^|;)\s*(?:pwd|password)\s*=", conn)
+    )
+    has_explicit_user = bool(isinstance(user_name, str) and user_name.strip())
+    has_authenticator = bool(_conn_value(attributes, ("authenticator",)))
+
     if retrieval in {"integrated", "windows"}:
-        return "windows"
+        return "username-password" if is_snowflake else "windows"
     if retrieval == "store":
         return "username-password"
     if retrieval == "prompt":
         return "prompt"
     if retrieval == "none":
+        if is_snowflake and (has_conn_user or has_conn_password or has_explicit_user or has_authenticator):
+            return "username-password"
         return "none"
+
+    if is_snowflake:
+        return "username-password"
 
     if windows_credentials is True:
         return "windows"
@@ -1061,7 +1319,7 @@ def _classify_security_type(
         return "windows"
     if "integrated security=true" in conn or "integrated security=sspi" in conn or "trusted_connection=true" in conn:
         return "windows"
-    if "user id=" in conn or "uid=" in conn or (user_name and user_name.strip()):
+    if has_conn_user or has_explicit_user:
         return "username-password"
 
     return "unknown"

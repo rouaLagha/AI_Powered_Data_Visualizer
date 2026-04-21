@@ -1,0 +1,51 @@
+{
+  "timestamp_utc": "2026-04-17T08:15:20.350433+00:00",
+  "stage": "generate_patch",
+  "llm_mode": "llm",
+  "source_file": "RegionalSales.rdl",
+  "query": "remove CalenderYear filter",
+  "patch_raw": {
+    "operations": [
+      {
+        "op": "remove_query_condition",
+        "target_dataset": "",
+        "condition_text": "CalenderYear"
+      },
+      {
+        "op": "remove_query_parameter",
+        "target_dataset": "",
+        "parameter": "CalenderYear"
+      },
+      {
+        "op": "remove_report_parameter",
+        "parameter": "CalenderYear"
+      },
+      {
+        "op": "remove_expression_references",
+        "parameter": "CalenderYear"
+      }
+    ]
+  },
+  "patch_validated": {
+    "operations": [
+      {
+        "op": "remove_query_condition",
+        "target_dataset": null,
+        "condition_text": "CalenderYear"
+      },
+      {
+        "op": "remove_query_parameter",
+        "target_dataset": null,
+        "parameter": "@CalenderYear"
+      },
+      {
+        "op": "remove_report_parameter",
+        "parameter": "CalenderYear"
+      },
+      {
+        "op": "remove_expression_references",
+        "parameter": "CalenderYear"
+      }
+    ]
+  }
+}
