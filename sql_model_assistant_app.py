@@ -6515,6 +6515,10 @@ def _init_state() -> None:
         str(tableau_defaults.get("empty_workbook_template_path") or ""),
     )
     st.session_state.setdefault(
+        "sql_model_assistant_tableau_visual_source_twb_path",
+        str(tableau_defaults.get("visual_source_twb_path") or ""),
+    )
+    st.session_state.setdefault(
         "sql_model_assistant_tableau_loaded_config_path",
         "",
     )
@@ -6645,6 +6649,10 @@ def _render_tableau_publish_settings() -> None:
         "sql_model_assistant_tableau_empty_workbook_template_path_input",
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path,
     )
+    st.session_state.setdefault(
+        "sql_model_assistant_tableau_visual_source_twb_path_input",
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path,
+    )
 
     st.checkbox(
         "Auto publish after TWB generation",
@@ -6682,8 +6690,16 @@ def _render_tableau_publish_settings() -> None:
         "Empty Workbook Template Path (.twb, optional)",
         key="sql_model_assistant_tableau_empty_workbook_template_path_input",
         help=(
-            "Optional workbook shell to use for the consumer workbook. "
-            "If provided, its structure is kept minimal and connected to the published datasource."
+            "Legacy option kept for backward compatibility. "
+            "The linked workbook now keeps converted report visuals, so this template is ignored."
+        ),
+    )
+    st.text_input(
+        "Visual Source TWB Path (.twb, optional)",
+        key="sql_model_assistant_tableau_visual_source_twb_path_input",
+        help=(
+            "Optional TWB used as visual source (worksheets/dashboards/windows). "
+            "Datasource connection is kept from the linked workbook."
         ),
     )
 
@@ -6710,6 +6726,9 @@ def _render_tableau_publish_settings() -> None:
     )
     st.session_state.sql_model_assistant_tableau_empty_workbook_template_path = str(
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path_input or ""
+    )
+    st.session_state.sql_model_assistant_tableau_visual_source_twb_path = str(
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input or ""
     )
 
 
@@ -6761,6 +6780,13 @@ def _sync_tableau_settings_from_config_if_needed() -> None:
             st.session_state.sql_model_assistant_tableau_empty_workbook_template_path_input = str(
                 defaults["empty_workbook_template_path"]
             )
+        if defaults.get("visual_source_twb_path"):
+            st.session_state.sql_model_assistant_tableau_visual_source_twb_path = str(
+                defaults["visual_source_twb_path"]
+            )
+            st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input = str(
+                defaults["visual_source_twb_path"]
+            )
 
     st.session_state.sql_model_assistant_tableau_loaded_config_path = current_config_path
 
@@ -6804,6 +6830,7 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, str]:
         "project_name",
         "source_datasource_name",
         "empty_workbook_template_path",
+        "visual_source_twb_path",
     ]:
         value = tableau_cfg.get(key)
         if isinstance(value, str) and value.strip():
@@ -7177,6 +7204,21 @@ def _tableau_render_publish_outcome_message(publish_report: dict[str, Any]) -> N
     datasource_name = str(publish_report.get("datasource_name") or "-")
     workbook_name = str(publish_report.get("workbook_name") or "-")
 
+    if status == "datasource_published_workbook_publish_skipped_for_validation":
+        linked_artifact = str(
+            publish_report.get("saved_publish_artifacts", {}).get("linked_workbook")
+            if isinstance(publish_report.get("saved_publish_artifacts"), dict)
+            else ""
+        ).strip()
+        guidance = (
+            "Datasource published successfully. Workbook publish is intentionally skipped for validation. "
+            f"Datasource '{datasource_name}' is available."
+        )
+        if linked_artifact:
+            guidance += f" Linked workbook artifact: {linked_artifact}."
+        st.info(guidance)
+        return
+
     if status == "datasource_published_workbook_publish_forbidden":
         details = str(publish_report.get("workbook_publish_error") or "").strip()
         linked_artifact = str(
@@ -7230,6 +7272,9 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     empty_workbook_template_path = str(
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path or ""
     ).strip()
+    visual_source_twb_path_value = str(
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path or ""
+    ).strip()
 
     # If stale sidebar state still points to Tableau Public, prefer the config file value.
     cfg_server_url = str(cfg_defaults.get("server_url") or "").strip()
@@ -7269,33 +7314,27 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         empty_workbook_template_path = str(cfg_defaults.get("empty_workbook_template_path") or "").strip()
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path = empty_workbook_template_path
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path_input = empty_workbook_template_path
-    if not empty_workbook_template_path:
-        default_empty_template = ROOT_DIR / "output" / "test.twb"
-        if default_empty_template.exists():
-            empty_workbook_template_path = str(default_empty_template)
-            st.session_state.sql_model_assistant_tableau_empty_workbook_template_path = empty_workbook_template_path
-            st.session_state.sql_model_assistant_tableau_empty_workbook_template_path_input = empty_workbook_template_path
+    if not visual_source_twb_path_value and cfg_defaults.get("visual_source_twb_path"):
+        visual_source_twb_path_value = str(cfg_defaults.get("visual_source_twb_path") or "").strip()
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path = visual_source_twb_path_value
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input = visual_source_twb_path_value
 
     linked_workbook_source_path = generated_twb_path
     linked_workbook_source_mode = "generated_twb"
     linked_workbook_source_datasource_name = source_datasource_name
     if empty_workbook_template_path:
-        template_candidate = Path(empty_workbook_template_path).expanduser()
-        if not template_candidate.is_absolute():
-            template_candidate = ROOT_DIR / template_candidate
-        if not template_candidate.exists():
-            raise FileNotFoundError(
-                "Empty workbook template not found: "
-                f"{template_candidate}"
-            )
-        if template_candidate.suffix.lower() != ".twb":
-            raise ValueError(
-                "Empty workbook template must be a .twb file. "
-                f"Received: {template_candidate.name}"
-            )
-        linked_workbook_source_path = template_candidate
-        linked_workbook_source_mode = "empty_workbook_template"
-        linked_workbook_source_datasource_name = ""
+        st.info(
+            "Ignoring empty workbook template path for linked workbook generation. "
+            "Converted report visuals are preserved by default."
+        )
+
+    visual_source_twb_path = _tableau_resolve_visual_source_twb_path(
+        generated_twb_path=generated_twb_path,
+        configured_path=visual_source_twb_path_value,
+    )
+    if visual_source_twb_path is not None:
+        linked_workbook_source_mode = "generated_twb_with_visual_overlay"
+        st.info(f"Using visual source workbook: {visual_source_twb_path}")
 
     if not server_url:
         raise ValueError("Missing Tableau Cloud Server URL.")
@@ -7325,15 +7364,14 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     )
     if generated_source_artifact:
         saved_publish_artifacts["generated_source_twb"] = generated_source_artifact
-    if linked_workbook_source_mode == "empty_workbook_template":
-        empty_template_artifact = _tableau_copy_publish_artifact(
-            source_path=linked_workbook_source_path,
+    if visual_source_twb_path is not None:
+        visual_source_artifact = _tableau_copy_publish_artifact(
+            source_path=visual_source_twb_path,
             timestamp_utc=timestamp_utc,
-            label="consumer_empty_workbook_template",
+            label="visual_source_twb",
         )
-        if empty_template_artifact:
-            saved_publish_artifacts["consumer_empty_workbook_template"] = empty_template_artifact
-            st.info(f"Using consumer workbook template: {empty_template_artifact}")
+        if visual_source_artifact:
+            saved_publish_artifacts["visual_source_twb"] = visual_source_artifact
 
     with tempfile.TemporaryDirectory(prefix="sql_model_assistant_tableau_publish_") as tmp_raw:
         tmp_dir = Path(tmp_raw)
@@ -7344,7 +7382,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             datasource_name=datasource_name,
             source_datasource_name=source_datasource_name,
         )
-        if linked_workbook_source_mode == "generated_twb":
+        if linked_workbook_source_mode.startswith("generated_twb"):
             linked_workbook_source_datasource_name = resolved_source_datasource_name
         package_size_mb = datasource_package_path.stat().st_size / (1024 * 1024)
         st.info(f"Live datasource TDS size: {package_size_mb:.1f} MB. Publishing to Tableau Cloud...")
@@ -7398,7 +7436,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                     published_datasource = recovered_datasource
                     st.warning(
                         "Tableau Cloud returned a transient error after datasource upload, "
-                        "but the datasource now exists on the site. Continuing with workbook publish."
+                        "but the datasource now exists on the site. Continuing with linked workbook artifact generation."
                     )
                 else:
                     debug_artifact_path = _tableau_copy_publish_artifact_for_debug(
@@ -7433,6 +7471,17 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                 site_content_url=site_content_url,
                 source_datasource_name=linked_workbook_source_datasource_name,
             )
+
+            if visual_source_twb_path is not None:
+                visualized_linked_twb_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}_with_visuals.twb"
+                _tableau_clone_linked_workbook_with_visual_content(
+                    linked_workbook_path=linked_twb_path,
+                    visual_source_twb_path=visual_source_twb_path,
+                    output_twb_path=visualized_linked_twb_path,
+                    preferred_datasource_name=linked_workbook_source_datasource_name,
+                )
+                linked_twb_path = visualized_linked_twb_path
+
             linked_workbook_artifact = _tableau_copy_publish_artifact(
                 source_path=linked_twb_path,
                 timestamp_utc=timestamp_utc,
@@ -7443,61 +7492,14 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                 st.info(f"Saved Tableau linked workbook to: {linked_workbook_artifact}")
 
             published_workbook = None
-            workbook_publish_status = "published"
+            workbook_publish_status = "skipped_validation_pending"
             workbook_publish_error = ""
-            workbook_item = TSC.WorkbookItem(project_id=project_id, name=workbook_name)
-            try:
-                published_workbook = _tableau_publish_workbook_with_fallback(
-                    server=server,
-                    workbook_item=workbook_item,
-                    workbook_path=linked_twb_path,
-                    publish_mode=TSC.Server.PublishMode.CreateNew,
-                )
-            except Exception as publish_exc:
-                message = str(publish_exc)
-                if _tableau_is_permission_publish_error(message):
-                    workbook_publish_status = "forbidden"
-                    workbook_publish_error = message
-                    st.warning(
-                        "Datasource publish succeeded, but Tableau denied workbook publish permissions. "
-                        "The linked workbook artifact was saved locally for manual publishing."
-                    )
-                else:
-                    if not _tableau_should_retry_packaged_publish(message):
-                        raise
-                    linked_twbx_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}.twbx"
-                    _tableau_package_twb_as_twbx(
-                        twb_path=linked_twb_path,
-                        twbx_path=linked_twbx_path,
-                    )
-                    linked_twbx_artifact = _tableau_copy_publish_artifact(
-                        source_path=linked_twbx_path,
-                        timestamp_utc=timestamp_utc,
-                        label="linked_workbook_twbx_for_tableau_cloud",
-                    )
-                    if linked_twbx_artifact:
-                        saved_publish_artifacts["linked_workbook_twbx"] = linked_twbx_artifact
-                        st.info(f"Saved Tableau linked packaged workbook to: {linked_twbx_artifact}")
-                    try:
-                        published_workbook = _tableau_publish_workbook_with_fallback(
-                            server=server,
-                            workbook_item=workbook_item,
-                            workbook_path=linked_twbx_path,
-                            publish_mode=TSC.Server.PublishMode.CreateNew,
-                        )
-                    except Exception as twbx_publish_exc:
-                        twbx_message = str(twbx_publish_exc)
-                        if _tableau_is_permission_publish_error(twbx_message):
-                            workbook_publish_status = "forbidden"
-                            workbook_publish_error = twbx_message
-                            st.warning(
-                                "Datasource publish succeeded, but Tableau denied workbook publish permissions. "
-                                "The linked workbook artifact was saved locally for manual publishing."
-                            )
-                        else:
-                            raise
+            st.info(
+                "Workbook publish is intentionally skipped for validation. "
+                "Use the saved linked workbook artifact for manual checks."
+            )
 
-    overall_status = "published"
+    overall_status = "datasource_published_workbook_publish_skipped_for_validation"
     if workbook_publish_status == "forbidden":
         overall_status = "datasource_published_workbook_publish_forbidden"
 
@@ -7512,6 +7514,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         "consumer_workbook_source_path": str(linked_workbook_source_path),
         "workbook_publish_status": workbook_publish_status,
         "workbook_publish_error": workbook_publish_error,
+        "workbook_publish_attempted": False,
         "linked_workbook_artifact": linked_workbook_artifact,
         "extract_report": extract_report or {},
         "saved_publish_artifacts": saved_publish_artifacts,
@@ -7756,6 +7759,7 @@ def _tableau_prepare_datasource_payload_for_publish(
     _tableau_remove_internal_table_object_columns(datasource_payload)
     if strict_mode:
         _tableau_remove_connection_metadata_object_ids(datasource_payload)
+    _tableau_remove_migrated_data_from_datasource(datasource_payload)
     _tableau_reorder_datasource_children(datasource_payload)
 
 
@@ -7798,6 +7802,293 @@ def _tableau_remove_connection_metadata_object_ids(datasource_payload: ET.Elemen
         for child in list(record_node):
             if _tableau_local_name(child.tag) == "object-id":
                 record_node.remove(child)
+
+
+def _tableau_resolve_visual_source_twb_path(
+    generated_twb_path: Path,
+    configured_path: str,
+) -> Path | None:
+    candidates: list[Path] = []
+
+    configured_value = str(configured_path or "").strip()
+    if configured_value:
+        configured_candidate = Path(configured_value).expanduser()
+        if not configured_candidate.is_absolute():
+            configured_candidate = ROOT_DIR / configured_candidate
+        candidates.append(configured_candidate)
+
+    candidates.extend(
+        [
+            ROOT_DIR / "output" / "converted_report_hyper.twb",
+            ROOT_DIR / "output" / "converted_report.twb",
+        ]
+    )
+
+    seen: set[str] = set()
+    generated_resolved = generated_twb_path.resolve()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+
+        if not candidate.exists() or candidate.suffix.lower() != ".twb":
+            continue
+
+        try:
+            if candidate.resolve() == generated_resolved:
+                continue
+        except Exception:
+            continue
+
+        if _tableau_workbook_has_rich_visual_content(candidate):
+            return candidate
+    return None
+
+
+def _tableau_workbook_has_rich_visual_content(twb_path: Path) -> bool:
+    try:
+        root = ET.fromstring(twb_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    _tableau_strip_namespaces(root)
+
+    worksheets_node = _tableau_find_first_child(root, "worksheets")
+    dashboards_node = _tableau_find_first_child(root, "dashboards")
+
+    worksheet_count = 0
+    dashboard_count = 0
+    if worksheets_node is not None:
+        worksheet_count = sum(1 for child in list(worksheets_node) if _tableau_local_name(child.tag) == "worksheet")
+    if dashboards_node is not None:
+        dashboard_count = sum(1 for child in list(dashboards_node) if _tableau_local_name(child.tag) == "dashboard")
+
+    return dashboard_count > 0 or worksheet_count > 1
+
+
+def _tableau_clone_linked_workbook_with_visual_content(
+    linked_workbook_path: Path,
+    visual_source_twb_path: Path,
+    output_twb_path: Path,
+    preferred_datasource_name: str,
+) -> None:
+    if not linked_workbook_path.exists():
+        raise FileNotFoundError(f"Linked workbook not found for visual clone: {linked_workbook_path}")
+    if not visual_source_twb_path.exists():
+        raise FileNotFoundError(f"Visual source workbook not found: {visual_source_twb_path}")
+
+    linked_root = ET.fromstring(linked_workbook_path.read_text(encoding="utf-8"))
+    visual_root = ET.fromstring(visual_source_twb_path.read_text(encoding="utf-8"))
+    _tableau_strip_namespaces(linked_root)
+    _tableau_strip_namespaces(visual_root)
+
+    datasources_node = _tableau_find_first_child(linked_root, "datasources")
+    if datasources_node is None:
+        raise ValueError("Linked workbook has no <datasources> section.")
+
+    datasource_nodes = [
+        node for node in list(datasources_node) if _tableau_local_name(node.tag) == "datasource"
+    ]
+    if not datasource_nodes:
+        raise ValueError("Linked workbook has no datasource node.")
+
+    selected_datasource = _tableau_select_datasource_node(datasource_nodes, preferred_datasource_name)
+    target_datasource_name = str(selected_datasource.attrib.get("name", "") or "").strip()
+
+    visual_datasource_names = _tableau_collect_workbook_datasource_names(visual_root)
+    inserted_sections = _tableau_replace_visual_sections(
+        target_root=linked_root,
+        visual_source_root=visual_root,
+    )
+    _tableau_rebind_visual_datasource_references(
+        section_roots=inserted_sections,
+        source_datasource_names=visual_datasource_names,
+        target_datasource_name=target_datasource_name,
+    )
+    _tableau_remove_migrated_data_artifacts(linked_root, selected_datasource)
+
+    output_twb_path.parent.mkdir(parents=True, exist_ok=True)
+    ET.register_namespace("user", "http://www.tableausoftware.com/xml/user")
+    output_twb_path.write_bytes(ET.tostring(linked_root, encoding="utf-8", xml_declaration=True))
+
+
+def _tableau_collect_workbook_datasource_names(root: ET.Element) -> list[str]:
+    datasources_node = _tableau_find_first_child(root, "datasources")
+    if datasources_node is None:
+        return []
+
+    names: list[str] = []
+    for datasource_node in list(datasources_node):
+        if _tableau_local_name(datasource_node.tag) != "datasource":
+            continue
+        name = str(datasource_node.attrib.get("name", "") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _tableau_replace_visual_sections(
+    target_root: ET.Element,
+    visual_source_root: ET.Element,
+) -> list[ET.Element]:
+    section_order = ["worksheets", "dashboards", "stories", "windows", "thumbnails"]
+
+    source_sections: dict[str, ET.Element] = {}
+    for section_name in section_order:
+        section_node = _tableau_find_first_child(visual_source_root, section_name)
+        if section_node is not None:
+            source_sections[section_name] = copy.deepcopy(section_node)
+
+    for child in [c for c in list(target_root) if _tableau_local_name(c.tag) in set(section_order)]:
+        target_root.remove(child)
+
+    children = list(target_root)
+    insert_index = len(children)
+    datasources_index = next(
+        (idx for idx, child in enumerate(children) if _tableau_local_name(child.tag) == "datasources"),
+        None,
+    )
+    if datasources_index is not None:
+        insert_index = datasources_index + 1
+
+    inserted: list[ET.Element] = []
+    for section_name in section_order:
+        section_node = source_sections.get(section_name)
+        if section_node is None:
+            continue
+        target_root.insert(insert_index, section_node)
+        insert_index += 1
+        inserted.append(section_node)
+    return inserted
+
+
+def _tableau_rebind_visual_datasource_references(
+    section_roots: list[ET.Element],
+    source_datasource_names: list[str],
+    target_datasource_name: str,
+) -> None:
+    target_name = str(target_datasource_name or "").strip()
+    if not target_name or not section_roots:
+        return
+
+    source_names: list[str] = []
+    seen: set[str] = set()
+    for name in source_datasource_names:
+        candidate = str(name or "").strip()
+        if not candidate or candidate == target_name or candidate in seen:
+            continue
+        seen.add(candidate)
+        source_names.append(candidate)
+
+    if not source_names:
+        return
+
+    source_name_set = set(source_names)
+    for section_root in section_roots:
+        for node in section_root.iter():
+            if _tableau_local_name(node.tag) == "datasource":
+                current_name = str(node.attrib.get("name", "") or "").strip()
+                if current_name in source_name_set:
+                    node.attrib["name"] = target_name
+
+            current_datasource = str(node.attrib.get("datasource", "") or "").strip()
+            if current_datasource in source_name_set:
+                node.attrib["datasource"] = target_name
+
+            for attr_name, attr_value in list(node.attrib.items()):
+                value = str(attr_value or "")
+                replaced = _tableau_replace_datasource_reference_tokens(value, source_names, target_name)
+                if replaced != value:
+                    node.attrib[attr_name] = replaced
+
+            if node.text:
+                node.text = _tableau_replace_datasource_reference_tokens(node.text, source_names, target_name)
+
+
+def _tableau_replace_datasource_reference_tokens(
+    value: str,
+    source_datasource_names: list[str],
+    target_datasource_name: str,
+) -> str:
+    updated = str(value or "")
+    target = str(target_datasource_name or "")
+    if not updated or not target:
+        return updated
+
+    for source_name in source_datasource_names:
+        source = str(source_name or "")
+        if not source:
+            continue
+        if updated == source:
+            updated = target
+        updated = updated.replace(f"[{source}].", f"[{target}].")
+        updated = updated.replace(f"'{source}'", f"'{target}'")
+        updated = updated.replace(f'"{source}"', f'"{target}"')
+    return updated
+
+
+def _tableau_is_migrated_data_value(value: str) -> bool:
+    normalized = re.sub(r"[_\s]+", " ", str(value or "").strip().lower())
+    return "migrated data" in normalized
+
+
+def _tableau_remove_migrated_data_from_datasource(datasource_node: ET.Element) -> None:
+    removed_column_names: set[str] = set()
+
+    for child in list(datasource_node):
+        if _tableau_local_name(child.tag) != "column":
+            continue
+        name_attr = str(child.attrib.get("name", "") or "").strip()
+        caption_attr = str(child.attrib.get("caption", "") or "").strip()
+        if _tableau_is_migrated_data_value(f"{name_attr} {caption_attr}"):
+            if name_attr:
+                removed_column_names.add(name_attr)
+            datasource_node.remove(child)
+
+    for child in list(datasource_node):
+        if _tableau_local_name(child.tag) != "column-instance":
+            continue
+        column_attr = str(child.attrib.get("column", "") or "").strip()
+        name_attr = str(child.attrib.get("name", "") or "").strip()
+        if (
+            column_attr in removed_column_names
+            or _tableau_is_migrated_data_value(column_attr)
+            or _tableau_is_migrated_data_value(name_attr)
+        ):
+            datasource_node.remove(child)
+
+    for parent in list(datasource_node.iter()):
+        for child in list(parent):
+            local_name = _tableau_local_name(child.tag)
+            if local_name not in {"map", "metadata-record", "object", "relation", "object-id"}:
+                continue
+
+            candidate_parts: list[str] = [str(child.text or "")]
+            candidate_parts.extend(str(value) for value in child.attrib.values())
+            for grandchild in list(child):
+                candidate_parts.append(str(grandchild.text or ""))
+                candidate_parts.extend(str(value) for value in grandchild.attrib.values())
+
+            if _tableau_is_migrated_data_value(" ".join(candidate_parts)):
+                parent.remove(child)
+
+
+def _tableau_remove_migrated_data_artifacts(
+    workbook_root: ET.Element,
+    datasource_node: ET.Element | None,
+) -> None:
+    if datasource_node is not None:
+        _tableau_remove_migrated_data_from_datasource(datasource_node)
+
+    for dependencies_node in workbook_root.findall(".//datasource-dependencies"):
+        for child in list(dependencies_node):
+            local_name = _tableau_local_name(child.tag)
+            if local_name not in {"column", "column-instance"}:
+                continue
+            candidate = " ".join(str(value) for value in child.attrib.values())
+            if _tableau_is_migrated_data_value(candidate):
+                dependencies_node.remove(child)
 
 
 def _build_linked_workbook_for_published_datasource(
@@ -7894,7 +8185,7 @@ def _build_linked_workbook_for_published_datasource(
         aliases_node.attrib.setdefault("enabled", "yes")
 
     _tableau_reorder_datasource_children(selected)
-    _tableau_rebuild_workbook_as_empty_consumer(root=root, datasource_node=selected)
+    _tableau_remove_migrated_data_artifacts(root, selected)
 
     output_twb_path.parent.mkdir(parents=True, exist_ok=True)
     ET.register_namespace("user", "http://www.tableausoftware.com/xml/user")
@@ -8197,7 +8488,7 @@ def _tableau_poll_publish_job_until_complete(
                     try:
                         status_placeholder.success(
                             "Tableau has not reported the async job complete yet, "
-                            "but the published datasource exists. Continuing with workbook publish."
+                            "but the published datasource exists. Continuing with publish workflow."
                         )
                     except Exception:
                         pass
