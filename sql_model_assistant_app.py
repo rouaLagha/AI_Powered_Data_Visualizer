@@ -6447,7 +6447,14 @@ def _init_state() -> None:
     st.session_state.setdefault("sql_model_assistant_validated_model", {})
     st.session_state.setdefault("sql_model_assistant_generated_twb", "")
     st.session_state.setdefault("sql_model_assistant_generated_twb_name", "validated_semantic_model.twb")
-    st.session_state.setdefault("sql_model_assistant_template_path", _template_default_path())
+    preferred_template_path = _template_default_path()
+    st.session_state.setdefault("sql_model_assistant_template_path", preferred_template_path)
+    current_template_path = str(st.session_state.sql_model_assistant_template_path or "").strip()
+    legacy_output_template_key = _template_path_key(OUTPUT_TEMPLATE_PATH)
+    current_template_key = _template_path_key(current_template_path)
+    preferred_template_key = _template_path_key(preferred_template_path)
+    if preferred_template_key and current_template_key in {"", legacy_output_template_key}:
+        st.session_state.sql_model_assistant_template_path = preferred_template_path
     st.session_state.setdefault(
         "sql_model_assistant_llm_config",
         str(_preferred_sql_assistant_llm_config_path()),
@@ -6685,13 +6692,129 @@ def _append_assistant_response() -> None:
 
 
 def _template_default_path() -> str:
-    if OUTPUT_TEMPLATE_PATH.exists():
-        return str(OUTPUT_TEMPLATE_PATH)
-    if DEFAULT_TEMPLATE_PATH.exists():
-        return str(DEFAULT_TEMPLATE_PATH)
-    if FALLBACK_TEMPLATE_PATH.exists():
-        return str(FALLBACK_TEMPLATE_PATH)
+    candidates = _template_default_candidates()
+    if candidates:
+        return str(max(candidates, key=_template_candidate_score))
     return str(OUTPUT_TEMPLATE_PATH)
+
+
+def _template_default_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    configured_path = ""
+    try:
+        configured_path = str(
+            st.session_state.get("sql_model_assistant_tableau_empty_workbook_template_path", "") or ""
+        ).strip()
+    except Exception:
+        configured_path = ""
+
+    if configured_path:
+        candidates.append(Path(configured_path).expanduser())
+
+    output_dir = OUTPUT_TEMPLATE_PATH.parent
+    if output_dir.exists():
+        candidates.extend(sorted(output_dir.glob("template_semantic_model*.twb")))
+
+    candidates.extend([OUTPUT_TEMPLATE_PATH, DEFAULT_TEMPLATE_PATH, FALLBACK_TEMPLATE_PATH])
+
+    existing_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.suffix.lower() != ".twb" or not path.exists():
+            continue
+        path_key = _template_path_key(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        existing_candidates.append(path)
+
+    return existing_candidates
+
+
+def _template_candidate_score(path: Path) -> tuple[int, int, int, int, int, int, int, int]:
+    configured_path = ""
+    try:
+        configured_path = str(
+            st.session_state.get("sql_model_assistant_tableau_empty_workbook_template_path", "") or ""
+        ).strip()
+    except Exception:
+        configured_path = ""
+
+    configured_key = _template_path_key(configured_path)
+    path_key = _template_path_key(path)
+    is_configured = 1 if configured_key and path_key == configured_key else 0
+    is_output_template_family = 1 if path.parent == OUTPUT_TEMPLATE_PATH.parent else 0
+
+    cols_count = 0
+    metadata_count = 0
+    relationship_count = 0
+    suffixed_name_count = 0
+    try:
+        root = ET.fromstring(_read_twb_text_with_fallback(path))
+        datasource_node = root.find("datasources/datasource")
+        if datasource_node is not None:
+            connection_node = datasource_node.find("connection")
+            if connection_node is not None:
+                cols_node = connection_node.find("cols")
+                if cols_node is not None:
+                    map_nodes = [child for child in list(cols_node) if child.tag == "map"]
+                    cols_count = len(map_nodes)
+                    for map_node in map_nodes:
+                        key_raw = str(map_node.attrib.get("key", "") or "").strip()
+                        if re.search(r"\[[^\]]+\s+\([^\]]+\)\]", key_raw):
+                            suffixed_name_count += 1
+
+                metadata_node = connection_node.find("metadata-records")
+                if metadata_node is not None:
+                    metadata_count = len([child for child in list(metadata_node) if child.tag == "metadata-record"])
+
+            relationships_node = datasource_node.find("object-graph/relationships")
+            if relationships_node is not None:
+                relationship_count = len(
+                    [child for child in list(relationships_node) if child.tag == "relationship"]
+                )
+    except Exception:
+        pass
+
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        modified = int(stat.st_mtime_ns)
+    except OSError:
+        size = 0
+        modified = 0
+
+    return (
+        is_configured,
+        is_output_template_family,
+        cols_count,
+        metadata_count,
+        relationship_count,
+        suffixed_name_count,
+        size,
+        modified,
+    )
+
+
+def _read_twb_text_with_fallback(path: Path) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _template_path_key(value: str | Path) -> str:
+    if not value:
+        return ""
+    path = Path(value).expanduser()
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
 
 
 def _preferred_sql_assistant_llm_config_path() -> Path:
@@ -7344,9 +7467,45 @@ def _tableau_format_user_publish_failure(error: Exception | str) -> str:
     return f"Tableau Cloud publish failed: {details}"
 
 
+def _tableau_resolve_source_twb_for_publish(generated_twb_path: Path) -> Path:
+    target_name = str(generated_twb_path.name or "").strip().lower()
+    if target_name != "validated_semantic_model.twb":
+        return generated_twb_path
+
+    candidates: list[Path] = []
+    env_override = str(os.getenv("SQL_MODEL_ASSISTANT_CANONICAL_TWB") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    candidates.extend(
+        [
+            ROOT_DIR / "output" / "template_semantic_model - Copy.twb",
+            ROOT_DIR / "config" / "RegionalSales.canonical.twb",
+            ROOT_DIR / "output" / "template_semantic_model.twb",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if resolved.is_file():
+            return resolved
+
+    return generated_twb_path
+
+
 def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, Any]:
     if not generated_twb_path.exists():
         raise FileNotFoundError(f"Generated TWB file not found: {generated_twb_path}")
+
+    source_twb_path_for_publish = _tableau_resolve_source_twb_for_publish(generated_twb_path)
+    if source_twb_path_for_publish != generated_twb_path:
+        try:
+            st.info(f"Using canonical source TWB for publish: {source_twb_path_for_publish}")
+        except Exception:
+            pass
 
     cfg_defaults = _load_tableau_publish_defaults(str(st.session_state.sql_model_assistant_llm_config or ""))
 
@@ -7407,7 +7566,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         st.session_state.sql_model_assistant_tableau_visual_source_twb_path = visual_source_twb_path_value
         st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input = visual_source_twb_path_value
 
-    linked_workbook_source_path = generated_twb_path
+    linked_workbook_source_path = source_twb_path_for_publish
     linked_workbook_source_mode = "generated_twb"
     linked_workbook_source_datasource_name = source_datasource_name
     if empty_workbook_template_path:
@@ -7417,7 +7576,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         )
 
     visual_source_twb_path = _tableau_resolve_visual_source_twb_path(
-        generated_twb_path=generated_twb_path,
+        generated_twb_path=source_twb_path_for_publish,
         configured_path=visual_source_twb_path_value,
     )
     if visual_source_twb_path is not None:
@@ -7446,7 +7605,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     saved_publish_artifacts: dict[str, str] = {}
     linked_workbook_artifact = ""
     generated_source_artifact = _tableau_copy_publish_artifact(
-        source_path=generated_twb_path,
+        source_path=source_twb_path_for_publish,
         timestamp_utc=timestamp_utc,
         label="generated_source_twb",
     )
@@ -7465,7 +7624,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         tmp_dir = Path(tmp_raw)
 
         datasource_package_path, resolved_source_datasource_name = _build_live_datasource_tds_for_publish(
-            source_twb_path=generated_twb_path,
+            source_twb_path=source_twb_path_for_publish,
             output_dir=tmp_dir,
             datasource_name=datasource_name,
             source_datasource_name=source_datasource_name,
@@ -7994,6 +8153,12 @@ def _tableau_clone_linked_workbook_with_visual_content(
         source_datasource_names=visual_datasource_names,
         target_datasource_name=target_datasource_name,
     )
+    _tableau_rebind_visual_field_references(
+        section_roots=inserted_sections,
+        visual_source_root=visual_root,
+        source_datasource_names=visual_datasource_names,
+        target_datasource_node=selected_datasource,
+    )
     _tableau_remove_migrated_data_artifacts(linked_root, selected_datasource)
 
     output_twb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8116,6 +8281,221 @@ def _tableau_replace_datasource_reference_tokens(
     return updated
 
 
+def _tableau_rebind_visual_field_references(
+    section_roots: list[ET.Element],
+    visual_source_root: ET.Element,
+    source_datasource_names: list[str],
+    target_datasource_node: ET.Element,
+) -> None:
+    field_reference_map = _tableau_build_visual_field_reference_map(
+        visual_source_root=visual_source_root,
+        source_datasource_names=source_datasource_names,
+        target_datasource_node=target_datasource_node,
+    )
+    if not field_reference_map:
+        return
+
+    for section_root in section_roots:
+        for node in section_root.iter():
+            for attr_name, attr_value in list(node.attrib.items()):
+                value = str(attr_value or "")
+                replaced = _tableau_replace_field_reference_tokens(value, field_reference_map)
+                if replaced != value:
+                    node.attrib[attr_name] = replaced
+
+            if node.text:
+                node.text = _tableau_replace_field_reference_tokens(node.text, field_reference_map)
+            if node.tail:
+                node.tail = _tableau_replace_field_reference_tokens(node.tail, field_reference_map)
+
+
+def _tableau_build_visual_field_reference_map(
+    visual_source_root: ET.Element,
+    source_datasource_names: list[str],
+    target_datasource_node: ET.Element,
+) -> dict[str, str]:
+    datasources_node = _tableau_find_first_child(visual_source_root, "datasources")
+    if datasources_node is None:
+        return {}
+
+    source_names = {str(name or "").strip() for name in source_datasource_names if str(name or "").strip()}
+    source_datasource_nodes: list[ET.Element] = []
+    for datasource_node in list(datasources_node):
+        if _tableau_local_name(datasource_node.tag) != "datasource":
+            continue
+        datasource_name = str(datasource_node.attrib.get("name", "") or "").strip()
+        if source_names and datasource_name not in source_names:
+            continue
+        source_datasource_nodes.append(datasource_node)
+
+    if not source_datasource_nodes:
+        return {}
+
+    source_specs: list[dict[str, str]] = []
+    for datasource_node in source_datasource_nodes:
+        source_specs.extend(_tableau_collect_datasource_field_specs(datasource_node))
+    source_specs.extend(_tableau_collect_dependency_field_specs(visual_source_root))
+
+    target_specs = _tableau_collect_datasource_field_specs(target_datasource_node)
+    if not source_specs or not target_specs:
+        return {}
+
+    target_exact_names = {_name_key(spec["name"]): spec["name"] for spec in target_specs if spec["name"]}
+    target_by_base = _tableau_build_unique_field_lookup(target_specs, "base_key")
+    target_by_label = _tableau_build_unique_field_lookup(target_specs, "label_key")
+
+    field_reference_map: dict[str, str] = {}
+    for source_spec in source_specs:
+        source_name = str(source_spec.get("name", "") or "").strip()
+        if not source_name:
+            continue
+
+        source_exact_key = _name_key(source_name)
+        if source_exact_key and source_exact_key in target_exact_names:
+            continue
+
+        candidate = ""
+        source_base_key = str(source_spec.get("base_key", "") or "").strip()
+        source_label_key = str(source_spec.get("label_key", "") or "").strip()
+        if source_base_key:
+            candidate = str(target_by_base.get(source_base_key, "") or "").strip()
+        if not candidate and source_label_key:
+            candidate = str(target_by_label.get(source_label_key, "") or "").strip()
+
+        if candidate and candidate != source_name:
+            field_reference_map[source_name] = candidate
+
+    return field_reference_map
+
+
+def _tableau_collect_datasource_field_specs(datasource_node: ET.Element) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    for child in list(datasource_node):
+        if _tableau_local_name(child.tag) != "column":
+            continue
+
+        datatype = str(child.attrib.get("datatype", "") or "").strip().lower()
+        name = str(child.attrib.get("name", "") or "").strip()
+        if not name or datatype == "table" or name.startswith("[__tableau_internal_object_id__]."):
+            continue
+
+        name_key = _name_key(name)
+        if not name_key or name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+
+        caption = str(child.attrib.get("caption", "") or "").strip()
+        specs.append(
+            {
+                "name": name,
+                "caption": caption,
+                "base_key": _tableau_field_base_key(name, caption),
+                "label_key": _tableau_field_label_key(name, caption),
+            }
+        )
+
+    return specs
+
+
+def _tableau_collect_dependency_field_specs(root: ET.Element) -> list[dict[str, str]]:
+    specs: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    for dependencies_node in root.findall(".//datasource-dependencies"):
+        for child in list(dependencies_node):
+            if _tableau_local_name(child.tag) != "column":
+                continue
+
+            name = str(child.attrib.get("name", "") or "").strip()
+            if not name:
+                continue
+
+            name_key = _name_key(name)
+            if not name_key or name_key in seen_names:
+                continue
+            seen_names.add(name_key)
+
+            caption = str(child.attrib.get("caption", "") or "").strip()
+            specs.append(
+                {
+                    "name": name,
+                    "caption": caption,
+                    "base_key": _tableau_field_base_key(name, caption),
+                    "label_key": _tableau_field_label_key(name, caption),
+                }
+            )
+
+    return specs
+
+
+def _tableau_build_unique_field_lookup(
+    field_specs: list[dict[str, str]],
+    key_name: str,
+) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for spec in field_specs:
+        key = str(spec.get(key_name, "") or "").strip()
+        name = str(spec.get("name", "") or "").strip()
+        if not key or not name:
+            continue
+        grouped.setdefault(key, []).append(name)
+
+    lookup: dict[str, str] = {}
+    for key, names in grouped.items():
+        unique_names = []
+        seen: set[str] = set()
+        for name in names:
+            normalized = _name_key(name)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_names.append(name)
+        if len(unique_names) == 1:
+            lookup[key] = unique_names[0]
+    return lookup
+
+
+def _tableau_field_label_key(name: str, caption: str) -> str:
+    label = str(caption or "").strip()
+    if not label:
+        label = _clean_name(name)
+    return _name_key(label)
+
+
+def _tableau_field_base_key(name: str, caption: str) -> str:
+    label = str(caption or "").strip()
+    if not label:
+        label = _clean_name(name)
+    label = re.sub(r"\s+\([^)]*\)$", "", label).strip()
+    return _name_key(label)
+
+
+def _tableau_replace_field_reference_tokens(
+    value: str,
+    field_reference_map: dict[str, str],
+) -> str:
+    updated = str(value or "")
+    if not updated or not field_reference_map:
+        return updated
+
+    ordered_replacements = sorted(
+        (
+            (str(source_name or ""), str(target_name or ""))
+            for source_name, target_name in field_reference_map.items()
+            if str(source_name or "").strip() and str(target_name or "").strip()
+        ),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    for source_name, target_name in ordered_replacements:
+        updated = updated.replace(source_name, target_name)
+
+    return updated
+
+
 def _tableau_is_migrated_data_value(value: str) -> bool:
     normalized = re.sub(r"[_\s]+", " ", str(value or "").strip().lower())
     return "migrated data" in normalized
@@ -8224,6 +8604,7 @@ def _build_linked_workbook_for_published_datasource(
     selected.attrib["caption"] = published_name
     selected.attrib.setdefault("inline", "true")
     selected.attrib.setdefault("version", "18.1")
+    _tableau_ensure_exposed_columns_from_connection_metadata(selected)
 
     for child in [
         c
@@ -9477,6 +9858,7 @@ def _apply_validated_schema_to_twb(
         connection_node=connection_node,
         datasource_node=datasource_node,
     )
+    _tableau_ensure_exposed_columns_from_connection_metadata(datasource_node)
 
     _normalize_connection_child_order(connection_node)
 
@@ -9892,6 +10274,164 @@ def _build_cols_local_key_to_table_name(connection_node: ET.Element) -> dict[str
         lookup[local_key] = table_name
 
     return lookup
+
+
+def _tableau_ensure_exposed_columns_from_connection_metadata(datasource_node: ET.Element) -> None:
+    connection_node = datasource_node.find("connection")
+    if connection_node is None:
+        return
+
+    cols_node = connection_node.find("cols")
+    if cols_node is None:
+        return
+
+    metadata_lookup = _tableau_build_connection_metadata_lookup(connection_node)
+    if not metadata_lookup:
+        return
+
+    existing_names: set[str] = set()
+    for child in list(datasource_node):
+        if child.tag != "column":
+            continue
+        datatype = str(child.attrib.get("datatype", "") or "").strip().lower()
+        name_attr = str(child.attrib.get("name", "") or "").strip()
+        if not name_attr or datatype == "table" or name_attr.startswith("[__tableau_internal_object_id__]."):
+            continue
+        existing_names.add(_name_key(name_attr))
+
+    insert_at = len(list(datasource_node))
+    for index, child in enumerate(list(datasource_node)):
+        if child.tag in {"layout", "semantic-values", "object-graph"}:
+            insert_at = index
+            break
+
+    columns_to_add: list[ET.Element] = []
+    for map_node in [child for child in list(cols_node) if child.tag == "map"]:
+        local_name = str(map_node.attrib.get("key", "") or "").strip()
+        if not local_name:
+            continue
+        local_key = _name_key(local_name)
+        if not local_key or local_key in existing_names:
+            continue
+
+        metadata = metadata_lookup.get(local_key)
+        if metadata is None:
+            continue
+
+        columns_to_add.append(_tableau_build_exposed_column_from_metadata(local_name, metadata))
+        existing_names.add(local_key)
+
+    for offset, column_node in enumerate(columns_to_add):
+        datasource_node.insert(insert_at + offset, column_node)
+
+
+def _tableau_build_connection_metadata_lookup(
+    connection_node: ET.Element,
+) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    metadata_node = connection_node.find("metadata-records")
+    if metadata_node is None:
+        return lookup
+
+    for record in [child for child in list(metadata_node) if child.tag == "metadata-record"]:
+        local_name = str(record.findtext("local-name", "") or "").strip()
+        if not local_name:
+            continue
+
+        lookup[_name_key(local_name)] = {
+            "local_name": local_name,
+            "local_type": str(record.findtext("local-type", "") or "").strip().lower(),
+            "aggregation": str(record.findtext("aggregation", "") or "").strip(),
+            "remote_name": str(record.findtext("remote-name", "") or "").strip(),
+            "remote_alias": str(record.findtext("remote-alias", "") or "").strip(),
+        }
+
+    return lookup
+
+
+def _tableau_build_exposed_column_from_metadata(
+    local_name: str,
+    metadata: dict[str, str],
+) -> ET.Element:
+    clean_local_name = _clean_name(local_name)
+    local_type = str(metadata.get("local_type", "") or "").strip().lower()
+    remote_name = str(metadata.get("remote_name", "") or "").strip()
+    remote_alias = str(metadata.get("remote_alias", "") or "").strip()
+    datatype, role, semantic_type = _tableau_infer_exposed_column_traits(
+        local_name=clean_local_name,
+        local_type=local_type,
+        remote_name=remote_name,
+    )
+
+    attrs: dict[str, str] = {
+        "name": local_name,
+        "datatype": datatype,
+        "role": role,
+        "type": semantic_type,
+    }
+
+    if role == "dimension" and datatype in {"integer", "real"}:
+        attrs["aggregation"] = "Sum"
+
+    caption = ""
+    if " (" not in clean_local_name:
+        caption = remote_alias or remote_name
+    if caption:
+        attrs["caption"] = _tableau_titleize_identifier(caption)
+
+    return ET.Element("column", attrib=attrs)
+
+
+def _tableau_infer_exposed_column_traits(
+    local_name: str,
+    local_type: str,
+    remote_name: str,
+) -> tuple[str, str, str]:
+    normalized_local_name = _clean_name(local_name)
+    normalized_remote_name = _clean_name(remote_name)
+    dimension_like = _tableau_is_dimension_like_field_name(normalized_local_name) or _tableau_is_dimension_like_field_name(
+        normalized_remote_name
+    )
+
+    if local_type in {"string"}:
+        return "string", "dimension", "nominal"
+    if local_type in {"boolean"}:
+        return "boolean", "dimension", "nominal"
+    if local_type in {"date", "datetime"}:
+        return local_type, "dimension", "ordinal"
+    if local_type == "integer":
+        if dimension_like:
+            return "integer", "dimension", "ordinal"
+        return "integer", "measure", "quantitative"
+    if local_type == "real":
+        if dimension_like:
+            return "real", "dimension", "ordinal"
+        return "real", "measure", "quantitative"
+
+    return "string", "dimension", "nominal"
+
+
+def _tableau_is_dimension_like_field_name(value: str) -> bool:
+    normalized = _name_key(value)
+    if not normalized:
+        return False
+    return (
+        normalized.endswith("key")
+        or normalized.endswith("id")
+        or normalized.endswith("code")
+        or normalized.startswith("is")
+    )
+
+
+def _tableau_titleize_identifier(value: str) -> str:
+    text = _clean_name(value)
+    if not text:
+        return ""
+
+    parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|[0-9]+", text)
+    if not parts:
+        return text
+    return " ".join(parts)
 
 
 def _build_table_object_id_lookup_from_current_object_graph(datasource_node: ET.Element) -> dict[str, str]:
