@@ -1,0 +1,2154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reactflow@11.11.4/dist/style.css" />
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --bg: #f8fafc;
+        --panel: rgba(255, 255, 255, 0.97);
+        --border: #dbe3ee;
+        --text: #0f172a;
+        --muted: #64748b;
+        --fact: #1d4ed8;
+        --fact-soft: #dbeafe;
+        --direct: #0f766e;
+        --direct-soft: #d1fae5;
+        --snowflake: #7c3aed;
+        --snowflake-soft: #ede9fe;
+        --unknown: #64748b;
+        --unknown-soft: #eef2f7;
+        --time: #b45309;
+        --time-soft: #fef3c7;
+        --relation: #6b7280;
+        --relation-soft: #f3f4f6;
+        --relation-snowflake: #6b7280;
+        --relation-snowflake-soft: #ede9fe;
+        --shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+      }
+
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+      }
+
+      .schema-flow-shell {
+        box-sizing: border-box;
+        height: 100%;
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #f8fafc;
+        overflow: hidden;
+        position: relative;
+        --toolbar-height: 72px;
+      }
+
+      .schema-flow-toolbar {
+        align-items: flex-start;
+        background: #ffffff;
+        border-bottom: 1px solid var(--border);
+        box-sizing: border-box;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 16px;
+        min-height: 72px;
+        justify-content: space-between;
+        padding: 12px 18px;
+        position: absolute;
+        width: 100%;
+        z-index: 8;
+        pointer-events: auto;
+      }
+
+      .schema-flow-heading {
+        align-items: center;
+        display: flex;
+        flex: 1 1 420px;
+        gap: 14px;
+        min-width: 0;
+      }
+
+      .schema-flow-mark {
+        align-items: center;
+        background: #eff6ff;
+        border-radius: 8px;
+        color: var(--fact);
+        display: inline-flex;
+        flex: 0 0 auto;
+        height: 34px;
+        justify-content: center;
+        width: 34px;
+      }
+
+      .schema-flow-mark svg {
+        height: 18px;
+        width: 18px;
+      }
+
+      .schema-flow-title-wrap {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .schema-flow-title {
+        color: var(--text);
+        font-size: 18px;
+        font-weight: 800;
+        letter-spacing: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .schema-flow-subtitle {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 3px;
+      }
+
+      .schema-flow-stats {
+        align-items: center;
+        color: #334155;
+        display: flex;
+        flex: 1 1 300px;
+        flex-wrap: wrap;
+        font-size: 13px;
+        gap: 10px;
+        justify-content: flex-end;
+      }
+
+      @media (max-width: 980px) {
+        .schema-flow-stats {
+          justify-content: flex-start;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .schema-flow-toolbar {
+          gap: 8px 12px;
+          padding: 10px 12px;
+        }
+
+        .schema-flow-title {
+          font-size: 16px;
+        }
+
+        .schema-flow-pill {
+          min-height: 30px;
+          padding: 0 12px;
+        }
+      }
+
+      .schema-flow-stats > .schema-flow-pill {
+        flex: 0 0 auto;
+      }
+
+      .schema-flow-pill {
+        align-items: center;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        display: inline-flex;
+        gap: 6px;
+        font-weight: 700;
+        min-height: 34px;
+        padding: 0 16px;
+        white-space: nowrap;
+      }
+
+      .schema-flow-pill.fact {
+        background: #eff6ff;
+        border-color: #bfdbfe;
+        color: #1d4ed8;
+      }
+
+      .schema-flow-pill.direct {
+        background: #f0fdf4;
+        border-color: #bbf7d0;
+        color: #166534;
+      }
+
+      .schema-flow-pill.snowflake {
+        background: #f5f3ff;
+        border-color: #ddd6fe;
+        color: #5b21b6;
+      }
+
+      .schema-flow-pill.relation {
+        background: #f8fafc;
+        border-color: #e2e8f0;
+        color: #111827;
+      }
+
+      .schema-flow-canvas {
+        background-color: #f8fafc;
+        background-image: radial-gradient(#e5e7eb 0.85px, transparent 0.85px);
+        background-size: 18px 18px;
+        box-sizing: border-box;
+        bottom: 0;
+        left: 0;
+        position: absolute;
+        right: 0;
+        top: var(--toolbar-height);
+        /* FIX: ensure canvas gets pointer events */
+        pointer-events: auto;
+        z-index: 1;
+      }
+
+      .schema-flow-canvas .react-flow {
+        background: transparent;
+        height: 100%;
+        width: 100%;
+      }
+
+      .schema-flow-legend {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        color: #111827;
+        display: grid;
+        gap: 12px;
+        left: 16px;
+        padding: 16px 18px;
+        position: absolute;
+        /* FIX: legend must not block canvas interactions */
+        pointer-events: none;
+        top: calc(var(--toolbar-height) + 16px);
+        z-index: 7;
+        min-width: 190px;
+      }
+
+      .schema-flow-legend-title {
+        color: var(--text);
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      .schema-flow-legend-row {
+        align-items: center;
+        display: flex;
+        font-size: 13px;
+        gap: 10px;
+        white-space: nowrap;
+      }
+
+      .schema-flow-dot {
+        border-radius: 3px;
+        display: inline-block;
+        height: 13px;
+        width: 13px;
+      }
+
+      .schema-flow-line-sample {
+        border-top: 2px solid var(--relation);
+        display: inline-block;
+        width: 32px;
+      }
+
+      .schema-flow-line-sample.snowflake {
+        border-top-color: var(--relation-snowflake);
+        border-top-style: dashed;
+      }
+
+      .schema-flow-legend-relation {
+        align-items: flex-start;
+        display: grid;
+        gap: 4px;
+        grid-template-columns: 34px 1fr;
+      }
+
+      .schema-flow-legend-relation-main {
+        color: #111827;
+        font-size: 12px;
+        line-height: 1.25;
+      }
+
+      .schema-flow-legend-relation-cardinality {
+        color: #111827;
+        font-size: 12px;
+        grid-column: 2;
+      }
+
+      .schema-flow-empty,
+      .schema-flow-error {
+        align-items: center;
+        color: #475569;
+        display: flex;
+        font-size: 14px;
+        height: 100%;
+        justify-content: center;
+        padding: 20px;
+        text-align: center;
+      }
+
+      .react-flow__node {
+        background: transparent;
+        border: 0;
+        box-shadow: none;
+        font-size: 12px;
+      }
+
+      .react-flow__background {
+        display: none;
+        pointer-events: none;
+      }
+
+      .react-flow__attribution {
+        display: none !important;
+        pointer-events: none;
+      }
+
+      .react-flow__pane {
+        cursor: grab;
+      }
+
+      .react-flow__pane.dragging {
+        cursor: grabbing;
+      }
+
+      .react-flow__node.selected .table-card {
+        box-shadow: 0 12px 24px rgba(15, 23, 42, 0.14);
+      }
+
+      .react-flow__edge-text {
+        font-size: 11px;
+        font-weight: 700;
+        fill: #334155;
+      }
+
+      .relationship-edge-path {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .relationship-edge-path:hover {
+        stroke-width: 2.8px;
+      }
+
+      .relationship-cardinality-label text {
+        dominant-baseline: central;
+        fill: #111827;
+        font-size: 13px;
+        font-weight: 800;
+        pointer-events: none;
+      }
+
+      .relationship-cardinality-label rect {
+        fill: #ffffff;
+        stroke: #cbd5e1;
+        stroke-width: 1;
+      }
+
+      .table-card {
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        box-shadow: var(--shadow);
+        min-width: 300px;
+        width: 300px;
+        overflow: hidden;
+        position: relative;
+        transition: box-shadow 0.18s ease;
+      }
+
+      .table-card-handle {
+        background: transparent;
+        border: 0;
+        height: 14px;
+        opacity: 0;
+        pointer-events: none;
+        width: 14px;
+      }
+
+      .table-card.fact {
+        border-color: #2563eb;
+      }
+
+      .table-card.direct {
+        border-color: #16a34a;
+      }
+
+      .table-card.snowflake {
+        border-color: #a78bfa;
+      }
+
+      .table-card.unknown {
+        border-color: #cbd5e1;
+      }
+
+      .table-card.time {
+        border-color: #16a34a;
+      }
+
+      .table-card-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        justify-content: space-between;
+        min-height: 44px;
+        padding: 0 12px;
+        border-bottom: 1px solid #dbe8dc;
+      }
+
+      .table-card-header.fact {
+        background: #eff6ff;
+        border-bottom-color: #bfdbfe;
+      }
+
+      .table-card-header.direct {
+        background: #f0fdf4;
+        border-bottom-color: #bbf7d0;
+      }
+
+      .table-card-header.snowflake {
+        background: #faf5ff;
+        border-bottom-color: #ddd6fe;
+      }
+
+      .table-card-header.unknown {
+        background: var(--unknown-soft);
+      }
+
+      .table-card-header.time {
+        background: #f0fdf4;
+        border-bottom-color: #bbf7d0;
+      }
+
+      .table-card-title-wrap {
+        align-items: center;
+        display: flex;
+        flex-direction: row;
+        gap: 10px;
+        min-width: 0;
+        flex: 1;
+      }
+
+      .table-card-icon {
+        align-items: center;
+        color: #16a34a;
+        display: inline-flex;
+        flex: 0 0 auto;
+        height: 20px;
+        justify-content: center;
+        width: 20px;
+      }
+
+      .table-card-icon svg {
+        height: 20px;
+        width: 20px;
+      }
+
+      .table-card-icon.fact {
+        color: #2563eb;
+      }
+
+      .table-card-icon.snowflake {
+        color: #7c3aed;
+      }
+
+      .table-card-icon.time {
+        color: #16a34a;
+      }
+
+      .table-card-title {
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+        word-break: break-word;
+      }
+
+      .table-card.fact .table-card-title {
+        color: #1d4ed8;
+      }
+
+      .table-card.snowflake .table-card-title {
+        color: #5b21b6;
+      }
+
+      .table-card-meta {
+        color: var(--muted);
+        font-size: 11px;
+        margin-top: 3px;
+      }
+
+      .table-badge {
+        border-radius: 6px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        padding: 4px 7px;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .table-badge.fact { background: #bfdbfe; color: #1d4ed8; }
+      .table-badge.direct { background: #bbf7d0; color: #166534; }
+      .table-badge.snowflake { background: #ddd6fe; color: #5b21b6; }
+      .table-badge.unknown { background: #e2e8f0; color: #334155; }
+      .table-badge.time { background: #bbf7d0; color: #166534; }
+
+      .table-toggle {
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid #dbe3ee;
+        border-radius: 5px;
+        color: #334155;
+        cursor: pointer;
+        display: inline-flex;
+        font-size: 12px;
+        font-weight: 700;
+        height: 24px;
+        justify-content: center;
+        min-width: 24px;
+        padding: 0;
+        transition: 0.18s ease;
+        /* FIX: ensure toggle button receives clicks */
+        pointer-events: auto;
+      }
+
+      .table-toggle:hover {
+        background: #f8fafc;
+      }
+
+      .table-toggle:focus {
+        outline: 2px solid #bfdbfe;
+        outline-offset: 1px;
+      }
+
+      .table-toggle-icon {
+        display: inline-block;
+        transition: transform 0.18s ease;
+      }
+
+      .table-toggle.expanded .table-toggle-icon {
+        transform: rotate(180deg);
+      }
+
+      .table-card-header .table-toggle {
+        display: none;
+      }
+
+      .table-toggle-icon.expanded {
+        transform: rotate(180deg);
+      }
+
+      .table-card-body {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .table-card-prompt {
+        align-items: center;
+        color: #111827;
+        cursor: pointer;
+        display: grid;
+        font-size: 12px;
+        gap: 4px;
+        justify-items: center;
+        min-height: 36px;
+        padding: 8px 12px;
+        /* FIX: ensure prompt area receives click events */
+        pointer-events: auto;
+        text-align: center;
+        user-select: none;
+      }
+
+      .table-card-prompt .table-toggle-icon {
+        color: #111827;
+      }
+
+      .table-info {
+        color: #475569;
+        font-size: 11px;
+        line-height: 1.35;
+      }
+
+      .table-info strong {
+        color: #334155;
+      }
+
+      .section-block {
+        display: grid;
+        gap: 6px;
+      }
+
+      .section-title {
+        color: #475569;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .column-list {
+        display: grid;
+        gap: 6px;
+      }
+
+      .column-list.catalog {
+        max-height: 210px;
+        overflow: auto;
+        padding-right: 2px;
+      }
+
+      .column-row {
+        align-items: center;
+        background: #f8fafc;
+        border: 1px solid #edf2f7;
+        border-radius: 8px;
+        color: #334155;
+        display: flex;
+        font-size: 11px;
+        justify-content: space-between;
+        padding: 6px 8px;
+      }
+
+      .column-row.catalog {
+        align-items: flex-start;
+        gap: 10px;
+      }
+
+      .column-main {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .column-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 205px;
+      }
+
+      .column-type {
+        color: #64748b;
+        font-size: 10px;
+        line-height: 1.2;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .column-badges {
+        align-items: center;
+        display: flex;
+        flex: 0 0 auto;
+        flex-wrap: wrap;
+        gap: 4px;
+        justify-content: flex-end;
+        max-width: 100px;
+      }
+
+      .column-tag {
+        border-radius: 999px;
+        color: #64748b;
+        font-size: 10px;
+        font-weight: 700;
+        padding: 2px 6px;
+        background: #eef2f7;
+      }
+
+      .column-tag.pk {
+        background: #dbeafe;
+        color: #1d4ed8;
+      }
+
+      .column-tag.fk {
+        background: #fef3c7;
+        color: #92400e;
+      }
+
+      .column-tag.attr {
+        background: #dcfce7;
+        color: #166534;
+      }
+
+      .column-tag.measure {
+        background: #ede9fe;
+        color: #5b21b6;
+      }
+
+      .key-list {
+        display: grid;
+        gap: 5px;
+      }
+
+      .key-row {
+        background: #f8fafc;
+        border: 1px solid #edf2f7;
+        border-radius: 8px;
+        color: #334155;
+        display: grid;
+        font-size: 11px;
+        gap: 2px;
+        padding: 6px 8px;
+      }
+
+      .key-target {
+        color: #64748b;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .hierarchy-chip-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .hierarchy-chip {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 999px;
+        color: #334155;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 4px 8px;
+      }
+
+      .hint-text {
+        color: var(--muted);
+        font-size: 11px;
+        font-style: italic;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/reactflow@11.11.4/dist/umd/index.js"></script>
+
+    <script>
+      const STREAMLIT_READY = "streamlit:componentReady";
+      const STREAMLIT_RENDER = "streamlit:render";
+      const STREAMLIT_SET_HEIGHT = "streamlit:setFrameHeight";
+
+      function postStreamlitMessage(type, payload) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type }, payload || {}),
+          "*"
+        );
+      }
+
+      function setFrameHeight(height) {
+        postStreamlitMessage(STREAMLIT_SET_HEIGHT, { height });
+      }
+
+      function text(value) {
+        return typeof value === "string" ? value.trim() : "";
+      }
+
+      function list(value) {
+        return Array.isArray(value) ? value : [];
+      }
+
+      function normalizeCardinality(value, fallback) {
+        const raw = text(value).toLowerCase();
+        if (!raw) return fallback || "1:N";
+        if (raw.includes("many-to-one")) return "N:1";
+        if (raw.includes("one-to-many")) return "1:N";
+        if (raw.includes("many-to-many")) return "N:N";
+        if (raw.includes("one-to-one")) return "1:1";
+        return text(value) || fallback || "1:N";
+      }
+
+      function compactCardinalityPart(value) {
+        const raw = text(value).toLowerCase();
+        if (!raw) return "";
+        if (raw === "*" || raw === "n" || raw === "m") return "*";
+        if (raw.includes("many")) return "*";
+        if (raw.includes("one") || raw === "1") return "1";
+        return raw.toUpperCase();
+      }
+
+      function splitCardinality(value, fallback) {
+        const normalized = normalizeCardinality(value, fallback || "1:N")
+          .replace(/\s+/g, "")
+          .replace(/-/g, ":")
+          .replace(/>/g, ":")
+          .replace(/to/gi, ":");
+        const parts = normalized.split(":").filter(Boolean);
+
+        if (parts.length >= 2) {
+          return {
+            source: compactCardinalityPart(parts[0]) || "1",
+            target: compactCardinalityPart(parts[1]) || "N",
+          };
+        }
+
+        const fallbackParts = normalizeCardinality(fallback, "1:N").split(":");
+        return {
+          source: compactCardinalityPart(fallbackParts[0]) || "1",
+          target: compactCardinalityPart(fallbackParts[1]) || "N",
+        };
+      }
+
+      function formatCardinality(parts) {
+        return `${parts.source} - ${parts.target}`;
+      }
+
+      function inferFallbackCardinality(sourceKind, targetKind, relationshipType) {
+        const source = text(sourceKind).toLowerCase();
+        const target = text(targetKind).toLowerCase();
+        const relationType = text(relationshipType).toLowerCase();
+
+        if (source === "fact" && target !== "fact") return "N:1";
+        if (source !== "fact" && target === "fact") return "1:N";
+
+        if (relationType === "dimension_to_dimension") {
+          const sourceIsBranch = source === "snowflake";
+          const targetIsBranch = target === "snowflake";
+          if (sourceIsBranch && !targetIsBranch) return "N:1";
+          if (!sourceIsBranch && targetIsBranch) return "1:N";
+        }
+
+        return "1:N";
+      }
+
+      function sideForDelta(dx, dy, isSource) {
+        if (Math.abs(dx) >= Math.abs(dy)) {
+          if (isSource) return dx >= 0 ? "right" : "left";
+          return dx >= 0 ? "left" : "right";
+        }
+        if (isSource) return dy >= 0 ? "bottom" : "top";
+        return dy >= 0 ? "top" : "bottom";
+      }
+
+      function applyEdgeHandles(edge, sourceNode, targetNode) {
+        const dx = (targetNode.position.x || 0) - (sourceNode.position.x || 0);
+        const dy = (targetNode.position.y || 0) - (sourceNode.position.y || 0);
+        const sourceSide = sideForDelta(dx, dy, true);
+        const targetSide = sideForDelta(dx, dy, false);
+
+        edge.sourceHandle = `source-${sourceSide}`;
+        edge.targetHandle = `target-${targetSide}`;
+        edge.data = Object.assign({}, edge.data || {}, {
+          sourceSide,
+          targetSide,
+        });
+      }
+
+      function edgeSignature(relationship, relationType, cardinalityLabel) {
+        return [
+          text(relationship && relationship.from_table),
+          text(relationship && relationship.to_table),
+          text(relationType),
+          text(relationship && relationship.cardinality),
+          text(cardinalityLabel),
+          text(relationship && relationship.join_condition),
+        ]
+          .map((part) => tableKey(part))
+          .filter(Boolean)
+          .join("-");
+      }
+
+      function tableKey(value) {
+        const cleaned = text(value)
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+        return cleaned || "table";
+      }
+
+      function isTimeDimension(label, meta) {
+        const name = text(label).toLowerCase();
+        const attrs = list(meta && meta.attributes).map((v) => text(v).toLowerCase());
+        return (
+          name.includes("date") ||
+          name.includes("time") ||
+          attrs.includes("year") ||
+          attrs.includes("month") ||
+          attrs.includes("quarter") ||
+          attrs.includes("dayofweek") ||
+          attrs.includes("date")
+        );
+      }
+
+      function kindLabel(kind) {
+        if (kind === "fact") return "Fact table";
+        if (kind === "direct") return "Dimension";
+        if (kind === "snowflake") return "Snowflake";
+        if (kind === "time") return "Time dimension";
+        return "Table";
+      }
+
+      function buildFactSections(meta) {
+        return {
+          grain: text(meta && meta.grain) || "Not specified",
+          foreignKeys: list(meta && meta.foreign_keys),
+          measures: list(meta && meta.measures),
+          degenerateDimensions: list(meta && meta.degenerate_dimensions),
+        };
+      }
+
+      function buildDimensionSections(meta, isTimeDim) {
+        let attributes = list(meta && meta.attributes);
+        let hierarchies = list(meta && meta.hierarchies);
+        let unknownRow = text(meta && meta.unknown_row) || "0 = Unknown";
+        const primaryKey = text(meta && meta.primary_key) || text(meta && meta.natural_key);
+
+        if (isTimeDim) {
+          const required = ["Date", "Month", "Quarter", "Year", "DayOfWeek"];
+          required.forEach((attr) => {
+            if (!attributes.some((a) => text(a).toLowerCase() === attr.toLowerCase())) {
+              attributes.push(attr);
+            }
+          });
+          if (!hierarchies.length) {
+            hierarchies = [["Year", "Quarter", "Month", "Date"]];
+          }
+        }
+
+        return {
+          primaryKey,
+          attributes,
+          hierarchies,
+          unknownRow,
+        };
+      }
+
+      function schemaMetadataTables(schema) {
+        const metadata = schema && schema.schema_metadata;
+        const tables = metadata && metadata.tables;
+        return tables && typeof tables === "object" ? tables : {};
+      }
+
+      function resolveTableDetails(schema, label, meta) {
+        const tables = schemaMetadataTables(schema);
+        const candidates = [
+          label,
+          meta && meta.name,
+          meta && meta.physical_table,
+          meta && meta.alias,
+          meta && meta.caption,
+        ]
+          .map((value) => tableKey(value))
+          .filter(Boolean);
+
+        for (const candidate of candidates) {
+          if (tables[candidate]) return tables[candidate];
+        }
+
+        return {};
+      }
+
+      function primaryKeyNames(details, fallback) {
+        const values = list(details && details.primary_key).map((value) => text(value)).filter(Boolean);
+        const fallbackValue = text(fallback);
+        if (!values.length && fallbackValue) values.push(fallbackValue);
+        return values;
+      }
+
+      function foreignKeyRows(details, fallback) {
+        const rows = list(details && details.foreign_keys)
+          .map((item) => {
+            if (typeof item === "string") {
+              return { column: text(item), target: "" };
+            }
+
+            const refParts = [
+              text(item && item.ref_schema),
+              text(item && item.ref_table),
+              text(item && item.ref_column),
+            ].filter(Boolean);
+            return {
+              column: text(item && (item.column || item.name)),
+              target: refParts.join("."),
+            };
+          })
+          .filter((item) => item.column);
+
+        if (!rows.length) {
+          list(fallback).forEach((value) => {
+            const column = text(value);
+            if (column) rows.push({ column, target: "" });
+          });
+        }
+
+        return rows;
+      }
+
+      function columnRows(details, fallbackValues) {
+        const rows = list(details && details.columns)
+          .map((column) => {
+            if (typeof column === "string") {
+              return { name: text(column), dataType: "", isNullable: null, semanticRole: "" };
+            }
+            return {
+              name: text(column && column.name),
+              dataType: text(column && (column.data_type || column.type)),
+              isNullable:
+                column && typeof column.is_nullable === "boolean"
+                  ? column.is_nullable
+                  : null,
+              semanticRole: text(column && column.semantic_role),
+            };
+          })
+          .filter((column) => column.name);
+
+        if (!rows.length) {
+          list(fallbackValues).forEach((value) => {
+            const name = typeof value === "string" ? text(value) : text(value && value.name);
+            const semanticRole = typeof value === "string" ? "" : text(value && value.tag).toLowerCase();
+            if (name) rows.push({ name, dataType: "", isNullable: null, semanticRole });
+          });
+        }
+
+        return rows;
+      }
+
+      function layoutRing(nodes, radius, startAngle) {
+        const count = nodes.length;
+        if (!count) return;
+
+        nodes.forEach((node, index) => {
+          const angle = startAngle - (Math.PI * 2 * index) / count;
+          node.position = {
+            x: Math.round(Math.cos(angle) * radius),
+            y: Math.round(Math.sin(angle) * radius),
+          };
+          node.data.angle = angle;
+        });
+      }
+
+      function layoutFactNodes(nodes) {
+        const count = nodes.length;
+        if (!count) return;
+
+        const spacing = 220;
+        nodes.forEach((node, index) => {
+          node.position = {
+            x: 0,
+            y: Math.round((index - (count - 1) / 2) * spacing),
+          };
+        });
+      }
+
+      function assignSnowflakeBranches(directNodes, snowflakeNodes, edges) {
+        const branchMap = new Map();
+        directNodes.forEach((node) => branchMap.set(node.id, []));
+
+        snowflakeNodes.forEach((snowflakeNode) => {
+          let parentId = "";
+
+          for (const edge of edges) {
+            const connectedDirect = directNodes.find(
+              (node) =>
+                (edge.source === snowflakeNode.id && edge.target === node.id) ||
+                (edge.target === snowflakeNode.id && edge.source === node.id)
+            );
+
+            if (connectedDirect) {
+              parentId = connectedDirect.id;
+              break;
+            }
+          }
+
+          if (!parentId && directNodes.length) {
+            parentId = directNodes[0].id;
+          }
+
+          if (!branchMap.has(parentId)) branchMap.set(parentId, []);
+          branchMap.get(parentId).push(snowflakeNode);
+        });
+
+        return branchMap;
+      }
+
+      function layoutSnowflakeBranches(branchMap, directNodes) {
+        directNodes.forEach((directNode) => {
+          const branchNodes = branchMap.get(directNode.id) || [];
+          if (!branchNodes.length) return;
+
+          const baseX = directNode.position.x || 0;
+          const baseY = directNode.position.y || 0;
+
+          const norm = Math.max(Math.hypot(baseX, baseY), 1);
+          const radialX = baseX / norm;
+          const radialY = baseY / norm;
+
+          const tangentX = -radialY;
+          const tangentY = radialX;
+
+          const baseDistance = 380;
+          const branchSpacing = 210;
+
+          branchNodes.forEach((node, index) => {
+            const offset = index - (branchNodes.length - 1) / 2;
+
+            node.position = {
+              x: Math.round(baseX + radialX * baseDistance + tangentX * offset * branchSpacing),
+              y: Math.round(baseY + radialY * baseDistance + tangentY * offset * branchSpacing),
+            };
+          });
+        });
+      }
+
+      function buildGraph(schema) {
+        const nodesById = new Map();
+        const edges = [];
+
+        const factTables = list(schema.fact_tables).filter((item) => text(item && item.name));
+        const directDimensions = list(schema.direct_dimensions).filter((item) => text(item && item.name));
+        const snowflakeDimensions = list(schema.snowflake_dimensions).filter((item) => text(item && item.name));
+        const relationships = list(schema.relationships).filter((item) => item && typeof item === "object");
+
+        function inferKindFromName(label) {
+          const key = tableKey(label);
+          if (factTables.some((item) => tableKey(item.name) === key)) return "fact";
+          if (directDimensions.some((item) => tableKey(item.name) === key)) {
+            const meta = directDimensions.find((item) => tableKey(item.name) === key);
+            return isTimeDimension(label, meta) ? "time" : "direct";
+          }
+          if (snowflakeDimensions.some((item) => tableKey(item.name) === key)) return "snowflake";
+          return "unknown";
+        }
+
+        function addNode(name, kind, meta) {
+          const label = text(name);
+          if (!label) return "";
+          const id = tableKey(label);
+          if (nodesById.has(id)) return id;
+
+          let resolvedKind = kind === "unknown" ? inferKindFromName(label) : kind;
+          if (resolvedKind === "direct" && isTimeDimension(label, meta)) {
+            resolvedKind = "time";
+          }
+
+          const factSections = resolvedKind === "fact" ? buildFactSections(meta) : null;
+          const dimensionSections =
+            resolvedKind !== "fact" ? buildDimensionSections(meta, resolvedKind === "time") : null;
+          const tableDetails = resolveTableDetails(schema, label, meta);
+
+          nodesById.set(id, {
+            id,
+            type: "tableNode",
+            position: { x: 0, y: 0 },
+            data: {
+              label,
+              kind: resolvedKind,
+              subtitle: kindLabel(resolvedKind),
+              physicalTable: text(meta && meta.physical_table),
+              alias: text(meta && meta.alias),
+              semanticRole: text(meta && meta.semantic_role),
+              naturalKey: text(meta && meta.natural_key),
+              factSections,
+              dimensionSections,
+              tableDetails,
+            },
+          });
+
+          return id;
+        }
+
+        factTables.forEach((fact) => addNode(fact.name, "fact", fact));
+        directDimensions.forEach((dimension) => addNode(dimension.name, "direct", dimension));
+        snowflakeDimensions.forEach((dimension) => addNode(dimension.name, "snowflake", dimension));
+
+        relationships.forEach((relationship, index) => {
+          const fromTable = text(relationship.from_table);
+          const toTable = text(relationship.to_table);
+          if (!fromTable || !toTable) return;
+
+          const relationType = text(relationship.relationship_type).toLowerCase();
+          const isSnowflake = relationType === "dimension_to_dimension";
+          const source = addNode(fromTable, "unknown", {});
+          const target = addNode(toTable, "unknown", {});
+          if (!source || !target) return;
+
+          const sourceNode = nodesById.get(source);
+          const targetNode = nodesById.get(target);
+          const fallbackCardinality = inferFallbackCardinality(
+            sourceNode && sourceNode.data && sourceNode.data.kind,
+            targetNode && targetNode.data && targetNode.data.kind,
+            relationType
+          );
+          const cardinalityParts = splitCardinality(relationship.cardinality, fallbackCardinality);
+          const cardinalityLabel = formatCardinality(cardinalityParts);
+
+          const signature = edgeSignature(relationship, relationType, cardinalityLabel);
+
+          edges.push({
+            id: `edge-${source}-${target}-${index}-${signature}`,
+            source,
+            target,
+            type: "relationshipEdge",
+            animated: false,
+            label: cardinalityLabel,
+            data: {
+              sourceTable: fromTable,
+              targetTable: toTable,
+              sourceCardinality: cardinalityParts.source,
+              targetCardinality: cardinalityParts.target,
+              cardinalityLabel,
+              joinCondition: text(relationship.join_condition),
+              relationshipType: relationType,
+              relationshipKind: isSnowflake ? "snowflake" : "star",
+            },
+            style: {
+              stroke: "#6b7280",
+              strokeDasharray: isSnowflake ? "6 4" : "",
+              strokeWidth: 1.7,
+            },
+            labelBgPadding: [8, 4],
+            labelBgBorderRadius: 6,
+            labelBgStyle: {
+              fill: "#ffffff",
+              fillOpacity: 0.96,
+            },
+          });
+        });
+
+        const factNodes = [];
+        const directNodes = [];
+        const snowflakeNodes = [];
+        const unknownNodes = [];
+
+        nodesById.forEach((node) => {
+          if (node.data.kind === "fact") factNodes.push(node);
+          else if (node.data.kind === "direct" || node.data.kind === "time") directNodes.push(node);
+          else if (node.data.kind === "snowflake") snowflakeNodes.push(node);
+          else unknownNodes.push(node);
+        });
+
+        layoutFactNodes(factNodes);
+
+        const directRadius = Math.max(430, 330 + directNodes.length * 52);
+        layoutRing(directNodes, directRadius, 0);
+        const branchMap = assignSnowflakeBranches(directNodes, snowflakeNodes, edges);
+        layoutSnowflakeBranches(branchMap, directNodes);
+        layoutRing(unknownNodes, directRadius + 300, 0);
+
+        edges.forEach((edge) => {
+          const sourceNode = nodesById.get(edge.source);
+          const targetNode = nodesById.get(edge.target);
+          if (sourceNode && targetNode) applyEdgeHandles(edge, sourceNode, targetNode);
+        });
+
+        return {
+          nodes: Array.from(nodesById.values()),
+          edges,
+          counts: {
+            facts: factNodes.length,
+            direct: directNodes.length,
+            snowflake: snowflakeNodes.length,
+            relationships: edges.length,
+          },
+        };
+      }
+
+      function renderColumnList(items, emptyText) {
+        const React = window.React;
+        const values = list(items);
+        if (!values.length) {
+          return React.createElement("div", { className: "hint-text" }, emptyText);
+        }
+
+        return React.createElement(
+          "div",
+          { className: "column-list" },
+          values.map((item, index) => {
+            const name = typeof item === "string" ? item : text(item && item.name);
+            const tag = typeof item === "string" ? "" : text(item && item.tag);
+            const tagClass = tag ? tag.toLowerCase().replace(/[^a-z0-9]+/g, "") : "";
+            return React.createElement(
+              "div",
+              { className: "column-row", key: `${name}-${index}` },
+              React.createElement("span", { className: "column-name", title: name }, name || "Value"),
+              tag ? React.createElement("span", { className: `column-tag ${tagClass}` }, tag) : null
+            );
+          })
+        );
+      }
+
+      function renderPrimaryKeyList(values) {
+        const React = window.React;
+        if (!values.length) {
+          return React.createElement("div", { className: "hint-text" }, "No primary key");
+        }
+
+        return renderColumnList(
+          values.map((value) => ({ name: value, tag: "PK" })),
+          "No primary key"
+        );
+      }
+
+      function renderForeignKeyList(rows) {
+        const React = window.React;
+        if (!rows.length) {
+          return React.createElement("div", { className: "hint-text" }, "No foreign keys");
+        }
+
+        return React.createElement(
+          "div",
+          { className: "key-list" },
+          rows.map((row, index) =>
+            React.createElement(
+              "div",
+              { className: "key-row", key: `${row.column}-${index}` },
+              React.createElement(
+                "div",
+                { style: { display: "flex", justifyContent: "space-between", gap: "8px" } },
+                React.createElement("span", { title: row.column }, row.column),
+                React.createElement("span", { className: "column-tag fk" }, "FK")
+              ),
+              row.target
+                ? React.createElement("div", { className: "key-target", title: row.target }, `-> ${row.target}`)
+                : null
+            )
+          )
+        );
+      }
+
+      function renderCatalogColumnList(details, fallbackValues, primaryKeys, foreignKeys) {
+        const React = window.React;
+        const rows = columnRows(details, fallbackValues);
+        if (!rows.length) {
+          return React.createElement("div", { className: "hint-text" }, "No columns identified");
+        }
+
+        const pkSet = new Set(primaryKeys.map((value) => tableKey(value)));
+        const fkSet = new Set(foreignKeys.map((row) => tableKey(row.column)));
+
+        return React.createElement(
+          "div",
+          { className: "column-list catalog" },
+          rows.map((column, index) => {
+            const columnKey = tableKey(column.name);
+            const tags = [];
+            if (pkSet.has(columnKey)) tags.push(["PK", "pk"]);
+            if (fkSet.has(columnKey)) tags.push(["FK", "fk"]);
+            if (!tags.length) {
+              const role = text(column.semanticRole).toLowerCase();
+              tags.push([role === "measure" ? "MEASURE" : "ATTR", role === "measure" ? "measure" : "attr"]);
+            }
+
+            const typeText = column.dataType || "type unknown";
+            const nullability =
+              column.isNullable === true
+                ? "nullable"
+                : column.isNullable === false
+                  ? "not null"
+                  : "";
+            const detailText = [typeText, nullability].filter(Boolean).join(" - ");
+
+            return React.createElement(
+              "div",
+              { className: "column-row catalog", key: `${column.name}-${index}` },
+              React.createElement(
+                "div",
+                { className: "column-main" },
+                React.createElement("span", { className: "column-name", title: column.name }, column.name),
+                React.createElement("span", { className: "column-type", title: detailText }, detailText)
+              ),
+              React.createElement(
+                "div",
+                { className: "column-badges" },
+                tags.map((tag) =>
+                  React.createElement(
+                    "span",
+                    { className: `column-tag ${tag[1]}`, key: `${column.name}-${tag[0]}` },
+                    tag[0]
+                  )
+                )
+              )
+            );
+          })
+        );
+      }
+
+      function renderHierarchyList(hierarchies) {
+        const React = window.React;
+        const values = list(hierarchies);
+        if (!values.length) {
+          return React.createElement("div", { className: "hint-text" }, "No hierarchy defined");
+        }
+
+        return React.createElement(
+          "div",
+          { className: "column-list" },
+          values.map((hierarchy, index) => {
+            const parts = Array.isArray(hierarchy) ? hierarchy.map((v) => text(v)).filter(Boolean) : [text(hierarchy)];
+            return React.createElement(
+              "div",
+              { className: "hierarchy-chip-list", key: `hierarchy-${index}` },
+              parts.map((part, partIndex) =>
+                React.createElement("span", { className: "hierarchy-chip", key: `${part}-${partIndex}` }, part)
+              )
+            );
+          })
+        );
+      }
+
+      function renderEndpointCardinalityLabel(x, y, value, key) {
+        const React = window.React;
+        const label = text(value);
+        if (!label) return null;
+        const width = Math.max(26, label.length * 9 + 14);
+
+        return React.createElement(
+          "g",
+          {
+            className: "relationship-cardinality-label",
+            key,
+            style: { pointerEvents: "none" },
+            transform: `translate(${Math.round(x)}, ${Math.round(y)})`,
+          },
+          React.createElement("rect", {
+            x: -width / 2,
+            y: -12,
+            width,
+            height: 24,
+            rx: 6,
+          }),
+          React.createElement(
+            "text",
+            {
+              textAnchor: "middle",
+              x: 0,
+              y: 1,
+            },
+            label
+          )
+        );
+      }
+
+      function fallbackEdgePath(sourceX, sourceY, targetX, targetY) {
+        const midX = sourceX + (targetX - sourceX) / 2;
+        return {
+          path: `M ${sourceX},${sourceY} C ${midX},${sourceY} ${midX},${targetY} ${targetX},${targetY}`,
+          labelX: sourceX + (targetX - sourceX) / 2,
+          labelY: sourceY + (targetY - sourceY) / 2,
+        };
+      }
+
+      function RelationshipEdge(props) {
+        const React = window.React;
+        const ReactFlowLib = window.ReactFlow || {};
+        const getSmoothStepPath = ReactFlowLib.getSmoothStepPath;
+        const data = props.data || {};
+        const sourceX = Number(props.sourceX) || 0;
+        const sourceY = Number(props.sourceY) || 0;
+        const targetX = Number(props.targetX) || 0;
+        const targetY = Number(props.targetY) || 0;
+        const isSnowflake = text(data.relationshipKind) === "snowflake";
+        const stroke = (props.style && props.style.stroke) || "#6b7280";
+        const strokeWidth = (props.style && props.style.strokeWidth) || 1.7;
+        const pathResult = getSmoothStepPath
+          ? getSmoothStepPath({
+              sourceX,
+              sourceY,
+              sourcePosition: props.sourcePosition,
+              targetX,
+              targetY,
+              targetPosition: props.targetPosition,
+              borderRadius: 24,
+            })
+          : null;
+        const fallbackPath = fallbackEdgePath(sourceX, sourceY, targetX, targetY);
+        const edgePath = Array.isArray(pathResult) ? pathResult[0] : fallbackPath.path;
+
+        const dx = targetX - sourceX;
+        const dy = targetY - sourceY;
+        const length = Math.max(Math.hypot(dx, dy), 1);
+        const unitX = dx / length;
+        const unitY = dy / length;
+        const normalX = -unitY;
+        const normalY = unitX;
+        const labelOffset = -18;
+        const sourceRatio = length < 280 ? 0.32 : 0.28;
+        const targetRatio = length < 280 ? 0.68 : 0.72;
+        const sourceLabelX = sourceX + dx * sourceRatio + normalX * labelOffset;
+        const sourceLabelY = sourceY + dy * sourceRatio + normalY * labelOffset;
+        const targetLabelX = sourceX + dx * targetRatio + normalX * labelOffset;
+        const targetLabelY = sourceY + dy * targetRatio + normalY * labelOffset;
+        const markerEnd = typeof props.markerEnd === "string" ? props.markerEnd : undefined;
+        const title = [
+          `${text(data.sourceTable) || "Source"} ${text(data.cardinalityLabel) || ""} ${text(data.targetTable) || "Target"}`.trim(),
+          text(data.joinCondition),
+        ]
+          .filter(Boolean)
+          .join(" | ");
+
+        return React.createElement(
+          React.Fragment,
+          null,
+          React.createElement(
+            "path",
+            {
+              id: props.id,
+              d: edgePath,
+              className: "react-flow__edge-path relationship-edge-path",
+              markerEnd,
+              style: {
+                stroke,
+                strokeWidth,
+                strokeDasharray: props.style && props.style.strokeDasharray,
+              },
+            },
+            title ? React.createElement("title", null, title) : null
+          ),
+          renderEndpointCardinalityLabel(sourceLabelX, sourceLabelY, data.sourceCardinality, "source-cardinality"),
+          renderEndpointCardinalityLabel(targetLabelX, targetLabelY, data.targetCardinality, "target-cardinality")
+        );
+      }
+
+      function renderTableHandles() {
+        const React = window.React;
+        const ReactFlowLib = window.ReactFlow || {};
+        const Handle = ReactFlowLib.Handle;
+        const Position = ReactFlowLib.Position || {};
+
+        if (!Handle) return null;
+
+        const sides = [
+          ["left", Position.Left || "left"],
+          ["right", Position.Right || "right"],
+          ["top", Position.Top || "top"],
+          ["bottom", Position.Bottom || "bottom"],
+        ];
+
+        return sides.flatMap((side) => {
+          const name = side[0];
+          const position = side[1];
+          return [
+            React.createElement(Handle, {
+              key: `source-${name}`,
+              id: `source-${name}`,
+              type: "source",
+              position,
+              className: "table-card-handle",
+              isConnectable: false,
+            }),
+            React.createElement(Handle, {
+              key: `target-${name}`,
+              id: `target-${name}`,
+              type: "target",
+              position,
+              className: "table-card-handle",
+              isConnectable: false,
+            }),
+          ];
+        });
+      }
+
+      function applyNodeChangesFallback(changes, currentNodes) {
+        let nextNodes = currentNodes.slice();
+        list(changes).forEach((change) => {
+          if (!change || typeof change !== "object") return;
+
+          if (change.type === "remove") {
+            nextNodes = nextNodes.filter((node) => node.id !== change.id);
+            return;
+          }
+
+          if (change.type === "add" && change.item) {
+            nextNodes = nextNodes.concat(change.item);
+            return;
+          }
+
+          nextNodes = nextNodes.map((node) => {
+            if (node.id !== change.id) return node;
+
+            if (change.type === "position") {
+              return Object.assign({}, node, {
+                position: change.position || node.position,
+                positionAbsolute: change.positionAbsolute || node.positionAbsolute,
+                dragging: Boolean(change.dragging),
+              });
+            }
+
+            if (change.type === "select") {
+              return Object.assign({}, node, { selected: Boolean(change.selected) });
+            }
+
+            if (change.type === "dimensions") {
+              return Object.assign({}, node, {
+                dimensions: change.dimensions || node.dimensions,
+                measured: change.measured || node.measured,
+              });
+            }
+
+            return node;
+          });
+        });
+
+        return nextNodes;
+      }
+
+      function applyEdgeChangesFallback(changes, currentEdges) {
+        let nextEdges = currentEdges.slice();
+        list(changes).forEach((change) => {
+          if (!change || typeof change !== "object") return;
+
+          if (change.type === "remove") {
+            nextEdges = nextEdges.filter((edge) => edge.id !== change.id);
+            return;
+          }
+
+          nextEdges = nextEdges.map((edge) => {
+            if (edge.id !== change.id) return edge;
+            if (change.type === "select") {
+              return Object.assign({}, edge, { selected: Boolean(change.selected) });
+            }
+            return edge;
+          });
+        });
+
+        return nextEdges;
+      }
+
+      function tableBadgeLabel(kind) {
+        if (kind === "fact") return "FACT";
+        if (kind === "snowflake") return "SF";
+        if (kind === "direct" || kind === "time") return "DIM";
+        return "TABLE";
+      }
+
+      function renderTableIcon(kind) {
+        const React = window.React;
+        const baseProps = {
+          viewBox: "0 0 24 24",
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 2,
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+          "aria-hidden": "true",
+        };
+
+        if (kind === "fact") {
+          return React.createElement(
+            "span",
+            { className: "table-card-icon fact" },
+            React.createElement(
+              "svg",
+              baseProps,
+              React.createElement("rect", { x: 3, y: 3, width: 18, height: 18, rx: 1 }),
+              React.createElement("path", { d: "M3 9h18M3 15h18M9 3v18M15 3v18" })
+            )
+          );
+        }
+
+        if (kind === "snowflake") {
+          return React.createElement(
+            "span",
+            { className: "table-card-icon snowflake" },
+            React.createElement(
+              "svg",
+              baseProps,
+              React.createElement("path", { d: "M12 4v5" }),
+              React.createElement("path", { d: "M6 20v-4h12v4" }),
+              React.createElement("path", { d: "M12 9h-5v4" }),
+              React.createElement("path", { d: "M12 9h5v4" }),
+              React.createElement("rect", { x: 9, y: 2, width: 6, height: 4, rx: 1 }),
+              React.createElement("rect", { x: 3, y: 13, width: 6, height: 4, rx: 1 }),
+              React.createElement("rect", { x: 15, y: 13, width: 6, height: 4, rx: 1 })
+            )
+          );
+        }
+
+        if (kind === "time") {
+          return React.createElement(
+            "span",
+            { className: "table-card-icon time" },
+            React.createElement(
+              "svg",
+              baseProps,
+              React.createElement("circle", { cx: 12, cy: 12, r: 9 }),
+              React.createElement("path", { d: "M12 7v5l3 2" })
+            )
+          );
+        }
+
+        return React.createElement(
+          "span",
+          { className: "table-card-icon" },
+          React.createElement(
+            "svg",
+            baseProps,
+            React.createElement("path", { d: "M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z" }),
+            React.createElement("path", { d: "M12 12l8-4.5" }),
+            React.createElement("path", { d: "M12 12v9" }),
+            React.createElement("path", { d: "M12 12L4 7.5" })
+          )
+        );
+      }
+
+      function TableNode(props) {
+        const React = window.React;
+        const data = props.data || {};
+        const id = props.id;
+        const kind = text(data.kind) || "unknown";
+        const expandedState = React.useState(false);
+        const expanded = expandedState[0];
+        const setExpanded = expandedState[1];
+        const factSections = data.factSections || {};
+        const dimensionSections = data.dimensionSections || {};
+        const tableDetails = data.tableDetails || {};
+        const primaryKeys = primaryKeyNames(tableDetails, dimensionSections.primaryKey || data.naturalKey);
+        const foreignKeys = foreignKeyRows(tableDetails, factSections.foreignKeys);
+        const fallbackColumns =
+          kind === "fact"
+            ? list(factSections.foreignKeys).concat(list(factSections.measures))
+            : primaryKeys.concat(list(dimensionSections.attributes));
+        const catalogLabel =
+          text(tableDetails.full_name) ||
+          [text(tableDetails.schema), text(tableDetails.name)].filter(Boolean).join(".") ||
+          text(tableDetails.name);
+        const toggleDetails = function (event) {
+          event.stopPropagation();
+          setExpanded(!expanded);
+        };
+
+        return React.createElement(
+          "div",
+          { className: `table-card ${kind}` },
+          renderTableHandles(),
+          React.createElement(
+            "div",
+            { className: `table-card-header ${kind}` },
+            React.createElement(
+              "div",
+              { className: "table-card-title-wrap" },
+              renderTableIcon(kind),
+              React.createElement("div", { className: "table-card-title" }, data.label || "Table")
+            ),
+            React.createElement(
+              "div",
+              { style: { display: "flex", alignItems: "center", gap: "8px" } },
+              React.createElement(
+                "div",
+                { className: `table-badge ${kind}` },
+                tableBadgeLabel(kind)
+              ),
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: `table-toggle ${expanded ? "expanded" : ""}`,
+                  title: expanded ? "Collapse details" : "Expand details",
+                  onClick: function (event) {
+                    event.stopPropagation();
+                    setExpanded(!expanded);
+                  },
+                },
+                React.createElement("span", { className: "table-toggle-icon" }, "▾")
+              )
+            )
+          ),
+          React.createElement(
+            "div",
+            {
+              className: "table-card-prompt nodrag nopan",
+              onClick: toggleDetails,
+              title: expanded ? "Collapse details" : "Expand details",
+            },
+            React.createElement("span", null, expanded ? "Click to collapse" : "Click to expand"),
+            React.createElement("span", { className: `table-toggle-icon ${expanded ? "expanded" : ""}` }, "▾")
+          ),
+          expanded
+            ? React.createElement(
+                "div",
+                { className: "table-card-body" },
+                data.physicalTable
+                  ? React.createElement(
+                      "div",
+                      { className: "table-info" },
+                      React.createElement("strong", null, "Physical"),
+                      " · ",
+                      data.physicalTable
+                    )
+                  : null,
+                catalogLabel
+                  ? React.createElement(
+                      "div",
+                      { className: "table-info" },
+                      React.createElement("strong", null, "Catalog"),
+                      " - ",
+                      catalogLabel
+                    )
+                  : null,
+                data.semanticRole
+                  ? React.createElement(
+                      "div",
+                      { className: "table-info" },
+                      React.createElement("strong", null, "Role"),
+                      " · ",
+                      data.semanticRole
+                    )
+                  : null,
+
+                kind === "fact"
+                  ? React.createElement(
+                      React.Fragment,
+                      null,
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Grain"),
+                        React.createElement("div", { className: "table-info" }, factSections.grain || "Not specified")
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Primary Key"),
+                        renderPrimaryKeyList(primaryKeys)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Foreign Keys"),
+                        renderForeignKeyList(foreignKeys)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Measures"),
+                        renderColumnList(factSections.measures, "No measures")
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Attributes and Types"),
+                        renderCatalogColumnList(tableDetails, fallbackColumns, primaryKeys, foreignKeys)
+                      )
+                    )
+                  : React.createElement(
+                      React.Fragment,
+                      null,
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Primary Key"),
+                        renderPrimaryKeyList(primaryKeys)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Foreign Keys"),
+                        renderForeignKeyList(foreignKeys)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Attributes and Types"),
+                        renderCatalogColumnList(tableDetails, fallbackColumns, primaryKeys, foreignKeys)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Hierarchies"),
+                        renderHierarchyList(dimensionSections.hierarchies)
+                      ),
+                      React.createElement(
+                        "div",
+                        { className: "section-block" },
+                        React.createElement("div", { className: "section-title" }, "Unknown Row"),
+                        React.createElement("div", { className: "table-info" }, dimensionSections.unknownRow || "0 = Unknown")
+                      )
+                    )
+              )
+            : null
+        );
+      }
+
+      function SchemaFlowApp(props) {
+        const React = window.React;
+        const ReactFlowLib = window.ReactFlow || {};
+        const ReactFlowComponent = ReactFlowLib.ReactFlow || ReactFlowLib.default;
+        const applyNodeChanges = ReactFlowLib.applyNodeChanges;
+        const applyEdgeChanges = ReactFlowLib.applyEdgeChanges;
+        const useMemo = React.useMemo;
+        const useState = React.useState;
+        const useRef = React.useRef;
+
+        const schema = props.schema || {};
+        const schemaSignature = text(props.schemaSignature) || "schema";
+        const height = Math.max(Number(props.height) || 560, 420);
+        const toolbarRef = useRef(null);
+        const toolbarHeightState = useState(72);
+        const toolbarHeight = toolbarHeightState[0];
+        const setToolbarHeight = toolbarHeightState[1];
+        const graph = useMemo(() => buildGraph(schema), [schemaSignature, schema]);
+        const nodesState = useState(graph.nodes);
+        const nodes = nodesState[0];
+        const setNodes = nodesState[1];
+        const edgesState = useState(graph.edges);
+        const edges = edgesState[0];
+        const setEdges = edgesState[1];
+
+        const nodeTypes = useMemo(
+          () => ({
+            tableNode: TableNode,
+          }),
+          []
+        );
+        const edgeTypes = useMemo(
+          () => ({
+            relationshipEdge: RelationshipEdge,
+          }),
+          []
+        );
+
+        const modelTitle = graph.counts.snowflake > 0
+          ? "Semantic Model - Star Schema with Snowflake"
+          : "Semantic Model - Star Schema";
+        const factLabel = `${graph.counts.facts} ${graph.counts.facts === 1 ? "Fact Table" : "Fact Tables"}`;
+        const dimensionLabel = `${graph.counts.direct} ${graph.counts.direct === 1 ? "Dimension" : "Dimensions"}`;
+        const snowflakeLabel = `${graph.counts.snowflake} ${graph.counts.snowflake === 1 ? "Snowflake Table" : "Snowflake Tables"}`;
+        const relationshipLabel = `${graph.counts.relationships} ${graph.counts.relationships === 1 ? "Relationship" : "Relationships"}`;
+
+        React.useEffect(() => {
+          setFrameHeight(height);
+        }, [height, graph.nodes.length, graph.edges.length]);
+
+        React.useEffect(() => {
+          const toolbarElement = toolbarRef.current;
+          if (!toolbarElement) return undefined;
+
+          const updateToolbarHeight = function () {
+            const nextHeight = Math.max(72, Math.ceil(toolbarElement.getBoundingClientRect().height));
+            setToolbarHeight(function (currentHeight) {
+              return currentHeight === nextHeight ? currentHeight : nextHeight;
+            });
+          };
+
+          updateToolbarHeight();
+
+          let resizeObserver = null;
+          if (typeof ResizeObserver !== "undefined") {
+            resizeObserver = new ResizeObserver(updateToolbarHeight);
+            resizeObserver.observe(toolbarElement);
+          }
+
+          window.addEventListener("resize", updateToolbarHeight);
+          return function () {
+            window.removeEventListener("resize", updateToolbarHeight);
+            if (resizeObserver) resizeObserver.disconnect();
+          };
+        }, [modelTitle, factLabel, dimensionLabel, snowflakeLabel, relationshipLabel]);
+
+        React.useEffect(() => {
+          setNodes(graph.nodes);
+          setEdges(graph.edges);
+        }, [graph]);
+
+        const onNodesChange = function (changes) {
+          setNodes(function (currentNodes) {
+            return applyNodeChanges
+              ? applyNodeChanges(changes, currentNodes)
+              : applyNodeChangesFallback(changes, currentNodes);
+          });
+        };
+
+        const onEdgesChange = function (changes) {
+          setEdges(function (currentEdges) {
+            return applyEdgeChanges
+              ? applyEdgeChanges(changes, currentEdges)
+              : applyEdgeChangesFallback(changes, currentEdges);
+          });
+        };
+
+        if (!ReactFlowComponent) {
+          return React.createElement(
+            "div",
+            { className: "schema-flow-error", style: { height } },
+            "React Flow assets could not be loaded."
+          );
+        }
+
+        if (!graph.nodes.length) {
+          return React.createElement(
+            "div",
+            { className: "schema-flow-empty", style: { height } },
+            "No schema tables are available."
+          );
+        }
+
+        return React.createElement(
+          "div",
+          { className: "schema-flow-shell", style: { height, "--toolbar-height": `${toolbarHeight}px` } },
+
+          React.createElement(
+            "div",
+            { className: "schema-flow-toolbar", ref: toolbarRef },
+            React.createElement(
+              "div",
+              { className: "schema-flow-heading" },
+              React.createElement(
+                "div",
+                { className: "schema-flow-mark" },
+                React.createElement(
+                  "svg",
+                  {
+                    viewBox: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    strokeWidth: 2.4,
+                    strokeLinecap: "round",
+                    strokeLinejoin: "round",
+                    "aria-hidden": "true",
+                  },
+                  React.createElement("path", { d: "M12 3v6" }),
+                  React.createElement("path", { d: "M12 15v6" }),
+                  React.createElement("path", { d: "M3 12h6" }),
+                  React.createElement("path", { d: "M15 12h6" })
+                )
+              ),
+              React.createElement(
+                "div",
+                { className: "schema-flow-title-wrap" },
+                React.createElement("div", { className: "schema-flow-title" }, modelTitle),
+                React.createElement("div", { className: "schema-flow-subtitle" }, "Interactive data model visualization")
+              )
+            ),
+            React.createElement(
+              "div",
+              { className: "schema-flow-stats" },
+              React.createElement("span", { className: "schema-flow-pill fact" }, factLabel),
+              React.createElement("span", { className: "schema-flow-pill direct" }, dimensionLabel),
+              React.createElement("span", { className: "schema-flow-pill snowflake" }, snowflakeLabel),
+              React.createElement("span", { className: "schema-flow-pill relation" }, relationshipLabel)
+            )
+          ),
+
+          React.createElement(
+            "div",
+            { className: "schema-flow-legend" },
+            React.createElement("div", { className: "schema-flow-legend-title" }, "Legend"),
+            React.createElement(
+              "div",
+              { className: "schema-flow-legend-row" },
+              React.createElement("span", { className: "schema-flow-dot", style: { background: "#1d4ed8" } }),
+              React.createElement("span", null, "Fact table")
+            ),
+            React.createElement(
+              "div",
+              { className: "schema-flow-legend-row" },
+              React.createElement("span", { className: "schema-flow-dot", style: { background: "#16a34a" } }),
+              React.createElement("span", null, "Dimension")
+            ),
+            React.createElement(
+              "div",
+              { className: "schema-flow-legend-row" },
+              React.createElement("span", { className: "schema-flow-dot", style: { background: "#8b5cf6" } }),
+              React.createElement("span", null, "Snowflake")
+            ),
+            React.createElement(
+              "div",
+              { className: "schema-flow-legend-relation" },
+              React.createElement("span", { className: "schema-flow-line-sample" }),
+              React.createElement("span", { className: "schema-flow-legend-relation-main" }, "Star (Fact - Dim)"),
+              React.createElement("span", { className: "schema-flow-legend-relation-cardinality" }, "1 - *")
+            ),
+            React.createElement(
+              "div",
+              { className: "schema-flow-legend-relation" },
+              React.createElement("span", { className: "schema-flow-line-sample snowflake" }),
+              React.createElement("span", { className: "schema-flow-legend-relation-main" }, "Snowflake (Dim - Dim)"),
+              React.createElement("span", { className: "schema-flow-legend-relation-cardinality" }, "1 - *")
+            )
+          ),
+
+          React.createElement(
+            "div",
+            { className: "schema-flow-canvas" },
+            React.createElement(
+              ReactFlowComponent,
+              {
+                key: schemaSignature,
+                nodes,
+                edges,
+                nodeTypes,
+                edgeTypes,
+                style: { height: "100%", width: "100%" },
+                onNodesChange,
+                onEdgesChange,
+                fitView: true,
+                fitViewOptions: { padding: 0.24 },
+                minZoom: 0.25,
+                maxZoom: 2.4,
+                nodesDraggable: true,
+                nodesConnectable: false,
+                panOnDrag: [0, 1, 2],
+                panOnScroll: false,
+                zoomOnScroll: true,
+                zoomOnPinch: true,
+                zoomOnDoubleClick: true,
+                // FIX: set to false so ReactFlow correctly receives wheel/zoom events
+                // in iframe/embedded contexts (Streamlit). true was causing preventDefault
+                // to fight with the browser and block zoom/pan interactions.
+                preventScrolling: false,
+                elementsSelectable: true,
+                selectNodesOnDrag: false,
+                selectionOnDrag: false,
+                multiSelectionKeyCode: null,
+                deleteKeyCode: null,
+                nodeDragThreshold: 1,
+                paneClickDistance: 4,
+              }
+            )
+          ),
+        );
+      }
+
+      const rootElement = document.getElementById("root");
+      const reactRoot =
+        window.ReactDOM && window.ReactDOM.createRoot
+          ? window.ReactDOM.createRoot(rootElement)
+          : null;
+
+      function renderComponent(args) {
+        const height = Math.max(Number(args.height) || 560, 420);
+        const schemaSignature = text(args.schema_signature) || "schema";
+
+        if (!window.React || !reactRoot) {
+          rootElement.innerHTML =
+            '<div class="schema-flow-error" style="height:' +
+            height +
+            'px">React assets could not be loaded.</div>';
+          setFrameHeight(height);
+          return;
+        }
+
+        reactRoot.render(
+          window.React.createElement(SchemaFlowApp, {
+            key: schemaSignature,
+            schema: args.schema || {},
+            schemaSignature,
+            height,
+          })
+        );
+
+        window.setTimeout(function () {
+          setFrameHeight(height);
+        }, 0);
+      }
+
+      window.addEventListener("message", function (event) {
+        if (!event.data || event.data.type !== STREAMLIT_RENDER) return;
+        renderComponent(event.data.args || {});
+      });
+
+      postStreamlitMessage(STREAMLIT_READY, { apiVersion: 1 });
+      setFrameHeight(560);
+    </script>
+  </body>
+</html>

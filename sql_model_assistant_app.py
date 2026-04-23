@@ -6259,6 +6259,7 @@ import zipfile
 
 import streamlit as st
 
+from src.schema_flow_component import render_schema_flow
 from src.rdl_ai_editor.nlp_agent import load_llm_from_config
 from src.rdl_to_twb.db_introspection import build_db_catalog
 from src.rdl_to_twb.rdl_parser import parse_rdl_file
@@ -6399,6 +6400,8 @@ def main() -> None:
     _init_state()
 
     with st.sidebar:
+        _render_pipeline_status_sidebar()
+        st.markdown("---")
         st.subheader("Settings")
         st.session_state.sql_model_assistant_llm_config = st.text_input(
             "LLM config path",
@@ -6417,15 +6420,7 @@ def main() -> None:
     else:
         _render_rdl_intake()
 
-    if st.session_state.sql_model_assistant_messages:
-        st.markdown("### Chat")
-        for message in st.session_state.sql_model_assistant_messages:
-            with st.chat_message(message["role"]):
-                st.write(message["content"])
-                if message["role"] == "assistant":
-                    if message.get("used_fallback"):
-                        st.caption("SQL-evidence mode used for this response.")
-                    _render_structured_result(message.get("structured_result", {}))
+    _render_chat_transcript()
 
     if st.session_state.sql_model_assistant_sql_query:
         latest_model = _latest_assistant_model()
@@ -6525,6 +6520,7 @@ def _init_state() -> None:
     st.session_state.setdefault("sql_model_assistant_tableau_last_publish_report", {})
     st.session_state.setdefault("sql_model_assistant_tableau_last_publish_error", "")
     st.session_state.setdefault("sql_model_assistant_tableau_publish_context", {})
+    st.session_state.setdefault("sql_model_assistant_schema_flow_catalog_cache", {})
 
 
 def _reset_state() -> None:
@@ -6547,6 +6543,98 @@ def _clear_validation_outputs() -> None:
     st.session_state.sql_model_assistant_tableau_last_publish_report = {}
     st.session_state.sql_model_assistant_tableau_last_publish_error = ""
     st.session_state.sql_model_assistant_tableau_publish_context = {}
+
+
+def _render_pipeline_status_sidebar() -> None:
+    st.subheader("Pipeline Status")
+
+    _datasource, dataset = _resolve_current_rdl_context()
+    dataset_query = str(dataset.get("query", "") or "").strip() if isinstance(dataset, dict) else ""
+    latest_model = _latest_assistant_model()
+    publish_report = st.session_state.get("sql_model_assistant_tableau_last_publish_report", {})
+    publish_error = str(st.session_state.get("sql_model_assistant_tableau_last_publish_error", "") or "").strip()
+
+    steps = [
+        {
+            "title": "RDL loaded",
+            "state": "done" if isinstance(st.session_state.sql_model_assistant_rdl_report, dict)
+            and bool(st.session_state.sql_model_assistant_rdl_report) else "pending",
+            "detail": str(st.session_state.sql_model_assistant_rdl_filename or ""),
+        },
+        {
+            "title": "SQL selected",
+            "state": "done" if bool(dataset_query or st.session_state.sql_model_assistant_sql_query) else "pending",
+            "detail": str(st.session_state.sql_model_assistant_selected_dataset_name or ""),
+        },
+        {
+            "title": "Model generated",
+            "state": "done" if bool(latest_model) else "pending",
+            "detail": str(latest_model.get("model_type", "")) if latest_model else "",
+        },
+        {
+            "title": "Schema validated",
+            "state": "done" if bool(st.session_state.sql_model_assistant_schema_validated) else "pending",
+            "detail": "Locked for template update" if st.session_state.sql_model_assistant_schema_validated else "",
+        },
+        {
+            "title": "TWB generated",
+            "state": "done" if bool(st.session_state.sql_model_assistant_generated_twb) else "pending",
+            "detail": str(st.session_state.sql_model_assistant_generated_twb_name or "")
+            if st.session_state.sql_model_assistant_generated_twb else "",
+        },
+        {
+            "title": "Tableau publish",
+            "state": "error" if publish_error else "done" if isinstance(publish_report, dict) and bool(publish_report) else "pending",
+            "detail": _pipeline_publish_detail(publish_report, publish_error),
+        },
+    ]
+
+    completed_steps = sum(1 for step in steps if step["state"] == "done")
+    st.progress(completed_steps / len(steps))
+    for step in steps:
+        _render_pipeline_step(step["title"], step["state"], step.get("detail", ""))
+
+
+def _pipeline_publish_detail(publish_report: Any, publish_error: str) -> str:
+    if publish_error:
+        return "Last publish failed"
+    if isinstance(publish_report, dict) and publish_report:
+        datasource_name = str(publish_report.get("datasource_name") or "").strip()
+        workbook_name = str(publish_report.get("workbook_name") or "").strip()
+        if datasource_name and workbook_name:
+            return f"{datasource_name} / {workbook_name}"
+        return str(publish_report.get("status") or "Published")
+    return ""
+
+
+def _render_pipeline_step(title: str, state: str, detail: str = "") -> None:
+    label = "Done" if state == "done" else "Error" if state == "error" else "Pending"
+    st.markdown(f"`{label}` {title}")
+    if detail:
+        st.caption(detail)
+
+
+def _render_chat_transcript() -> None:
+    st.markdown("### Conversation")
+
+    if not st.session_state.sql_model_assistant_messages:
+        with st.chat_message("assistant"):
+            if st.session_state.sql_model_assistant_rdl_report:
+                st.write("Select a dataset, analyze the extracted SQL, then send corrections here.")
+            else:
+                st.write("Upload an RDL report, extract its SQL, then I will build the schema and update it from your corrections.")
+        return
+
+    for message_index, message in enumerate(st.session_state.sql_model_assistant_messages):
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            if message["role"] == "assistant":
+                if message.get("used_fallback"):
+                    st.caption("SQL-evidence mode used for this response.")
+                _render_structured_result(
+                    message.get("structured_result", {}),
+                    render_key_suffix=f"message_{message_index}",
+                )
 
 
 def _start_conversation(sql_query: str) -> None:
@@ -10744,7 +10832,12 @@ def _generate_response(
     if not sql_query.strip():
         raise ValueError("SQL query must be non-empty.")
 
-    sql_evidence_model = _heuristic_model(sql_query, conversation)
+    sql_evidence_model = _heuristic_model(sql_query, conversation, apply_corrections=False)
+    previous_model = _latest_assistant_model_from_conversation(conversation)
+    if previous_model and _follow_up_user_messages(conversation):
+        sql_evidence_model = copy.deepcopy(previous_model)
+    _apply_follow_up_corrections(sql_evidence_model, conversation)
+
     llm = _load_optional_llm(llm_config_path)
     if llm is not None:
         try:
@@ -10752,7 +10845,11 @@ def _generate_response(
             payload = _parse_json_payload(raw)
             assistant_text = payload.get("assistant_response") or "Generated an updated dimensional model."
             llm_model = _normalize_model(payload.get("model", {}))
-            structured_result = _merge_llm_with_sql_evidence(llm_model, sql_evidence_model)
+            structured_result = _merge_llm_with_sql_evidence(
+                llm_model,
+                sql_evidence_model,
+                forced_model_type=_forced_model_type_from_conversation(conversation),
+            )
             return assistant_text, structured_result, False
         except Exception as exc:
             sql_evidence_model["warnings"].insert(0, f"LLM analysis failed; SQL-evidence model used. Details: {exc}")
@@ -10772,9 +10869,20 @@ def _generate_response(
     )
 
 
+def _latest_assistant_model_from_conversation(conversation: list[dict[str, Any]]) -> dict[str, Any]:
+    for message in reversed(conversation):
+        if message.get("role") != "assistant":
+            continue
+        structured_result = message.get("structured_result")
+        if isinstance(structured_result, dict) and structured_result:
+            return copy.deepcopy(structured_result)
+    return {}
+
+
 def _merge_llm_with_sql_evidence(
     llm_model: dict[str, Any],
     sql_evidence_model: dict[str, Any],
+    forced_model_type: str = "",
 ) -> dict[str, Any]:
     merged = copy.deepcopy(sql_evidence_model)
 
@@ -10836,7 +10944,7 @@ def _merge_llm_with_sql_evidence(
             "Ignored LLM-only tables not supported by SQL evidence: " + ", ".join(_unique(ignored_llm_tables)),
         )
 
-    _refresh_model_output(merged)
+    _refresh_model_output(merged, forced_model_type=forced_model_type or None)
     return merged
 
 
@@ -11843,7 +11951,11 @@ def _apply_semantic_names_to_relationships(
     return output
 
 
-def _heuristic_model(sql_query: str, conversation: list[dict[str, Any]]) -> dict[str, Any]:
+def _heuristic_model(
+    sql_query: str,
+    conversation: list[dict[str, Any]],
+    apply_corrections: bool = True,
+) -> dict[str, Any]:
     cleaned_sql = _sanitize_sql(sql_query)
     cte_primary_tables = _extract_cte_primary_tables(cleaned_sql)
     raw_table_refs = _extract_table_refs(cleaned_sql)
@@ -11936,7 +12048,8 @@ def _heuristic_model(sql_query: str, conversation: list[dict[str, Any]]) -> dict
         }
     )
 
-    _apply_follow_up_corrections(model, conversation)
+    if apply_corrections:
+        _apply_follow_up_corrections(model, conversation)
     return model
 
 
@@ -12608,41 +12721,160 @@ def _dimension_key_from_join(condition: str, aliases: set[str]) -> str:
     return ""
 
 
+def _follow_up_user_messages(conversation: list[dict[str, Any]]) -> list[str]:
+    messages: list[str] = []
+    for item in conversation:
+        if item.get("role") != "user" or not item.get("content"):
+            continue
+        content = str(item["content"]).strip()
+        if content.lower().startswith("analyze this sql query"):
+            continue
+        messages.append(content)
+    return messages
+
+
+def _fold_correction_text(value: str) -> str:
+    replacements = str.maketrans(
+        {
+            "à": "a",
+            "â": "a",
+            "ä": "a",
+            "é": "e",
+            "è": "e",
+            "ê": "e",
+            "ë": "e",
+            "î": "i",
+            "ï": "i",
+            "ô": "o",
+            "ö": "o",
+            "ù": "u",
+            "û": "u",
+            "ü": "u",
+            "ç": "c",
+            "À": "A",
+            "Â": "A",
+            "Ä": "A",
+            "É": "E",
+            "È": "E",
+            "Ê": "E",
+            "Ë": "E",
+            "Î": "I",
+            "Ï": "I",
+            "Ô": "O",
+            "Ö": "O",
+            "Ù": "U",
+            "Û": "U",
+            "Ü": "U",
+            "Ç": "C",
+        }
+    )
+    return value.translate(replacements).lower()
+
+
+def _normalize_correction_model_type(value: str) -> str:
+    token = _fold_correction_text(value).strip().lower()
+    if token in {"star", "etoile"}:
+        return "Star"
+    if token in {"snowflake", "flocon"}:
+        return "Snowflake"
+    if token in {"hybrid", "hybride"}:
+        return "Hybrid"
+    return ""
+
+
+def _forced_model_type_from_conversation(conversation: list[dict[str, Any]]) -> str:
+    merged = "\n".join(_follow_up_user_messages(conversation))
+    if not merged:
+        return ""
+    folded = _fold_correction_text(merged)
+    model_type_pattern = r"(star|snowflake|hybrid|etoile|flocon|hybride)"
+    trigger_pattern = (
+        r"(?:it is|it's|should be|schema is|schema should be|"
+        r"c est|c'est|schema est|schema doit etre|schema devrait etre|"
+        r"modele est|modele doit etre|modele devrait etre|doit etre|devrait etre)"
+    )
+    forced_model_type = ""
+    for match in re.finditer(fr"\b{trigger_pattern}\s+(?:un\s+|une\s+|en\s+)?{model_type_pattern}\b", folded):
+        normalized = _normalize_correction_model_type(match.group(1))
+        if normalized:
+            forced_model_type = normalized
+    return forced_model_type
+
+
+def _normalize_correction_cardinality(value: str) -> str:
+    token = _fold_correction_text(value)
+    token = re.sub(r"\s+", " ", token.replace("_", "-")).strip()
+    compact = token.replace(" ", "").replace(":", "-")
+
+    if compact in {"one-to-one", "1-1", "un-a-un", "un-vers-un"}:
+        return "one-to-one"
+    if compact in {"one-to-many", "1-n", "1-many", "un-a-plusieurs", "un-vers-plusieurs"}:
+        return "one-to-many"
+    if compact in {"many-to-one", "n-1", "many-1", "plusieurs-a-un", "plusieurs-vers-un"}:
+        return "many-to-one"
+    if compact in {"many-to-many", "n-n", "many-many", "plusieurs-a-plusieurs"}:
+        return "many-to-many"
+    return ""
+
+
+def _normalize_correction_relationship_type(value: str) -> str:
+    folded = _fold_correction_text(value)
+    if "dimension" in folded and ("dimension" in folded.split("dimension", 1)[1] or "flocon" in folded):
+        return "dimension_to_dimension"
+    if "fact" in folded or "fait" in folded:
+        return "fact_to_dimension"
+    return _normalize_relationship_type(value.replace(" ", "_").replace("-", "_"))
+
+
 def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[str, Any]]) -> None:
-    user_messages = [item["content"] for item in conversation if item.get("role") == "user" and item.get("content")]
+    user_messages = _follow_up_user_messages(conversation)
     if not user_messages:
         return
 
     merged = "\n".join(user_messages)
-    lower = merged.lower()
-    forced_model_type: str | None = None
+    folded = _fold_correction_text(merged)
+    forced_model_type = _forced_model_type_from_conversation(conversation)
+    applied_notes: list[str] = []
 
-    for model_type in ("star", "snowflake", "hybrid"):
-        if re.search(fr"\b(it is|it's|should be|schema is)\s+{model_type}\b", lower):
-            forced_model_type = model_type.title()
-            break
+    if forced_model_type:
+        applied_notes.append(f"User correction applied: schema type forced to {forced_model_type}.")
+
+    table_token = r"([A-Za-z0-9_\.\[\]]+)"
+    cardinality_token = (
+        r"(one-to-one|one-to-many|many-to-one|many-to-many|"
+        r"1\s*[:\-]\s*1|1\s*[:\-]\s*n|n\s*[:\-]\s*1|n\s*[:\-]\s*n|"
+        r"un\s+a\s+un|un\s+a\s+plusieurs|plusieurs\s+a\s+un|plusieurs\s+a\s+plusieurs|"
+        r"un\s+vers\s+un|un\s+vers\s+plusieurs|plusieurs\s+vers\s+un)"
+    )
 
     for relation_match in re.finditer(
-        r"([A-Za-z0-9_\.\[\]]+)\s+(?:to|->)\s+([A-Za-z0-9_\.\[\]]+).*?\b(one-to-one|one-to-many|many-to-one|many-to-many)\b",
-        lower,
-        flags=re.DOTALL,
+        fr"{table_token}\s+(?:to|->|vers|a|avec)\s+{table_token}[^\n]{{0,160}}?\b{cardinality_token}\b",
+        folded,
     ):
         left_name, right_name, cardinality = relation_match.groups()
+        normalized_cardinality = _normalize_correction_cardinality(cardinality)
+        if not normalized_cardinality:
+            continue
         _apply_relationship_correction(
             model=model,
             left_name=left_name,
             right_name=right_name,
-            cardinality=cardinality,
+            cardinality=normalized_cardinality,
             relationship_type="",
+        )
+        applied_notes.append(
+            f"User correction applied: {left_name} to {right_name} cardinality set to {normalized_cardinality}."
         )
 
     for relation_type_match in re.finditer(
-        r"([A-Za-z0-9_\.\[\]]+)\s+(?:to|->)\s+([A-Za-z0-9_\.\[\]]+).*?\b(fact[-_\s]?to[-_\s]?dimension|dimension[-_\s]?to[-_\s]?dimension)\b",
-        lower,
-        flags=re.DOTALL,
+        fr"{table_token}\s+(?:to|->|vers|a|avec)\s+{table_token}[^\n]{{0,160}}?\b("
+        r"fact[-_\s]?to[-_\s]?dimension|dimension[-_\s]?to[-_\s]?dimension|"
+        r"fact\s+a\s+dimension|fait\s+a\s+dimension|dimension\s+a\s+dimension|dimension\s+vers\s+dimension"
+        r")\b",
+        folded,
     ):
         left_name, right_name, relation_type = relation_type_match.groups()
-        normalized_relation_type = _normalize_relationship_type(relation_type.replace(" ", "_").replace("-", "_"))
+        normalized_relation_type = _normalize_correction_relationship_type(relation_type)
         if normalized_relation_type:
             _apply_relationship_correction(
                 model=model,
@@ -12651,11 +12883,15 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
                 cardinality="",
                 relationship_type=normalized_relation_type,
             )
+            applied_notes.append(
+                f"User correction applied: {left_name} to {right_name} relationship type set to {normalized_relation_type}."
+            )
 
     fact_match = re.search(
-        r"\bfact table\b.*?\b(?:is|should be)\s+([A-Za-z0-9_\.\[\]]+)",
-        merged,
-        flags=re.IGNORECASE | re.DOTALL,
+        fr"\b(?:fact table|table de fait|table fact|table des faits)\b[^\n]{{0,120}}?\b"
+        fr"(?:is|should be|est|doit etre|devrait etre)\s+{table_token}",
+        folded,
+        flags=re.IGNORECASE,
     )
     if fact_match:
         fact_name = _resolve_table_name(model, fact_match.group(1)) or fact_match.group(1).strip()
@@ -12673,32 +12909,87 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
             for dimension in _normalize_dimension_list(model.get("snowflake_dimensions", []))
             if not _same_name(dimension["name"], fact_name)
         ]
+        applied_notes.append(f"User correction applied: fact table set to {fact_name}.")
 
     for classification_match in re.finditer(
-        r"([A-Za-z0-9_\.\[\]]+)\s+(?:is|should be)\s+(?:a\s+)?(direct|snowflake)\s+dimension",
-        merged,
+        fr"{table_token}\s+(?:is|should be|est|doit etre|devrait etre).{{0,80}}?\b"
+        r"(directe?|snowflake|flocon)\s+dimension\b",
+        folded,
         flags=re.IGNORECASE,
     ):
         table_name, target_group = classification_match.groups()
-        _move_dimension_between_groups(model, table_name, target_group.lower())
+        normalized_group = "snowflake" if target_group in {"snowflake", "flocon"} else "direct"
+        _move_dimension_between_groups(model, table_name, normalized_group)
+        applied_notes.append(f"User correction applied: {table_name} moved to {normalized_group} dimensions.")
+
+    for classification_match in re.finditer(
+        fr"{table_token}\s+(?:is|should be|est|doit etre|devrait etre).{{0,80}}?\bdimension\s+"
+        r"(directe?|snowflake|flocon)\b",
+        folded,
+        flags=re.IGNORECASE,
+    ):
+        table_name, target_group = classification_match.groups()
+        normalized_group = "snowflake" if target_group in {"snowflake", "flocon"} else "direct"
+        _move_dimension_between_groups(model, table_name, normalized_group)
+        applied_notes.append(f"User correction applied: {table_name} moved to {normalized_group} dimensions.")
+
+    for link_match in re.finditer(
+        fr"\b(?:relation|lien|join|link)\b[^\n]{{0,80}}?\b(?:entre|between)\s+{table_token}\s+(?:et|and)\s+{table_token}",
+        folded,
+        flags=re.IGNORECASE,
+    ):
+        left_name, right_name = link_match.groups()
+        _apply_relationship_correction(
+            model=model,
+            left_name=left_name,
+            right_name=right_name,
+            cardinality="",
+            relationship_type="",
+        )
+        applied_notes.append(f"User correction applied: relationship link kept between {left_name} and {right_name}.")
+
+    for link_match in re.finditer(
+        fr"{table_token}[^\n]{{0,80}}?\b(?:relie|reliee|connecte|connected|linked)\b[^\n]{{0,80}}?"
+        fr"\b(?:a|to|vers)\s+{table_token}",
+        folded,
+        flags=re.IGNORECASE,
+    ):
+        left_name, right_name = link_match.groups()
+        _apply_relationship_correction(
+            model=model,
+            left_name=left_name,
+            right_name=right_name,
+            cardinality="",
+            relationship_type="",
+        )
+        applied_notes.append(f"User correction applied: relationship link kept between {left_name} and {right_name}.")
 
     fk_match = re.search(
-        r"\bforeign keys?\b(?:\s+for\s+([A-Za-z0-9_\.\[\]]+))?.*?\b(?:are|is|should be)\s+([A-Za-z0-9_\.\[\],\s]+)",
-        merged,
-        flags=re.IGNORECASE | re.DOTALL,
+        fr"\b(?:foreign keys?|cles? etrangeres?)\b(?:\s+(?:for|pour)\s+{table_token})?[^\n]{{0,80}}?"
+        fr"\b(?:are|is|should be|sont|est|doit etre|devrait etre)\s+([A-Za-z0-9_\.\[\], ]+)",
+        folded,
+        flags=re.IGNORECASE,
     )
     if fk_match and model.get("fact_tables"):
-        target_table, key_list = fk_match.groups()
+        groups = fk_match.groups()
+        target_table = groups[0] if len(groups) > 1 else ""
+        key_list = groups[-1]
         fact_name = model["fact_tables"][0]["name"]
         if not target_table or _same_name(target_table, fact_name):
             keys = [
                 _clean_name(token.strip())
-                for token in re.split(r",| and ", key_list, flags=re.IGNORECASE)
+                for token in re.split(r",| and | et ", key_list, flags=re.IGNORECASE)
                 if token.strip()
             ]
             if keys:
                 model["fact_tables"][0]["foreign_keys"] = _unique(keys)
+                applied_notes.append(
+                    "User correction applied: fact foreign keys set to " + ", ".join(_unique(keys)) + "."
+                )
 
+    if applied_notes:
+        model["review_notes"] = _unique(_as_string_list(model.get("review_notes", [])) + applied_notes)
+    _sync_relationship_types_with_current_tables(model)
     _refresh_model_output(model, forced_model_type=forced_model_type)
 
 
@@ -12771,6 +13062,7 @@ def _apply_relationship_correction(
             relationship["cardinality"] = cardinality if direct_match else _reverse_cardinality(cardinality)
         if relationship_type:
             relationship["relationship_type"] = relationship_type
+            relationship["_user_corrected_relationship_type"] = True
         matched = True
         break
 
@@ -12788,6 +13080,7 @@ def _apply_relationship_correction(
             "relationship_type": inferred_type,
             "cardinality": cardinality,
             "join_condition": "",
+            "_user_corrected_relationship_type": bool(relationship_type),
         }
     )
 
@@ -12824,6 +13117,35 @@ def _move_dimension_between_groups(model: dict[str, Any], table_name: str, targe
     model["snowflake_dimensions"] = _merge_dimensions(snowflake)
 
 
+def _sync_relationship_types_with_current_tables(model: dict[str, Any]) -> None:
+    relationships = model.get("relationships", [])
+    if not isinstance(relationships, list):
+        return
+
+    fact_keys = {
+        _name_key(str(fact.get("name", "") or ""))
+        for fact in model.get("fact_tables", [])
+        if isinstance(fact, dict)
+    }
+    dimension_keys = {
+        _name_key(str(dimension.get("name", "") or ""))
+        for dimension in _normalize_dimension_list(model.get("direct_dimensions", []))
+        + _normalize_dimension_list(model.get("snowflake_dimensions", []))
+    }
+
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            continue
+        if bool(relationship.get("_user_corrected_relationship_type")):
+            continue
+        from_key = _name_key(str(relationship.get("from_table", "") or ""))
+        to_key = _name_key(str(relationship.get("to_table", "") or ""))
+        if from_key in fact_keys or to_key in fact_keys:
+            relationship["relationship_type"] = "fact_to_dimension"
+        elif from_key in dimension_keys and to_key in dimension_keys:
+            relationship["relationship_type"] = "dimension_to_dimension"
+
+
 def _reverse_cardinality(cardinality: str) -> str:
     lowered = cardinality.strip().lower()
     if lowered == "one-to-many":
@@ -12833,7 +13155,452 @@ def _reverse_cardinality(cardinality: str) -> str:
     return lowered
 
 
-def _render_structured_result(model: dict[str, Any]) -> None:
+def _build_schema_flow_payload(model: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(model) if isinstance(model, dict) else {}
+    payload["schema_metadata"] = _build_schema_flow_metadata(payload)
+    return payload
+
+
+def _build_schema_flow_metadata(model: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "source": "model",
+        "tables": _schema_flow_fallback_table_metadata(model),
+        "warnings": [],
+    }
+
+    try:
+        data_source, dataset = _resolve_current_rdl_context()
+        if not data_source or not dataset:
+            return metadata
+
+        table_instances = _build_table_instances_from_model(model)
+        db_catalog = _schema_flow_cached_db_catalog(
+            data_source=data_source,
+            dataset=dataset,
+            table_instances=table_instances,
+        )
+        catalog_tables = _schema_flow_catalog_table_metadata(
+            model=model,
+            table_instances=table_instances,
+            db_catalog=db_catalog,
+        )
+        if catalog_tables:
+            metadata["tables"] = _schema_flow_merge_table_metadata(metadata["tables"], catalog_tables)
+            metadata["source"] = "database_catalog"
+    except Exception as exc:
+        metadata["warnings"].append(str(exc))
+
+    return metadata
+
+
+def _schema_flow_cached_db_catalog(
+    data_source: dict[str, Any],
+    dataset: dict[str, Any],
+    table_instances: list[dict[str, Any]],
+) -> dict[str, Any]:
+    cache_key = _schema_flow_catalog_cache_key(
+        data_source=data_source,
+        dataset=dataset,
+        table_instances=table_instances,
+    )
+    cache = st.session_state.setdefault("sql_model_assistant_schema_flow_catalog_cache", {})
+    if cache_key not in cache:
+        cache[cache_key] = _build_db_catalog_for_twb_generation(
+            data_source=data_source,
+            dataset=dataset,
+            table_instances=table_instances,
+        ) or {}
+    cached_catalog = cache.get(cache_key, {})
+    return cached_catalog if isinstance(cached_catalog, dict) else {}
+
+
+def _schema_flow_catalog_cache_key(
+    data_source: dict[str, Any],
+    dataset: dict[str, Any],
+    table_instances: list[dict[str, Any]],
+) -> str:
+    connection_info = data_source.get("connection_info", {}) if isinstance(data_source, dict) else {}
+    if not isinstance(connection_info, dict):
+        connection_info = {}
+
+    payload = {
+        "datasource": str(data_source.get("name", "") or ""),
+        "provider": str(data_source.get("provider", "") or ""),
+        "server": str(connection_info.get("server", "") or ""),
+        "database": str(connection_info.get("database", "") or ""),
+        "dataset": str(dataset.get("name", "") or ""),
+        "query_hash": hashlib.md5(str(dataset.get("query", "") or "").encode("utf-8")).hexdigest(),
+        "tables": sorted(
+            _unique(
+                [
+                    str(instance.get("physical_table", "") or "")
+                    for instance in table_instances
+                    if isinstance(instance, dict)
+                ]
+            )
+        ),
+    }
+    return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _schema_flow_fallback_table_metadata(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tables: dict[str, dict[str, Any]] = {}
+
+    for fact in [item for item in model.get("fact_tables", []) if isinstance(item, dict)]:
+        fact_name = str(fact.get("name", "") or "").strip()
+        if not fact_name:
+            continue
+        measures = _as_string_list(fact.get("measures", []))
+        foreign_keys = _as_string_list(fact.get("foreign_keys", []))
+        columns = [
+            {"name": key, "data_type": "", "is_nullable": None, "semantic_role": "foreign_key"}
+            for key in foreign_keys
+        ] + [
+            {"name": measure, "data_type": "", "is_nullable": None, "semantic_role": "measure"}
+            for measure in measures
+        ]
+        table_payload = {
+            "name": fact_name,
+            "full_name": fact_name,
+            "columns": columns,
+            "primary_key": [],
+            "foreign_keys": [{"column": key, "ref_schema": "", "ref_table": "", "ref_column": ""} for key in foreign_keys],
+            "measures": measures,
+            "attributes": [],
+            "source": "model",
+        }
+        _schema_flow_register_table_metadata(tables, [fact_name], table_payload)
+
+    dimensions = _normalize_dimension_list(model.get("direct_dimensions", [])) + _normalize_dimension_list(
+        model.get("snowflake_dimensions", [])
+    )
+    for dimension in dimensions:
+        name = str(dimension.get("name", "") or "").strip()
+        physical_table = str(dimension.get("physical_table", "") or name).strip()
+        alias = str(dimension.get("alias", "") or "").strip()
+        natural_key = str(dimension.get("natural_key", "") or "").strip()
+        attributes = _as_string_list(dimension.get("attributes", []))
+        column_names = _unique(([natural_key] if natural_key else []) + attributes)
+        table_payload = {
+            "name": physical_table or name,
+            "full_name": physical_table or name,
+            "columns": [
+                {
+                    "name": column_name,
+                    "data_type": "",
+                    "is_nullable": None,
+                    "semantic_role": "primary_key" if natural_key and _same_name(column_name, natural_key) else "attribute",
+                }
+                for column_name in column_names
+            ],
+            "primary_key": [natural_key] if natural_key else [],
+            "foreign_keys": [],
+            "attributes": attributes,
+            "measures": [],
+            "source": "model",
+        }
+        _schema_flow_register_table_metadata(tables, [name, physical_table, alias], table_payload)
+
+    return tables
+
+
+def _schema_flow_catalog_table_metadata(
+    model: dict[str, Any],
+    table_instances: list[dict[str, Any]],
+    db_catalog: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    lookup = _schema_flow_catalog_lookup(db_catalog)
+    if not lookup:
+        return {}
+
+    metadata: dict[str, dict[str, Any]] = {}
+    for instance in table_instances:
+        candidates = _schema_flow_instance_names(instance)
+        catalog_payload = _schema_flow_first_catalog_match(candidates, lookup)
+        if not catalog_payload:
+            continue
+        enriched_payload = copy.deepcopy(catalog_payload)
+        enriched_payload["source"] = "database_catalog"
+        _schema_flow_register_table_metadata(metadata, candidates, enriched_payload)
+
+    for relationship in model.get("relationships", []):
+        if not isinstance(relationship, dict):
+            continue
+        for table_name in [
+            str(relationship.get("from_table", "") or ""),
+            str(relationship.get("to_table", "") or ""),
+        ]:
+            catalog_payload = _schema_flow_first_catalog_match([table_name], lookup)
+            if catalog_payload:
+                enriched_payload = copy.deepcopy(catalog_payload)
+                enriched_payload["source"] = "database_catalog"
+                _schema_flow_register_table_metadata(metadata, [table_name], enriched_payload)
+
+    return metadata
+
+
+def _schema_flow_catalog_lookup(db_catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    datasources = db_catalog.get("datasources", []) if isinstance(db_catalog, dict) else []
+    if not isinstance(datasources, list):
+        return lookup
+
+    for datasource in datasources:
+        if not isinstance(datasource, dict):
+            continue
+        tables = datasource.get("tables", [])
+        if not isinstance(tables, list):
+            continue
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            payload = _schema_flow_catalog_payload(table)
+            names = [
+                str(table.get("name", "") or ""),
+                str(table.get("full_name", "") or ""),
+                _table_leaf_from_table_reference(str(table.get("full_name", "") or "")),
+            ]
+            schema_name = str(table.get("schema", "") or "").strip()
+            table_name = str(table.get("name", "") or "").strip()
+            if schema_name and table_name:
+                names.append(f"{schema_name}.{table_name}")
+            _schema_flow_register_table_metadata(lookup, names, payload)
+
+    return lookup
+
+
+def _schema_flow_catalog_payload(table: dict[str, Any]) -> dict[str, Any]:
+    columns: list[dict[str, Any]] = []
+    for column in table.get("columns", []) if isinstance(table.get("columns", []), list) else []:
+        if not isinstance(column, dict):
+            continue
+        nullable_value = column.get("is_nullable")
+        is_nullable = nullable_value if isinstance(nullable_value, bool) else None
+        columns.append(
+            {
+                "name": str(column.get("name", "") or "").strip(),
+                "data_type": str(column.get("data_type", "") or "").strip(),
+                "is_nullable": is_nullable,
+            }
+        )
+
+    foreign_keys: list[dict[str, str]] = []
+    for foreign_key in table.get("foreign_keys", []) if isinstance(table.get("foreign_keys", []), list) else []:
+        if not isinstance(foreign_key, dict):
+            continue
+        foreign_keys.append(
+            {
+                "column": str(foreign_key.get("column", "") or "").strip(),
+                "ref_schema": str(foreign_key.get("ref_schema", "") or "").strip(),
+                "ref_table": str(foreign_key.get("ref_table", "") or "").strip(),
+                "ref_column": str(foreign_key.get("ref_column", "") or "").strip(),
+            }
+        )
+
+    return {
+        "schema": str(table.get("schema", "") or "").strip(),
+        "name": str(table.get("name", "") or "").strip(),
+        "full_name": str(table.get("full_name", "") or "").strip(),
+        "columns": [column for column in columns if column["name"]],
+        "primary_key": _as_string_list(table.get("primary_key", [])),
+        "foreign_keys": [foreign_key for foreign_key in foreign_keys if foreign_key["column"]],
+    }
+
+
+def _schema_flow_merge_table_metadata(
+    fallback_tables: dict[str, dict[str, Any]],
+    catalog_tables: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    merged = copy.deepcopy(fallback_tables)
+    for key, catalog_payload in catalog_tables.items():
+        existing = merged.get(key, {})
+        next_payload = copy.deepcopy(catalog_payload)
+        if existing:
+            for preserved_key in ("attributes", "measures"):
+                if existing.get(preserved_key) and not next_payload.get(preserved_key):
+                    next_payload[preserved_key] = existing[preserved_key]
+        merged[key] = next_payload
+    return merged
+
+
+def _schema_flow_register_table_metadata(
+    target: dict[str, dict[str, Any]],
+    names: list[str],
+    payload: dict[str, Any],
+) -> None:
+    for name in names:
+        key = _schema_flow_table_key(name)
+        if key:
+            target[key] = payload
+
+
+def _schema_flow_first_catalog_match(
+    names: list[str],
+    lookup: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    for name in names:
+        key = _schema_flow_table_key(name)
+        if key and key in lookup:
+            return lookup[key]
+        leaf_key = _schema_flow_table_key(_table_leaf_from_table_reference(name))
+        if leaf_key and leaf_key in lookup:
+            return lookup[leaf_key]
+    return {}
+
+
+def _schema_flow_instance_names(instance: dict[str, Any]) -> list[str]:
+    names = [
+        str(instance.get("semantic_name", "") or ""),
+        str(instance.get("physical_table", "") or ""),
+        str(instance.get("alias", "") or ""),
+        str(instance.get("caption", "") or ""),
+        str(instance.get("relation_name", "") or ""),
+    ]
+    physical_leaf = _table_leaf_from_table_reference(str(instance.get("physical_table", "") or ""))
+    if physical_leaf:
+        names.append(physical_leaf)
+    return _unique([name for name in names if name])
+
+
+def _schema_flow_table_key(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", _clean_name(str(value or "")).lower())
+    return cleaned.strip("_")
+
+
+def _schema_flow_details_for_names(
+    table_metadata: dict[str, dict[str, Any]],
+    names: list[str],
+) -> dict[str, Any]:
+    if not isinstance(table_metadata, dict):
+        return {}
+    details = _schema_flow_first_catalog_match([name for name in names if name], table_metadata)
+    return details if isinstance(details, dict) else {}
+
+
+def _schema_flow_details_for_dimension(
+    table_metadata: dict[str, dict[str, Any]],
+    dimension: dict[str, Any],
+) -> dict[str, Any]:
+    return _schema_flow_details_for_names(
+        table_metadata,
+        [
+            str(dimension.get("name", "") or ""),
+            str(dimension.get("physical_table", "") or ""),
+            str(dimension.get("alias", "") or ""),
+        ],
+    )
+
+
+def _schema_flow_details_for_fact(
+    table_metadata: dict[str, dict[str, Any]],
+    fact: dict[str, Any],
+) -> dict[str, Any]:
+    return _schema_flow_details_for_names(table_metadata, [str(fact.get("name", "") or "")])
+
+
+def _schema_flow_column_specs(table_details: dict[str, Any]) -> list[dict[str, str]]:
+    columns = table_details.get("columns", []) if isinstance(table_details, dict) else []
+    if not isinstance(columns, list):
+        return []
+
+    primary_keys = {_name_key(key) for key in _as_string_list(table_details.get("primary_key", []))}
+    foreign_key_lookup = _schema_flow_foreign_key_lookup(table_details)
+    rows: list[dict[str, str]] = []
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        column_name = str(column.get("name", "") or "").strip()
+        if not column_name:
+            continue
+        column_key = _name_key(column_name)
+        key_tags: list[str] = []
+        if column_key in primary_keys:
+            key_tags.append("PK")
+        if column_key in foreign_key_lookup:
+            key_tags.append("FK")
+        nullable = column.get("is_nullable")
+        rows.append(
+            {
+                "Column": column_name,
+                "Type": str(column.get("data_type", "") or "").strip() or "-",
+                "Key": ", ".join(key_tags) or "ATTR",
+                "Nullable": "Yes" if nullable is True else "No" if nullable is False else "-",
+                "Reference": foreign_key_lookup.get(column_key, ""),
+            }
+        )
+    return rows
+
+
+def _schema_flow_attribute_specs(
+    table_details: dict[str, Any],
+    fallback_attributes: list[str],
+) -> list[dict[str, str]]:
+    rows = _schema_flow_column_specs(table_details)
+    if rows:
+        attribute_rows = [row for row in rows if "PK" not in row["Key"] and "FK" not in row["Key"]]
+        return attribute_rows
+
+    return [
+        {
+            "Column": attribute,
+            "Type": "-",
+            "Key": "ATTR",
+            "Nullable": "-",
+            "Reference": "",
+        }
+        for attribute in fallback_attributes
+        if attribute
+    ]
+
+
+def _schema_flow_foreign_key_lookup(table_details: dict[str, Any]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for row in _schema_flow_foreign_key_rows(table_details):
+        lookup[_name_key(row["Column"])] = row["Reference"]
+    return lookup
+
+
+def _schema_flow_foreign_key_rows(table_details: dict[str, Any]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    foreign_keys = table_details.get("foreign_keys", []) if isinstance(table_details, dict) else []
+    if not isinstance(foreign_keys, list):
+        return rows
+
+    for foreign_key in foreign_keys:
+        if not isinstance(foreign_key, dict):
+            continue
+        column = str(foreign_key.get("column", "") or "").strip()
+        if not column:
+            continue
+        reference = ".".join(
+            [
+                part
+                for part in [
+                    str(foreign_key.get("ref_schema", "") or "").strip(),
+                    str(foreign_key.get("ref_table", "") or "").strip(),
+                    str(foreign_key.get("ref_column", "") or "").strip(),
+                ]
+                if part
+            ]
+        )
+        rows.append({"Column": column, "Reference": reference})
+
+    return rows
+
+
+def _schema_flow_primary_key_label(table_details: dict[str, Any], fallback: str) -> str:
+    primary_keys = _as_string_list(table_details.get("primary_key", [])) if isinstance(table_details, dict) else []
+    return ", ".join(primary_keys) or str(fallback or "").strip() or "-"
+
+
+def _render_schema_flow_columns_table(rows: list[dict[str, str]], empty_message: str) -> None:
+    if not rows:
+        st.caption(empty_message)
+        return
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _render_structured_result(model: dict[str, Any], render_key_suffix: str = "") -> None:
     if not model:
         return
 
@@ -12863,6 +13630,24 @@ def _render_structured_result(model: dict[str, Any]) -> None:
     if model.get("model_summary"):
         st.info(str(model["model_summary"]))
 
+    schema_flow_payload: dict[str, Any] = {}
+    schema_flow_table_metadata: dict[str, dict[str, Any]] = {}
+    if fact_tables or direct_dimensions or snowflake_dimensions or relationships:
+        schema_flow_payload = _build_schema_flow_payload(model)
+        schema_metadata = schema_flow_payload.get("schema_metadata", {})
+        if isinstance(schema_metadata, dict) and isinstance(schema_metadata.get("tables"), dict):
+            schema_flow_table_metadata = schema_metadata["tables"]
+        st.markdown("### Schema Diagram")
+        schema_flow_key = hashlib.md5(
+            json.dumps(schema_flow_payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        render_schema_flow(
+            schema=schema_flow_payload,
+            height=640,
+            key=f"sql_model_assistant_schema_flow_{schema_flow_key}_{_tableau_safe_name(render_key_suffix)}",
+            schema_signature=schema_flow_key,
+        )
+
     facts_tab, dimensions_tab, relationships_tab, notes_tab = st.tabs(
         ["Fact Tables", "Dimensions", "Relationships", "Review"]
     )
@@ -12876,7 +13661,17 @@ def _render_structured_result(model: dict[str, Any]) -> None:
                     {
                         "Table": fact.get("name", ""),
                         "Measures": len(_as_string_list(fact.get("measures", []))),
-                        "Foreign Keys": len(_as_string_list(fact.get("foreign_keys", []))),
+                        "Foreign Keys": len(
+                            _schema_flow_foreign_key_lookup(
+                                _schema_flow_details_for_fact(schema_flow_table_metadata, fact)
+                            )
+                        )
+                        or len(_as_string_list(fact.get("foreign_keys", []))),
+                        "Columns": len(
+                            _schema_flow_column_specs(
+                                _schema_flow_details_for_fact(schema_flow_table_metadata, fact)
+                            )
+                        ),
                     }
                     for fact in fact_tables
                 ],
@@ -12885,11 +13680,27 @@ def _render_structured_result(model: dict[str, Any]) -> None:
             )
             for fact in fact_tables:
                 fact_name = str(fact.get("name", "")).strip() or "Fact Table"
+                fact_details = _schema_flow_details_for_fact(schema_flow_table_metadata, fact)
                 with st.expander(f"{fact_name} details", expanded=False):
                     st.markdown("**Measures**")
                     _render_text_list(_as_string_list(fact.get("measures", [])), "No measures identified.")
                     st.markdown("**Foreign keys**")
-                    _render_text_list(_as_string_list(fact.get("foreign_keys", [])), "No foreign keys identified.")
+                    fk_rows = _schema_flow_foreign_key_rows(fact_details)
+                    if fk_rows:
+                        _render_text_list(
+                            [
+                                f"{row['Column']} -> {row['Reference']}" if row["Reference"] else row["Column"]
+                                for row in fk_rows
+                            ],
+                            "No foreign keys identified.",
+                        )
+                    else:
+                        _render_text_list(_as_string_list(fact.get("foreign_keys", [])), "No foreign keys identified.")
+                    st.markdown("**Catalog columns**")
+                    _render_schema_flow_columns_table(
+                        _schema_flow_column_specs(fact_details),
+                        "No database column metadata available.",
+                    )
 
     with dimensions_tab:
         direct_col, snowflake_col = st.columns(2)
@@ -12903,8 +13714,16 @@ def _render_structured_result(model: dict[str, Any]) -> None:
                             "Physical Table": dimension.get("physical_table", "") or dimension["name"],
                             "Alias": dimension.get("alias", "") or "-",
                             "Semantic Role": dimension.get("semantic_role", "") or "-",
-                            "Natural Key": dimension.get("natural_key", "") or "-",
-                            "Attributes": len(_as_string_list(dimension.get("attributes", []))),
+                            "Natural Key": _schema_flow_primary_key_label(
+                                _schema_flow_details_for_dimension(schema_flow_table_metadata, dimension),
+                                str(dimension.get("natural_key", "") or ""),
+                            ),
+                            "Attributes": len(
+                                _schema_flow_attribute_specs(
+                                    _schema_flow_details_for_dimension(schema_flow_table_metadata, dimension),
+                                    _as_string_list(dimension.get("attributes", [])),
+                                )
+                            ),
                         }
                         for dimension in direct_dimensions
                     ],
@@ -12924,8 +13743,16 @@ def _render_structured_result(model: dict[str, Any]) -> None:
                             "Alias": dimension.get("alias", "") or "-",
                             "Semantic Role": dimension.get("semantic_role", "") or "-",
                             "Origin (Star)": snowflake_origins.get(_name_key(dimension["name"]), "") or "-",
-                            "Natural Key": dimension.get("natural_key", "") or "-",
-                            "Attributes": len(_as_string_list(dimension.get("attributes", []))),
+                            "Natural Key": _schema_flow_primary_key_label(
+                                _schema_flow_details_for_dimension(schema_flow_table_metadata, dimension),
+                                str(dimension.get("natural_key", "") or ""),
+                            ),
+                            "Attributes": len(
+                                _schema_flow_attribute_specs(
+                                    _schema_flow_details_for_dimension(schema_flow_table_metadata, dimension),
+                                    _as_string_list(dimension.get("attributes", [])),
+                                )
+                            ),
                         }
                         for dimension in snowflake_dimensions
                     ],
@@ -12951,8 +13778,12 @@ def _render_structured_result(model: dict[str, Any]) -> None:
                     if dimension_type == "Snowflake":
                         origin = snowflake_origins.get(_name_key(dimension["name"]), "")
                         st.caption(f"Branch origin table (star schema): {origin or 'Unknown'}")
-                    _render_text_list(
-                        _as_string_list(dimension.get("attributes", [])),
+                    dimension_details = _schema_flow_details_for_dimension(schema_flow_table_metadata, dimension)
+                    _render_schema_flow_columns_table(
+                        _schema_flow_attribute_specs(
+                            dimension_details,
+                            _as_string_list(dimension.get("attributes", [])),
+                        ),
                         "No attributes identified.",
                     )
 
