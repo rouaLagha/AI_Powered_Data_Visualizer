@@ -6,6 +6,10 @@ Ce dossier contient le backend HTTP JSON utilise par l interface React.
 
 ```text
 backend/
+  assets/
+  config/
+  scripts/
+  src/
   sql_model_api/
     main.py
     api/
@@ -14,7 +18,8 @@ backend/
 
 - `main.py`: serveur HTTP, endpoints REST, et service des fichiers statiques React.
 - `api/routes.py`: declaration des endpoints et dispatch POST centralise.
-- `react_sql_model_app.py`: lanceur racine garde pour compatibilite.
+- `run_react_sql_model_app.py`: lanceur backend equivalent a `python -m backend.sql_model_api.main`.
+- Les artefacts generes sont ecrits dans `../outputs/`.
 
 ## Lancer le backend
 
@@ -27,7 +32,7 @@ python -m backend.sql_model_api.main
 ou:
 
 ```bash
-python react_sql_model_app.py
+python backend/run_react_sql_model_app.py
 ```
 
 URL par defaut:
@@ -48,4 +53,6 @@ POST /api/model/analyze
 POST /api/schema/validate
 POST /api/twb/generate
 POST /api/tableau/publish
+POST /api/conversion/run
+POST /api/rdl-editor/apply
 ```

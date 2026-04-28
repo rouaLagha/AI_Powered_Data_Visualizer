@@ -22,6 +22,8 @@ POST_ENDPOINTS = {
     "/api/schema/validate",
     "/api/twb/generate",
     "/api/tableau/publish",
+    "/api/conversion/run",
+    "/api/rdl-editor/apply",
 }
 
 

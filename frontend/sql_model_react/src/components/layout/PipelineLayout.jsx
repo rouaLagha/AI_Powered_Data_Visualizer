@@ -11,6 +11,9 @@ export default function PipelineLayout({
   chatProps,
   validationStatus,
   headerContext,
+  navItems,
+  activePage,
+  onNavigate,
 }) {
   return (
     <div className="app-shell">
@@ -18,6 +21,10 @@ export default function PipelineLayout({
         activeStepTitle={steps[activeStep]?.title || ""}
         validationStatus={validationStatus}
         context={headerContext}
+        navItems={navItems}
+        activePage={activePage}
+        onNavigate={onNavigate}
+        showValidationBadge
       />
       <div className="app-grid">
         <PipelineStepper steps={steps} activeStep={activeStep} onSelectStep={onSelectStep} />

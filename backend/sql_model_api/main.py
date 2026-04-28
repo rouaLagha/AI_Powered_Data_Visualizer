@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+from datetime import datetime, timezone
 import json
 import mimetypes
 import os
+import re
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,8 +19,10 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+BACKEND_DIR = PROJECT_ROOT / "backend"
+for import_root in [BACKEND_DIR, PROJECT_ROOT]:
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 try:
     from .api.routes import dispatch_post
@@ -26,12 +30,14 @@ except ImportError:
     from api.routes import dispatch_post
 
 from src.rdl_to_twb.rdl_parser import parse_rdl_file
+from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agent, validate_patch
+from src.rdl_ai_editor.logging_utils import write_patch_log
+from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
 from sql_model_assistant_app import (
     DEFAULT_LLM_CONFIG,
     FALLBACK_LLM_CONFIG,
     OUTPUT_TEMPLATE_COPY_PATH,
     OUTPUT_TEMPLATE_PATH,
-    ROOT_DIR,
     SQL_ASSISTANT_LLM_CONFIG,
     _build_tableau_publish_context,
     _find_dataset_by_name,
@@ -49,12 +55,14 @@ from sql_model_assistant_app import (
 )
 
 
-FRONTEND_DIR = ROOT_DIR / "frontend" / "sql_model_react"
+FRONTEND_DIR = PROJECT_ROOT / "frontend" / "sql_model_react"
 DIST_DIR = FRONTEND_DIR / "dist"
 INDEX_PATH = FRONTEND_DIR / "index.html"
-SCHEMA_FLOW_FRONTEND_DIR = ROOT_DIR / "src" / "schema_flow_component" / "frontend"
-OUTPUT_DIR = ROOT_DIR / "output"
+SCHEMA_FLOW_FRONTEND_DIR = BACKEND_DIR / "src" / "schema_flow_component" / "frontend"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
 STATE_LOCK = Lock()
+RDL_XSD_PATH = BACKEND_DIR / "assets" / "ReportDefinition.xsd"
+TWB_XSD_PATH = BACKEND_DIR / "assets" / "twb_2026.1.0.xsd"
 
 
 class SqlModelThreadingHTTPServer(ThreadingHTTPServer):
@@ -149,10 +157,21 @@ def _path_key(path: Path) -> str:
 def _is_safe_download_path(path: Path) -> bool:
     try:
         resolved = path.resolve(strict=True)
-        root = ROOT_DIR.resolve(strict=True)
+        root = PROJECT_ROOT.resolve(strict=True)
     except OSError:
         return False
     return str(resolved).lower().startswith(str(root).lower())
+
+
+def _resolve_workspace_path(path_value: str) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    resolved = path.resolve()
+    root = PROJECT_ROOT.resolve()
+    if not str(resolved).lower().startswith(str(root).lower()):
+        raise ValueError(f"Path must stay inside the project workspace: {path_value}")
+    return resolved
 
 
 def _file_payload(path_value: str) -> dict[str, Any]:
@@ -160,7 +179,7 @@ def _file_payload(path_value: str) -> dict[str, Any]:
         return {}
     path = Path(path_value)
     if not path.is_absolute():
-        path = ROOT_DIR / path
+        path = PROJECT_ROOT / path
     try:
         resolved = path.resolve(strict=True)
     except OSError:
@@ -174,6 +193,26 @@ def _file_payload(path_value: str) -> dict[str, Any]:
         "size_bytes": resolved.stat().st_size,
         "download_url": f"/api/file?path={quote(resolved.as_posix())}",
     }
+
+
+def _safe_file_stem(value: str, fallback: str = "report") -> str:
+    stem = Path(value or fallback).stem
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
+    return cleaned or fallback
+
+
+def _timestamp_token() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _artifact_payloads(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    artifacts: dict[str, dict[str, Any]] = {}
+    for key, value in result.items():
+        if isinstance(value, str):
+            payload = _file_payload(value)
+            if payload:
+                artifacts[key] = payload
+    return artifacts
 
 
 def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -571,6 +610,112 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
     return _state_snapshot()
 
 
+def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    file_name = str(payload.get("file_name") or "uploaded_report.rdl")
+    content = str(payload.get("content") or "")
+    if not content.strip():
+        raise ValueError("Uploaded RDL content is empty.")
+
+    output_dir_value = str(payload.get("output_dir") or "").strip()
+    if output_dir_value:
+        output_dir = _resolve_workspace_path(output_dir_value)
+    else:
+        output_dir = OUTPUT_DIR / "react_conversions" / f"{_timestamp_token()}_{_safe_file_stem(file_name)}"
+
+    suffix = Path(file_name).suffix or ".rdl"
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as handle:
+            handle.write(content)
+            temp_path = Path(handle.name)
+        result = run_full_conversion(
+            rdl_path=temp_path,
+            rdl_xsd_path=RDL_XSD_PATH,
+            twb_xsd_path=TWB_XSD_PATH,
+            output_dir=output_dir,
+            config_path=Path(str(payload.get("config_path") or _preferred_config_path())),
+            publish_enabled=bool(payload.get("publish_enabled", False)),
+        )
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    trace_steps: list[str] = []
+    trace_path = result.get("pipeline_trace") if isinstance(result, dict) else None
+    if isinstance(trace_path, str):
+        try:
+            trace_payload = json.loads(Path(trace_path).read_text(encoding="utf-8"))
+            raw_steps = trace_payload.get("steps", []) if isinstance(trace_payload, dict) else []
+            if isinstance(raw_steps, list):
+                trace_steps = [str(step) for step in raw_steps]
+        except Exception:
+            trace_steps = []
+
+    return {
+        "ok": True,
+        "status": "completed",
+        "report_name": file_name,
+        "output_dir": str(output_dir),
+        "result": result,
+        "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
+        "trace_steps": trace_steps,
+    }
+
+
+def _apply_rdl_editor_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    file_name = str(payload.get("file_name") or "uploaded_report.rdl")
+    content = str(payload.get("content") or "")
+    instruction = str(payload.get("instruction") or "").strip()
+    if not content.strip():
+        raise ValueError("Uploaded RDL content is empty.")
+    if not instruction:
+        raise ValueError("RDL edit instruction is required.")
+
+    use_llm_config = bool(payload.get("use_llm_config", False))
+    config_path = Path(str(payload.get("config_path") or _preferred_config_path())) if use_llm_config else None
+    output_dir = OUTPUT_DIR / "rdl_ai_editor" / f"{_timestamp_token()}_{_safe_file_stem(file_name)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    llm_client = load_llm_from_config(config_path) if config_path is not None else None
+    patch_raw = nlp_agent(query=instruction, llm=llm_client)
+    patch_validated = validate_patch(patch_raw)
+    apply_result = apply_patch_to_rdl(rdl_xml=content, patch_json=patch_validated)
+    log_path = write_patch_log(
+        log_dir=OUTPUT_DIR / "rdl_ai_editor_logs",
+        payload={
+            "source_name": file_name,
+            "query": instruction,
+            "patch_raw": patch_raw,
+            "patch_validated": patch_validated,
+            "operation_logs": apply_result.logs,
+        },
+    )
+
+    modified_path = output_dir / f"{_safe_file_stem(file_name)}_modified.rdl"
+    patch_path = output_dir / "patch_validated.json"
+    raw_patch_path = output_dir / "patch_raw.json"
+    modified_path.write_text(apply_result.modified_xml, encoding="utf-8")
+    patch_path.write_text(json.dumps(patch_validated, indent=2, ensure_ascii=True), encoding="utf-8")
+    raw_patch_path.write_text(json.dumps(patch_raw, indent=2, ensure_ascii=True), encoding="utf-8")
+
+    return {
+        "ok": True,
+        "status": "completed",
+        "report_name": file_name,
+        "instruction": instruction,
+        "modified_xml": apply_result.modified_xml,
+        "patch_raw": patch_raw,
+        "patch_validated": patch_validated,
+        "operation_logs": list(apply_result.logs),
+        "artifacts": {
+            "modified_rdl": _file_payload(str(modified_path)),
+            "patch_validated": _file_payload(str(patch_path)),
+            "patch_raw": _file_payload(str(raw_patch_path)),
+            "log": _file_payload(str(log_path)),
+        },
+    }
+
+
 def _reset_endpoint(_payload: dict[str, Any]) -> dict[str, Any]:
     return _reset_app_state()
 
@@ -587,6 +732,8 @@ POST_HANDLERS = {
     "/api/schema/validate": _validate_schema_endpoint,
     "/api/twb/generate": _generate_twb,
     "/api/tableau/publish": _publish_tableau,
+    "/api/conversion/run": _run_conversion_endpoint,
+    "/api/rdl-editor/apply": _apply_rdl_editor_endpoint,
 }
 
 
@@ -676,7 +823,7 @@ class ReactSqlModelHandler(BaseHTTPRequestHandler):
         raw_path = values.get("path", [""])[0]
         path = Path(unquote(raw_path))
         if not path.is_absolute():
-            path = ROOT_DIR / path
+            path = PROJECT_ROOT / path
         if not _is_safe_download_path(path):
             self.send_error(HTTPStatus.NOT_FOUND)
             return

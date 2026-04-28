@@ -171,6 +171,44 @@ export function publishTableau({ configPath = "", tableau = {} } = {}) {
   });
 }
 
+export function runRdlConversion({
+  fileName,
+  content,
+  configPath = "",
+  outputDir = "",
+  publishEnabled = false,
+}) {
+  return requestJson("/api/conversion/run", {
+    method: "POST",
+    body: JSON.stringify({
+      file_name: fileName,
+      content,
+      config_path: configPath,
+      output_dir: outputDir,
+      publish_enabled: publishEnabled,
+    }),
+  });
+}
+
+export function applyRdlAiEdit({
+  fileName,
+  content,
+  instruction,
+  configPath = "",
+  useLlmConfig = false,
+}) {
+  return requestJson("/api/rdl-editor/apply", {
+    method: "POST",
+    body: JSON.stringify({
+      file_name: fileName,
+      content,
+      instruction,
+      config_path: configPath,
+      use_llm_config: useLlmConfig,
+    }),
+  });
+}
+
 export function readFileAsText(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

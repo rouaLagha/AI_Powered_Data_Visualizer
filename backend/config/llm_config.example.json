@@ -1,0 +1,47 @@
+{
+  "agent1": {
+    "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "api_key": "",
+    "model": "llama3.2:3b",
+    "temperature": 0.1,
+    "timeout_seconds": 1800
+  },
+  "agent2": {
+    "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "api_key": "",
+    "model": "llama3.2:3b",
+    "temperature": 0.1,
+    "timeout_seconds": 1800
+  },
+  "tableau_server": {
+    "enabled": false,
+    "server_url": "https://your-tableau-server",
+    "site_content_url": "",
+    "project_name": "Default",
+    "project_id": "",
+    "workbook_name": "converted_report",
+    "datasource_publish_mode": "live_tds",
+    "build_hyper_extract": false,
+    "hyper_max_rows_per_table": 200000,
+    "publish_mode": "overwrite",
+    "file_format": "auto",
+    "auth_method": "pat",
+    "pat_name": "YOUR_PAT_NAME",
+    "pat_secret": "env:TABLEAU_PAT_SECRET",
+    "username": "env:TABLEAU_USERNAME",
+    "password": "env:TABLEAU_PASSWORD",
+    "skip_connection_check": false,
+    "as_job": false,
+    "fail_on_error": false,
+    "source_datasource_name": "",
+    "empty_workbook_template_path": "",
+    "visual_source_twb_path": "outputs/sql_model_assistant_flux1/RegionalSales/converted_report.twb",
+    "desktop_rpa_enabled": false,
+    "desktop_rpa_tableau_exe": "env:TABLEAU_PUBLIC_EXE",
+    "desktop_rpa_email": "env:TABLEAU_EMAIL",
+    "desktop_rpa_password": "env:TABLEAU_PASSWORD",
+    "desktop_rpa_timeout_seconds": 180,
+    "desktop_rpa_publish_wait_seconds": 240,
+    "desktop_rpa_launch_settle_seconds": 4
+  }
+}

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import Header from "./components/layout/Header.jsx";
 import PipelineLayout from "./components/layout/PipelineLayout.jsx";
 import RdlUploadStep from "./components/steps/RdlUploadStep.jsx";
 import RdlParsingStep from "./components/steps/RdlParsingStep.jsx";
@@ -10,6 +11,8 @@ import TwbGenerationStep from "./components/steps/TwbGenerationStep.jsx";
 import TableauDatasourceStep from "./components/steps/TableauDatasourceStep.jsx";
 import PublicationStep from "./components/steps/PublicationStep.jsx";
 import ConsumerWorkbookStep from "./components/steps/ConsumerWorkbookStep.jsx";
+import RdlAiEditorPage from "./pages/RdlAiEditorPage.jsx";
+import RdlConversionPage from "./pages/RdlConversionPage.jsx";
 import {
   STATUS,
   analysisFromBackend,
@@ -116,7 +119,14 @@ function tableauPayload(config) {
   };
 }
 
+const navItems = [
+  { id: "pipeline", label: "SQL model flow" },
+  { id: "conversion", label: "RDL to TWB" },
+  { id: "editor", label: "RDL AI editor" },
+];
+
 export default function App() {
+  const [activePage, setActivePage] = useState("pipeline");
   const [activeStep, setActiveStep] = useState(0);
   const [pipelineSteps, setPipelineSteps] = useState(initialSteps);
   const [backendState, setBackendState] = useState(null);
@@ -478,17 +488,65 @@ export default function App() {
     consumerWorkbook,
   ]);
 
+  const headerContext = {
+    backendReady: Boolean(backendState?.ok),
+    reportName: backendState?.report_name || uploadedFile?.name || "",
+    datasetName: selectedDataset?.name || backendState?.selected_dataset_name || "",
+  };
+  const defaultConfigPath = backendState?.defaults?.config_path || "";
+
+  if (activePage === "conversion") {
+    return (
+      <div className="app-shell">
+        <Header
+          activeStepTitle="RDL to TWB"
+          validationStatus={validationStatus}
+          context={headerContext}
+          navItems={navItems}
+          activePage={activePage}
+          onNavigate={setActivePage}
+          showValidationBadge={false}
+        />
+        <main className="page-workspace">
+          {loading && <div className="loading-banner">{loading} in progress...</div>}
+          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
+          <RdlConversionPage defaultConfigPath={defaultConfigPath} />
+        </main>
+      </div>
+    );
+  }
+
+  if (activePage === "editor") {
+    return (
+      <div className="app-shell">
+        <Header
+          activeStepTitle="RDL AI editor"
+          validationStatus={validationStatus}
+          context={headerContext}
+          navItems={navItems}
+          activePage={activePage}
+          onNavigate={setActivePage}
+          showValidationBadge={false}
+        />
+        <main className="page-workspace">
+          {loading && <div className="loading-banner">{loading} in progress...</div>}
+          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
+          <RdlAiEditorPage defaultConfigPath={defaultConfigPath} />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <PipelineLayout
       steps={pipelineSteps}
       activeStep={activeStep}
       onSelectStep={activateStep}
       validationStatus={validationStatus}
-      headerContext={{
-        backendReady: Boolean(backendState?.ok),
-        reportName: backendState?.report_name || uploadedFile?.name || "",
-        datasetName: selectedDataset?.name || backendState?.selected_dataset_name || "",
-      }}
+      headerContext={headerContext}
+      navItems={navItems}
+      activePage={activePage}
+      onNavigate={setActivePage}
       chatProps={{
         chatMessages,
         changeProposals,
