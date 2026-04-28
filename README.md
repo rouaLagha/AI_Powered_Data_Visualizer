@@ -4,6 +4,21 @@ Ce projet implemente une chaine complete pour convertir un fichier SSRS `.rdl` v
 
 ## Architecture
 
+Structure applicative:
+
+```text
+backend/
+  sql_model_api/
+    main.py          # serveur HTTP + static hosting
+    api/routes.py   # declaration et dispatch des routes REST
+frontend/
+  sql_model_react/  # application React/Vite
+```
+
+Le frontend appelle le backend en JSON via `/api/...`. En production locale, `backend/sql_model_api/main.py`
+sert aussi les fichiers React construits par Vite. En developpement, Vite proxy `/api` et `/schema-flow`
+vers `http://127.0.0.1:5177`.
+
 1. Parsing source
 - Lit le RDL.
 - Extrait data sources, datasets, champs, parametres, visuels et expressions.
@@ -143,10 +158,16 @@ Variables utiles:
 
 ## Execution
 
-### Interface React
+### Interface React + backend REST API
 
 ```bash
 python react_sql_model_app.py
+```
+
+Commande backend equivalente:
+
+```bash
+python -m backend.sql_model_api.main
 ```
 
 Puis ouvrez:
@@ -154,6 +175,16 @@ Puis ouvrez:
 ```text
 http://127.0.0.1:5177
 ```
+
+Mode developpement frontend:
+
+```bash
+cd frontend/sql_model_react
+npm install
+npm run dev
+```
+
+Vite ouvre `http://localhost:3000` et redirige les appels `/api` vers le backend REST.
 
 ### Interface Streamlit (simple)
 
