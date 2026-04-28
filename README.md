@@ -143,6 +143,18 @@ Variables utiles:
 
 ## Execution
 
+### Interface React
+
+```bash
+python react_sql_model_app.py
+```
+
+Puis ouvrez:
+
+```text
+http://127.0.0.1:5177
+```
+
 ### Interface Streamlit (simple)
 
 ```bash

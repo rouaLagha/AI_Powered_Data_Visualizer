@@ -1171,8 +1171,23 @@ def _find_catalog_datasource(db_catalog: dict | None, datasource_name: str) -> d
             continue
         name = item.get("name")
         if isinstance(name, str) and name.strip().lower() == target:
-            return item
+            return item if _catalog_source_has_column_metadata(item) else None
     return None
+
+
+def _catalog_source_has_column_metadata(catalog_source: dict | None) -> bool:
+    if not isinstance(catalog_source, dict):
+        return False
+    tables = catalog_source.get("tables")
+    if not isinstance(tables, list) or not tables:
+        return False
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        columns = table.get("columns")
+        if isinstance(columns, list) and columns:
+            return True
+    return False
 
 
 def _catalog_table_references(catalog_source: dict | None) -> list[str]:

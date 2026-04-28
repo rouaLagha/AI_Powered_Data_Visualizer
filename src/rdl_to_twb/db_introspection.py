@@ -99,6 +99,101 @@ def build_db_catalog(
     return catalog
 
 
+def inspect_sqlserver_datasource_inventory(
+    data_source: dict[str, Any],
+    connection_overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return the accessible table inventory for a SQL Server datasource."""
+    entry: dict[str, Any] = {
+        "name": str(data_source.get("name") or "").strip() if isinstance(data_source, dict) else "",
+        "provider": str(data_source.get("provider") or "").strip().lower() if isinstance(data_source, dict) else "",
+        "server": "",
+        "database": "",
+        "connected": False,
+        "tables": [],
+    }
+
+    if not isinstance(data_source, dict):
+        entry["error"] = "Unsupported datasource payload."
+        return entry
+
+    conn_string = str(data_source.get("connection_string") or "").strip()
+    if not entry["name"] or "sql" not in entry["provider"] or not conn_string:
+        entry["error"] = "Skipped (unsupported provider or missing connection string)."
+        return entry
+
+    entries = _connection_string_entries(conn_string)
+    entry["server"] = (
+        entries.get("server")
+        or entries.get("data source")
+        or entries.get("addr")
+        or entries.get("address")
+        or ""
+    )
+    entry["database"] = entries.get("database") or entries.get("initial catalog") or ""
+
+    overrides = _resolve_connection_overrides(connection_overrides, entry["name"])
+    effective_overrides = dict(overrides)
+    security_type = str(data_source.get("security_type") or "").strip().lower()
+    if security_type == "windows" and "trusted_connection" not in effective_overrides:
+        effective_overrides["trusted_connection"] = "true"
+
+    user_name = data_source.get("user_name")
+    if isinstance(user_name, str) and user_name.strip() and "uid" not in effective_overrides:
+        effective_overrides["uid"] = user_name.strip()
+
+    try:
+        import pyodbc  # type: ignore
+    except Exception as exc:
+        entry["error"] = f"pyodbc import failed: {type(exc).__name__}: {exc}"
+        return entry
+
+    conn = None
+    try:
+        conn = _open_sqlserver_connection(pyodbc, conn_string, effective_overrides)
+        if conn is None:
+            entry["error"] = "No usable ODBC SQL Server driver found."
+            return entry
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
+                """
+            )
+            tables = []
+            for row in cursor.fetchall():
+                schema_name = str(row[0] or "").strip()
+                table_name = str(row[1] or "").strip()
+                table_type = str(row[2] or "").strip()
+                if not schema_name or not table_name:
+                    continue
+                tables.append(
+                    {
+                        "schema": schema_name,
+                        "name": table_name,
+                        "full_name": f"[{schema_name}].[{table_name}]",
+                        "table_type": table_type,
+                    }
+                )
+
+        entry["tables"] = tables
+        entry["connected"] = True
+        return entry
+    except Exception as exc:
+        entry["error"] = f"Inventory failed: {type(exc).__name__}: {exc}"
+        return entry
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _extract_used_tables(data_sets: list[dict[str, Any]], datasource_name: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -218,13 +313,7 @@ def _normalize_sqlserver_odbc_connection_string(
     driver_name: str,
     overrides: dict[str, Any] | None,
 ) -> str:
-    entries: dict[str, str] = {}
-    for part in (raw_connection_string or "").split(";"):
-        token = part.strip()
-        if not token or "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        entries[key.strip().lower()] = value.strip()
+    entries = _connection_string_entries(raw_connection_string)
 
     server = entries.get("server") or entries.get("data source") or entries.get("addr") or entries.get("address")
     database = entries.get("database") or entries.get("initial catalog")
@@ -283,11 +372,22 @@ def _normalize_sqlserver_odbc_connection_string(
     return ";".join(parts)
 
 
+def _connection_string_entries(raw_connection_string: str) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for part in (raw_connection_string or "").split(";"):
+        token = part.strip()
+        if not token or "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        entries[key.strip().lower()] = value.strip()
+    return entries
+
+
 def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[str, Any] | None:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE
+            SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE
             FROM INFORMATION_SCHEMA.COLUMNS c
             WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
             ORDER BY c.ORDINAL_POSITION
@@ -295,17 +395,20 @@ def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[
             schema_name,
             table_name,
         )
+        rows = cursor.fetchall()
+        if not rows:
+            return None
+
+        canonical_schema_name = str(rows[0][0] or schema_name).strip() or schema_name
+        canonical_table_name = str(rows[0][1] or table_name).strip() or table_name
         columns = [
             {
-                "name": str(row[0]),
-                "data_type": str(row[1]).lower() if row[1] is not None else "",
-                "is_nullable": str(row[2]).upper() == "YES",
+                "name": str(row[2]),
+                "data_type": str(row[3]).lower() if row[3] is not None else "",
+                "is_nullable": str(row[4]).upper() == "YES",
             }
-            for row in cursor.fetchall()
+            for row in rows
         ]
-
-        if not columns:
-            return None
 
         cursor.execute(
             """
@@ -320,8 +423,8 @@ def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[
               AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
             ORDER BY kcu.ORDINAL_POSITION
             """,
-            schema_name,
-            table_name,
+            canonical_schema_name,
+            canonical_table_name,
         )
         primary_key = [str(row[0]) for row in cursor.fetchall()]
 
@@ -348,8 +451,8 @@ def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[
             WHERE s_parent.name = ?
               AND t_parent.name = ?
             """,
-            schema_name,
-            table_name,
+            canonical_schema_name,
+            canonical_table_name,
         )
         foreign_keys = [
             {
@@ -362,9 +465,9 @@ def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[
         ]
 
     return {
-        "schema": schema_name,
-        "name": table_name,
-        "full_name": f"[{schema_name}].[{table_name}]",
+        "schema": canonical_schema_name,
+        "name": canonical_table_name,
+        "full_name": f"[{canonical_schema_name}].[{canonical_table_name}]",
         "columns": columns,
         "primary_key": primary_key,
         "foreign_keys": foreign_keys,

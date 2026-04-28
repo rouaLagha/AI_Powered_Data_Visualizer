@@ -9,13 +9,13 @@
   "visible_windows": [
     "pid=24060 class=TMainWindow title=Tableau Public - converted_report",
     "pid=20164 class=Chrome_WidgetWin_1 title=Gestionnaire de mots de passe\u00a0Google - Google Chrome",
-    "pid=18876 class=Chrome_WidgetWin_1 title=gmail.com19052001@rouA - Search - Personne\u00a01 - Microsoft\u200b Edge"
+    "pid=18876 class=Chrome_WidgetWin_1 title=[redacted-browser-title]"
   ],
   "payload": {
     "config": {
       "twbx_path": "C:\\Users\\Roua\\Desktop\\Talan 2025-2026\\part2_V2\\output_verify_rpa_final\\converted_report.twbx",
       "tableau_exe": "C:\\Program Files\\Tableau\\Tableau Public 2026.1\\bin\\tabpublic.exe",
-      "email": "roualagha1@gmail.com",
+      "email": "env:TABLEAU_EMAIL",
       "password": "***",
       "workbook_name": "converted_report",
       "timeout_seconds": 180,
@@ -77,7 +77,7 @@
       "visible_windows": [
         "pid=24060 class=TMainWindow title=Tableau Public - converted_report",
         "pid=20164 class=Chrome_WidgetWin_1 title=Gestionnaire de mots de passe\u00a0Google - Google Chrome",
-        "pid=18876 class=Chrome_WidgetWin_1 title=gmail.com19052001@rouA - Search - Personne\u00a01 - Microsoft\u200b Edge"
+        "pid=18876 class=Chrome_WidgetWin_1 title=[redacted-browser-title]"
       ],
       "message": "RPA flow executed. If status is needs_manual_check, verify Tableau Public Desktop UI for MFA/CAPTCHA/login prompts or language-specific menu labels."
     }

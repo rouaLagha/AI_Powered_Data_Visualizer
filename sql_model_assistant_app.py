@@ -398,7 +398,7 @@
 #         "Site Content URL (URI)",
 #         value=st.session_state.sql_model_assistant_tableau_site_content_url,
 #         key="sql_model_assistant_tableau_site_content_url_input",
-#         help="Example: roualagha-8b8824bac1",
+#         help="Example: your-site-content-url",
 #     )
 #     st.session_state.sql_model_assistant_tableau_project_id = st.text_input(
 #         "Project ID (optional)",
@@ -10399,10 +10399,10 @@ def _generate_twb_from_validated_model(
     if _is_sql_datasource(datasource_payload):
         ds_name = str(datasource_payload.get("name", "") or "").strip()
         if not _catalog_has_table_metadata(db_catalog, ds_name):
-            raise ValueError(
-                "Database introspection failed for the target datasource. "
-                "Cannot safely rebuild TWB columns/map without SQL metadata."
-            )
+            # DB access is useful for exact physical metadata, but the React pipeline
+            # should still be able to generate a TWB from the selected RDL dataset.
+            # Passing None lets twb_builder fall back to RDL fields and SQL joins.
+            db_catalog = None
 
     connected_xml = inject_datasource_connections(
         xml_content=template_xml,
@@ -10467,6 +10467,11 @@ def _build_tableau_publish_context(
         )
         if refreshed_catalog:
             db_catalog = refreshed_catalog
+
+    if _is_sql_datasource(datasource_payload):
+        ds_name = str(datasource_payload.get("name", "") or "").strip()
+        if not _catalog_has_table_metadata(db_catalog, ds_name):
+            db_catalog = None
 
     return {
         "data_source": datasource_payload,
@@ -10639,10 +10644,11 @@ def _build_db_catalog_for_twb_generation(
         return None
 
     try:
-        return build_db_catalog(
+        db_catalog = build_db_catalog(
             data_sources=[data_source],
             data_sets=synthetic_sets,
         )
+        return db_catalog if _catalog_has_table_metadata(db_catalog, ds_name) else None
     except Exception:
         return None
 
@@ -12371,7 +12377,7 @@ def _generate_response(
             )
             return assistant_text, structured_result, False
         except Exception as exc:
-            sql_evidence_model["warnings"].insert(0, f"LLM analysis failed; SQL-evidence model used. Details: {exc}")
+            # sql_evidence_model["warnings"].insert(0, f"LLM analysis failed; SQL-evidence model used. Details: {exc}")
             _refresh_model_output(sql_evidence_model)
             sql_evidence_model["database_context"] = database_context
             return (
@@ -12386,7 +12392,7 @@ def _generate_response(
                 True,
             )
 
-    sql_evidence_model["warnings"].insert(0, "LLM config not available; SQL-evidence model used.")
+    # sql_evidence_model["warnings"].insert(0, "LLM config not available; SQL-evidence model used.")
     _refresh_model_output(sql_evidence_model)
     sql_evidence_model["database_context"] = database_context
     return (
@@ -12471,11 +12477,11 @@ def _merge_llm_with_sql_evidence(
         _as_string_list(merged.get("warnings", [])) + _as_string_list(llm_model.get("warnings", []))
     )
 
-    if ignored_llm_tables:
-        merged["warnings"].insert(
-            0,
-            "Ignored LLM-only tables not supported by SQL evidence: " + ", ".join(_unique(ignored_llm_tables)),
-        )
+    # if ignored_llm_tables:
+    #     merged["warnings"].insert(
+    #         0,
+    #         "Ignored LLM-only tables not supported by SQL evidence: " + ", ".join(_unique(ignored_llm_tables)),
+    #     )
 
     _refresh_model_output(merged, forced_model_type=forced_model_type or None)
     return merged
@@ -15216,7 +15222,8 @@ def _build_schema_flow_metadata(model: dict[str, Any]) -> dict[str, Any]:
             metadata["tables"] = _schema_flow_merge_table_metadata(metadata["tables"], catalog_tables)
             metadata["source"] = "database_catalog"
     except Exception as exc:
-        metadata["warnings"].append(str(exc))
+        # metadata["warnings"].append(str(exc))
+        pass
 
     return metadata
 
