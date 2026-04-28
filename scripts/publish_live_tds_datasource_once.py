@@ -13,6 +13,9 @@ if str(ROOT_DIR) not in sys.path:
 
 from sql_model_assistant_app import (  # noqa: E402
     _build_live_datasource_tds_for_publish,
+    _load_tableau_publish_defaults,
+    _preferred_sql_assistant_llm_config_path,
+    _tableau_resolve_generated_source_content_path,
     _tableau_resolve_project_id,
     _tableau_timestamped_name,
 )
@@ -24,14 +27,12 @@ ARTIFACT_DIR = ROOT_DIR / "output" / "tableau_publish_artifacts"
 REPORT_PATH = ROOT_DIR / "output" / "tableau_live_tds_datasource_publish_report.json"
 
 
-def _load_tableau_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
-    payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    tableau_cfg = payload.get("tableau_cloud")
-    if not isinstance(tableau_cfg, dict):
-        raise ValueError("Missing tableau_cloud config.")
-    return tableau_cfg
+def _load_tableau_config() -> tuple[dict[str, Any], Path]:
+    config_path = CONFIG_PATH if CONFIG_PATH.exists() else _preferred_sql_assistant_llm_config_path()
+    cfg = _load_tableau_publish_defaults(str(config_path))
+    if not cfg:
+        raise ValueError(f"No Tableau Cloud config found in {config_path}")
+    return cfg, config_path
 
 
 def _write_report(report: dict[str, Any]) -> None:
@@ -44,12 +45,16 @@ def main() -> int:
     if not SOURCE_TWB_PATH.exists():
         raise FileNotFoundError(f"TWB file not found: {SOURCE_TWB_PATH}")
 
-    cfg = _load_tableau_config()
+    cfg, config_path = _load_tableau_config()
+    source_twb_path = _tableau_resolve_generated_source_content_path(
+        SOURCE_TWB_PATH,
+        "generated_source_twb",
+    )
     timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     datasource_name = _tableau_timestamped_name("validated_semantic_model_live", timestamp_utc)
 
     tds_path, selected_datasource_name = _build_live_datasource_tds_for_publish(
-        source_twb_path=SOURCE_TWB_PATH,
+        source_twb_path=source_twb_path,
         output_dir=ARTIFACT_DIR,
         datasource_name=datasource_name,
         source_datasource_name=str(cfg.get("source_datasource_name") or ""),
@@ -57,7 +62,9 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "attempt": "publish_live_tds_datasource",
-        "source_twb_path": str(SOURCE_TWB_PATH),
+        "requested_source_twb_path": str(SOURCE_TWB_PATH),
+        "source_twb_path": str(source_twb_path),
+        "config_path": str(config_path),
         "tds_path": str(tds_path),
         "selected_datasource_name": selected_datasource_name,
         "datasource_name": datasource_name,
@@ -71,11 +78,19 @@ def main() -> int:
     try:
         import tableauserverclient as TSC
 
-        auth = TSC.TableauAuth(
-            username=str(cfg.get("username", "")),
-            password=str(cfg.get("password", "")),
-            site_id=str(cfg.get("site_content_url", "")),
-        )
+        auth_method = str(cfg.get("auth_method") or "username_password").strip().lower()
+        if auth_method == "pat":
+            auth = TSC.PersonalAccessTokenAuth(
+                token_name=str(cfg.get("pat_name", "")),
+                personal_access_token=str(cfg.get("pat_secret", "")),
+                site_id=str(cfg.get("site_content_url", "")),
+            )
+        else:
+            auth = TSC.TableauAuth(
+                username=str(cfg.get("username", "")),
+                password=str(cfg.get("password", "")),
+                site_id=str(cfg.get("site_content_url", "")),
+            )
         server = TSC.Server(str(cfg.get("server_url", "")), use_server_version=True)
         with server.auth.sign_in(auth):
             project_id = str(cfg.get("project_id", "") or "").strip() or _tableau_resolve_project_id(

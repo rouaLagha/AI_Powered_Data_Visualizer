@@ -6242,7 +6242,9 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import html
 import json
 import os
 import shutil
@@ -6261,7 +6263,8 @@ import streamlit as st
 
 from src.schema_flow_component import render_schema_flow
 from src.rdl_ai_editor.nlp_agent import load_llm_from_config
-from src.rdl_to_twb.db_introspection import build_db_catalog
+from src.rdl_to_twb.db_introspection import build_db_catalog, inspect_sqlserver_datasource_inventory
+from src.rdl_to_twb.pipeline import run_conversion
 from src.rdl_to_twb.rdl_parser import parse_rdl_file
 from src.rdl_to_twb.tableau_extract import build_hyper_extract_from_catalog
 from src.rdl_to_twb.twb_builder import inject_datasource_connections
@@ -6272,8 +6275,10 @@ SQL_ASSISTANT_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.tableau_cloud_sql_a
 DEFAULT_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.json"
 FALLBACK_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.example.json"
 OUTPUT_TEMPLATE_PATH = ROOT_DIR / "output" / "template_semantic_model.twb"
+OUTPUT_TEMPLATE_COPY_PATH = ROOT_DIR / "output" / "template_semantic_model - Copy.twb"
 DEFAULT_TEMPLATE_PATH = ROOT_DIR / "Semantic_model.twb"
 FALLBACK_TEMPLATE_PATH = Path.home() / "Desktop" / "Semantic_model.twb"
+FLUX_PIPELINE_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 SYSTEM_PROMPT = """You are SQL Model Assistant.
 You read a SQL query and the conversation history, then return the latest dimensional model.
@@ -6281,7 +6286,7 @@ Output JSON only.
 
 Return this shape:
 {
-  "assistant_response": "short explanation",
+  "assistant_response": "natural conversational reply to the user's latest message",
   "model": {
     "model_type": "Star | Snowflake | Hybrid | Unknown",
     "schema_confidence": "high | medium | low",
@@ -6331,6 +6336,11 @@ Return this shape:
 Rules:
 - Apply the latest user correction when possible.
 - Return the full current model, not only the delta.
+- Make assistant_response feel like a normal chat reply, not a machine dump.
+- When the user asks an informational question, answer it directly in assistant_response.
+- When the user asks for schema changes, summarize the change in assistant_response.
+- When datasource context is provided, use it to answer questions about the current database and available tables.
+- Do not invent physical tables outside the SQL evidence or datasource context.
 - Preserve real SQL join paths in join_condition.
 - Use fact-side column names for fact foreign keys.
 - Distinguish fact-to-dimension and dimension-to-dimension relationships.
@@ -6386,41 +6396,171 @@ TABLEAU_TRANSIENT_RETRY_DELAYS_SECONDS = (15, 45)
 TABLEAU_RECOVERY_LOOKUP_DELAYS_SECONDS = (0, 10)
 
 
-def main() -> None:
-    st.set_page_config(page_title="SQL Model Assistant", page_icon=":mag:", layout="wide")
-    st.title("SQL Model Assistant")
-    st.caption(
-        "Upload an RDL report, extract SQL, validate the schema, then update a semantic_model.twb template."
-    )
-    st.info(
-        "For the full multipage app, launch `streamlit_app.py`. "
-        "That keeps `RDL -> TWB Converter` as the main page and shows this assistant as a secondary page."
+def _inject_ui_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.15rem;
+            padding-bottom: 2rem;
+            max-width: 1480px;
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 1rem;
+        }
+        h1, h2, h3 {
+            letter-spacing: 0 !important;
+        }
+        .sqlma-hero {
+            padding: 1rem 1.15rem 1.05rem;
+            border: 1px solid rgba(120, 120, 140, 0.18);
+            border-radius: 16px;
+            background: linear-gradient(180deg, rgba(248, 250, 252, 0.96), rgba(255, 255, 255, 0.86));
+            margin-bottom: 1rem;
+        }
+        .sqlma-kicker {
+            font-size: 0.73rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #6b7280;
+            margin-bottom: 0.25rem;
+        }
+        .sqlma-hero h1 {
+            font-size: 1.72rem;
+            line-height: 1.2;
+            margin: 0 0 0.35rem 0;
+        }
+        .sqlma-hero p {
+            margin: 0;
+            color: rgba(55, 65, 81, 0.9);
+            font-size: 0.98rem;
+        }
+        .sqlma-section-label {
+            font-size: 0.8rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #6b7280;
+            margin: 0.15rem 0 0.55rem 0;
+        }
+        .sqlma-step {
+            display: flex;
+            gap: 0.55rem;
+            align-items: flex-start;
+            padding: 0.55rem 0.65rem;
+            margin: 0.35rem 0;
+            border: 1px solid rgba(120, 120, 140, 0.14);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.72);
+        }
+        .sqlma-step-state {
+            font-size: 0.72rem;
+            font-weight: 700;
+            border-radius: 999px;
+            padding: 0.18rem 0.45rem;
+            white-space: nowrap;
+            line-height: 1.2;
+        }
+        .sqlma-step-state.done {
+            background: #e8f7ee;
+            color: #166534;
+        }
+        .sqlma-step-state.pending {
+            background: #f3f4f6;
+            color: #4b5563;
+        }
+        .sqlma-step-state.error {
+            background: #fef2f2;
+            color: #b91c1c;
+        }
+        .sqlma-step-title {
+            font-weight: 600;
+            line-height: 1.2;
+        }
+        .sqlma-step-detail {
+            font-size: 0.78rem;
+            color: #6b7280;
+            margin-top: 0.14rem;
+            word-break: break-word;
+        }
+        .sqlma-callout {
+            padding: 0.75rem 0.9rem;
+            border: 1px solid rgba(120, 120, 140, 0.14);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.66);
+            margin: 0.35rem 0 0.8rem 0;
+        }
+        div[data-testid="stMetric"] {
+            background: rgba(255, 255, 255, 0.76);
+            border: 1px solid rgba(120, 120, 140, 0.14);
+            padding: 0.72rem 0.8rem;
+            border-radius: 14px;
+        }
+        div[data-testid="stExpander"] {
+            border: 1px solid rgba(120, 120, 140, 0.14);
+            border-radius: 14px;
+            overflow: hidden;
+        }
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 10px;
+            font-weight: 600;
+        }
+        div[data-testid="stChatMessage"] {
+            padding-top: 0.25rem;
+            padding-bottom: 0.25rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
+
+def _render_page_header() -> None:
+    st.markdown(
+        """
+        <div class="sqlma-hero">
+          <div class="sqlma-kicker">SQL Model Assistant</div>
+          <h1>Chat with your schema</h1>
+          <p>Ask questions, review relationships, and move from RDL to a publishable workbook without the clutter.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="SQL Model Assistant", page_icon=":mag:", layout="wide")
+    _inject_ui_styles()
+    _render_page_header()
+
     _init_state()
+    parallel_flux_state = _poll_parallel_fluxes()
 
     with st.sidebar:
         _render_pipeline_status_sidebar()
-        st.markdown("---")
-        st.subheader("Settings")
-        st.session_state.sql_model_assistant_llm_config = st.text_input(
-            "LLM config path",
-            value=st.session_state.sql_model_assistant_llm_config,
-        )
+        with st.expander("Workspace", expanded=False):
+            st.session_state.sql_model_assistant_llm_config = st.text_input(
+                "LLM config path",
+                value=st.session_state.sql_model_assistant_llm_config,
+            )
         _sync_tableau_settings_from_config_if_needed()
-        st.caption("Uses the existing LLM config if available, otherwise falls back to local heuristics.")
-        _render_tableau_publish_settings()
-        if st.button("Reset Conversation"):
+        with st.expander("Publish settings", expanded=False):
+            _render_tableau_publish_settings()
+        if st.button("Reset chat", use_container_width=True):
             _reset_state()
             st.rerun()
 
     if st.session_state.sql_model_assistant_sql_query:
-        with st.expander("Current SQL Query", expanded=False):
+        with st.expander("SQL preview", expanded=False):
             st.code(st.session_state.sql_model_assistant_sql_query, language="sql")
     else:
         _render_rdl_intake()
 
     _render_chat_transcript()
+    _render_parallel_flux_progress(parallel_flux_state)
+    _render_flux1_results()
 
     if st.session_state.sql_model_assistant_sql_query:
         latest_model = _latest_assistant_model()
@@ -6428,14 +6568,21 @@ def main() -> None:
             _render_validation_and_twb_tools(latest_model)
 
         follow_up = st.chat_input(
-            "Send a correction, for example: Customer to Sales should be one-to-many."
+            "Ask about the model or request a schema change..."
         )
         if follow_up:
             _handle_follow_up(follow_up.strip())
             st.rerun()
 
+    _render_consumer_workbook_results()
+
+    if parallel_flux_state.get("flux2_pending", False):
+        time.sleep(0.75)
+        st.rerun()
+
 
 def _init_state() -> None:
+    st.session_state.setdefault("sql_model_assistant_rdl_payload", b"")
     st.session_state.setdefault("sql_model_assistant_pending_sql", "")
     st.session_state.setdefault("sql_model_assistant_sql_query", "")
     st.session_state.setdefault("sql_model_assistant_messages", [])
@@ -6447,6 +6594,13 @@ def _init_state() -> None:
     st.session_state.setdefault("sql_model_assistant_validated_model", {})
     st.session_state.setdefault("sql_model_assistant_generated_twb", "")
     st.session_state.setdefault("sql_model_assistant_generated_twb_name", "validated_semantic_model.twb")
+    st.session_state.setdefault("sql_model_assistant_flux1_visual_workbook_path", "")
+    st.session_state.setdefault("sql_model_assistant_flux1_output_dir", "")
+    st.session_state.setdefault("sql_model_assistant_flux1_error", "")
+    st.session_state.setdefault("sql_model_assistant_consumer_workbook_path", "")
+    st.session_state.setdefault("sql_model_assistant_parallel_flux1_future", None)
+    st.session_state.setdefault("sql_model_assistant_parallel_flux2_future", None)
+    st.session_state.setdefault("sql_model_assistant_parallel_query", "")
     preferred_template_path = _template_default_path()
     st.session_state.setdefault("sql_model_assistant_template_path", preferred_template_path)
     current_template_path = str(st.session_state.sql_model_assistant_template_path or "").strip()
@@ -6524,13 +6678,17 @@ def _init_state() -> None:
         "sql_model_assistant_tableau_loaded_config_path",
         "",
     )
+    st.session_state.setdefault("sql_model_assistant_tableau_visual_source_twb_path_pending_sync", False)
     st.session_state.setdefault("sql_model_assistant_tableau_last_publish_report", {})
     st.session_state.setdefault("sql_model_assistant_tableau_last_publish_error", "")
     st.session_state.setdefault("sql_model_assistant_tableau_publish_context", {})
     st.session_state.setdefault("sql_model_assistant_schema_flow_catalog_cache", {})
+    st.session_state.setdefault("sql_model_assistant_database_inventory_cache", {})
 
 
 def _reset_state() -> None:
+    _clear_parallel_flux_state(cancel_running=True)
+    st.session_state.sql_model_assistant_rdl_payload = b""
     st.session_state.sql_model_assistant_pending_sql = ""
     st.session_state.sql_model_assistant_sql_query = ""
     st.session_state.sql_model_assistant_messages = []
@@ -6538,6 +6696,11 @@ def _reset_state() -> None:
     st.session_state.sql_model_assistant_rdl_filename = ""
     st.session_state.sql_model_assistant_selected_dataset_name = ""
     st.session_state.sql_model_assistant_selected_datasource_name = ""
+    st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+    st.session_state.sql_model_assistant_flux1_output_dir = ""
+    st.session_state.sql_model_assistant_flux1_error = ""
+    st.session_state.sql_model_assistant_consumer_workbook_path = ""
+    st.session_state.sql_model_assistant_tableau_visual_source_twb_path_pending_sync = False
     st.session_state.sql_model_assistant_template_path = _template_default_path()
     _clear_validation_outputs()
 
@@ -6547,52 +6710,170 @@ def _clear_validation_outputs() -> None:
     st.session_state.sql_model_assistant_validated_model = {}
     st.session_state.sql_model_assistant_generated_twb = ""
     st.session_state.sql_model_assistant_generated_twb_name = "validated_semantic_model.twb"
+    st.session_state.sql_model_assistant_consumer_workbook_path = ""
     st.session_state.sql_model_assistant_tableau_last_publish_report = {}
     st.session_state.sql_model_assistant_tableau_last_publish_error = ""
     st.session_state.sql_model_assistant_tableau_publish_context = {}
+    st.session_state.sql_model_assistant_database_inventory_cache = {}
+
+
+def _get_parallel_flux_future(session_key: str) -> Any:
+    candidate = st.session_state.get(session_key)
+    if candidate is None:
+        return None
+    if not callable(getattr(candidate, "done", None)):
+        return None
+    if not callable(getattr(candidate, "result", None)):
+        return None
+    return candidate
+
+
+def _clear_parallel_flux_state(cancel_running: bool = False) -> None:
+    for session_key in [
+        "sql_model_assistant_parallel_flux1_future",
+        "sql_model_assistant_parallel_flux2_future",
+    ]:
+        future = _get_parallel_flux_future(session_key)
+        if cancel_running and future is not None and not future.done():
+            future.cancel()
+        st.session_state[session_key] = None
+    st.session_state.sql_model_assistant_parallel_query = ""
+
+
+def _current_parallel_flux_state() -> dict[str, bool]:
+    flux1_pending = _get_parallel_flux_future("sql_model_assistant_parallel_flux1_future") is not None
+    flux2_pending = _get_parallel_flux_future("sql_model_assistant_parallel_flux2_future") is not None
+    return {
+        "active": flux1_pending or flux2_pending,
+        "flux1_pending": flux1_pending,
+        "flux2_pending": flux2_pending,
+    }
+
+
+def _poll_parallel_fluxes() -> dict[str, bool]:
+    state = _current_parallel_flux_state()
+    if not state["active"]:
+        return state
+
+    query = str(
+        st.session_state.get("sql_model_assistant_parallel_query", "")
+        or st.session_state.get("sql_model_assistant_sql_query", "")
+        or ""
+    ).strip()
+    initial_conversation = _seed_initial_sql_model_conversation()
+
+    flux2_future = _get_parallel_flux_future("sql_model_assistant_parallel_flux2_future")
+    if flux2_future is not None and flux2_future.done():
+        try:
+            assistant_text, structured_result, used_fallback = flux2_future.result()
+        except Exception as exc:
+            assistant_text = f"Flux 2 failed: {exc}"
+            structured_result = {}
+            used_fallback = False
+        display_mode = _assistant_display_mode(initial_conversation, structured_result)
+
+        _clear_validation_outputs()
+        st.session_state.sql_model_assistant_sql_query = query
+        st.session_state.sql_model_assistant_messages = initial_conversation + [
+            {
+                "role": "assistant",
+                "content": assistant_text,
+                "structured_result": structured_result,
+                "used_fallback": used_fallback,
+                "display_mode": display_mode,
+            }
+        ]
+        st.session_state.sql_model_assistant_parallel_flux2_future = None
+
+    flux1_future = _get_parallel_flux_future("sql_model_assistant_parallel_flux1_future")
+    if flux1_future is not None and flux1_future.done():
+        flux1_result: dict[str, str] | None = None
+        flux1_error = ""
+        try:
+            flux1_result = flux1_future.result()
+        except Exception as exc:
+            flux1_error = str(exc)
+
+        st.session_state.sql_model_assistant_flux1_error = flux1_error
+        if flux1_result is not None:
+            visual_workbook_path = str(flux1_result.get("visual_workbook_path", "") or "").strip()
+            output_dir = str(flux1_result.get("output_dir", "") or "").strip()
+            st.session_state.sql_model_assistant_flux1_visual_workbook_path = visual_workbook_path
+            st.session_state.sql_model_assistant_flux1_output_dir = output_dir
+            if visual_workbook_path:
+                _schedule_visual_source_sidebar_sync(visual_workbook_path)
+        else:
+            st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+            st.session_state.sql_model_assistant_flux1_output_dir = ""
+
+        st.session_state.sql_model_assistant_parallel_flux1_future = None
+
+    state = _current_parallel_flux_state()
+    if not state["active"]:
+        st.session_state.sql_model_assistant_parallel_query = ""
+    return state
 
 
 def _render_pipeline_status_sidebar() -> None:
-    st.subheader("Pipeline Status")
+    st.markdown('<div class="sqlma-section-label">Run Status</div>', unsafe_allow_html=True)
 
     _datasource, dataset = _resolve_current_rdl_context()
     dataset_query = str(dataset.get("query", "") or "").strip() if isinstance(dataset, dict) else ""
     latest_model = _latest_assistant_model()
+    rdl_report = st.session_state.get("sql_model_assistant_rdl_report", {})
+    rdl_filename = str(st.session_state.get("sql_model_assistant_rdl_filename", "") or "").strip()
+    selected_dataset_name = str(st.session_state.get("sql_model_assistant_selected_dataset_name", "") or "").strip()
+    schema_validated = bool(st.session_state.get("sql_model_assistant_schema_validated", False))
+    generated_twb = str(st.session_state.get("sql_model_assistant_generated_twb", "") or "").strip()
+    generated_twb_name = str(
+        st.session_state.get("sql_model_assistant_generated_twb_name", "") or ""
+    ).strip()
     publish_report = st.session_state.get("sql_model_assistant_tableau_last_publish_report", {})
     publish_error = str(st.session_state.get("sql_model_assistant_tableau_last_publish_error", "") or "").strip()
+    flux1_path = str(st.session_state.get("sql_model_assistant_flux1_visual_workbook_path", "") or "").strip()
+    consumer_path = str(st.session_state.get("sql_model_assistant_consumer_workbook_path", "") or "").strip()
+    flux1_error = str(st.session_state.get("sql_model_assistant_flux1_error", "") or "").strip()
 
     steps = [
         {
             "title": "RDL loaded",
-            "state": "done" if isinstance(st.session_state.sql_model_assistant_rdl_report, dict)
-            and bool(st.session_state.sql_model_assistant_rdl_report) else "pending",
-            "detail": str(st.session_state.sql_model_assistant_rdl_filename or ""),
+            "state": "done" if isinstance(rdl_report, dict) and bool(rdl_report) else "pending",
+            "detail": rdl_filename,
         },
         {
-            "title": "SQL selected",
-            "state": "done" if bool(dataset_query or st.session_state.sql_model_assistant_sql_query) else "pending",
-            "detail": str(st.session_state.sql_model_assistant_selected_dataset_name or ""),
+            "title": "Flux 1 visual workbook",
+            "state": "error" if flux1_error else "done" if flux1_path else "pending",
+            "detail": flux1_path or flux1_error,
         },
         {
-            "title": "Model generated",
+            "title": "Flux 2 SQL selected",
+            "state": "done" if bool(dataset_query or st.session_state.get("sql_model_assistant_sql_query", "")) else "pending",
+            "detail": selected_dataset_name,
+        },
+        {
+            "title": "Flux 2 schema proposed",
             "state": "done" if bool(latest_model) else "pending",
             "detail": str(latest_model.get("model_type", "")) if latest_model else "",
         },
         {
-            "title": "Schema validated",
-            "state": "done" if bool(st.session_state.sql_model_assistant_schema_validated) else "pending",
-            "detail": "Locked for template update" if st.session_state.sql_model_assistant_schema_validated else "",
+            "title": "Flux 2 schema validated",
+            "state": "done" if schema_validated else "pending",
+            "detail": "Locked for template update" if schema_validated else "",
         },
         {
-            "title": "TWB generated",
-            "state": "done" if bool(st.session_state.sql_model_assistant_generated_twb) else "pending",
-            "detail": str(st.session_state.sql_model_assistant_generated_twb_name or "")
-            if st.session_state.sql_model_assistant_generated_twb else "",
+            "title": "Flux 2 semantic workbook",
+            "state": "done" if bool(generated_twb) else "pending",
+            "detail": generated_twb_name if generated_twb else "",
         },
         {
-            "title": "Tableau publish",
+            "title": "Datasource published",
             "state": "error" if publish_error else "done" if isinstance(publish_report, dict) and bool(publish_report) else "pending",
             "detail": _pipeline_publish_detail(publish_report, publish_error),
+        },
+        {
+            "title": "Consumer workbook fused",
+            "state": "done" if consumer_path else "pending",
+            "detail": consumer_path,
         },
     ]
 
@@ -6616,32 +6897,133 @@ def _pipeline_publish_detail(publish_report: Any, publish_error: str) -> str:
 
 def _render_pipeline_step(title: str, state: str, detail: str = "") -> None:
     label = "Done" if state == "done" else "Error" if state == "error" else "Pending"
-    st.markdown(f"`{label}` {title}")
-    if detail:
-        st.caption(detail)
+    detail_html = (
+        f"<div class='sqlma-step-detail'>{html.escape(str(detail or ''))}</div>"
+        if detail
+        else ""
+    )
+    st.markdown(
+        (
+            "<div class='sqlma-step'>"
+            f"<span class='sqlma-step-state {state}'>{html.escape(label)}</span>"
+            "<div>"
+            f"<div class='sqlma-step-title'>{html.escape(title)}</div>"
+            f"{detail_html}"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _render_chat_transcript() -> None:
-    st.markdown("### Conversation")
+    st.markdown('<div class="sqlma-section-label">Conversation</div>', unsafe_allow_html=True)
 
-    if not st.session_state.sql_model_assistant_messages:
+    messages = st.session_state.get("sql_model_assistant_messages", [])
+    rdl_report = st.session_state.get("sql_model_assistant_rdl_report", {})
+    if not messages:
         with st.chat_message("assistant"):
-            if st.session_state.sql_model_assistant_rdl_report:
-                st.write("Select a dataset, analyze the extracted SQL, then send corrections here.")
+            if rdl_report:
+                st.write(
+                    "Run Flux 1 + Flux 2, then ask about tables, relationships, or the current model."
+                )
             else:
-                st.write("Upload an RDL report, extract its SQL, then I will build the schema and update it from your corrections.")
+                st.write(
+                    "Upload an RDL report to get started."
+                )
         return
 
-    for message_index, message in enumerate(st.session_state.sql_model_assistant_messages):
+    for message_index, message in enumerate(messages):
         with st.chat_message(message["role"]):
             st.write(message["content"])
             if message["role"] == "assistant":
                 if message.get("used_fallback"):
                     st.caption("SQL-evidence mode used for this response.")
-                _render_structured_result(
-                    message.get("structured_result", {}),
-                    render_key_suffix=f"message_{message_index}",
-                )
+                structured_result = message.get("structured_result", {})
+                display_mode = str(message.get("display_mode", "model") or "model").strip().lower()
+                if isinstance(structured_result, dict) and structured_result:
+                    if display_mode == "model":
+                        _render_structured_result(
+                            structured_result,
+                            render_key_suffix=f"message_{message_index}",
+                        )
+                    else:
+                        with st.expander("Show current schema model", expanded=False):
+                            _render_structured_result(
+                                structured_result,
+                                render_key_suffix=f"message_{message_index}",
+                            )
+
+
+def _render_parallel_flux_progress(parallel_flux_state: dict[str, bool]) -> None:
+    if not parallel_flux_state.get("active", False):
+        return
+
+    st.markdown('<div class="sqlma-section-label">Parallel Run</div>', unsafe_allow_html=True)
+    flux1_pending = bool(parallel_flux_state.get("flux1_pending", False))
+    flux2_pending = bool(parallel_flux_state.get("flux2_pending", False))
+
+    if flux1_pending and flux2_pending:
+        st.caption("Flux 1 and Flux 2 started together. Flux 2 will appear first when it finishes.")
+        return
+
+    if flux1_pending and not flux2_pending:
+        st.caption("Flux 2 is ready. Flux 1 is still running in the background.")
+        st.button("Refresh Flux 1 Status", key="refresh_flux1_status", use_container_width=True)
+        return
+
+    if flux2_pending and not flux1_pending:
+        st.caption("Flux 1 is ready. Flux 2 is still analyzing the model.")
+
+
+def _render_flux1_results() -> None:
+    flux1_path_value = str(st.session_state.get("sql_model_assistant_flux1_visual_workbook_path", "") or "").strip()
+    flux1_error = str(st.session_state.get("sql_model_assistant_flux1_error", "") or "").strip()
+    if not flux1_path_value and not flux1_error:
+        return
+
+    st.markdown('<div class="sqlma-section-label">Flux 1 Output</div>', unsafe_allow_html=True)
+    if flux1_error:
+        st.error(f"Flux 1 failed: {flux1_error}")
+        return
+
+    flux1_path = Path(flux1_path_value)
+    st.success("Visual workbook ready.")
+    st.caption(str(flux1_path))
+    if flux1_path.exists():
+        st.download_button(
+            "Download visual workbook",
+            data=flux1_path.read_bytes(),
+            file_name=flux1_path.name,
+            mime="application/xml",
+            key="download_flux1_visual_workbook",
+            use_container_width=True,
+        )
+
+
+def _render_consumer_workbook_results() -> None:
+    consumer_path_value = str(st.session_state.get("sql_model_assistant_consumer_workbook_path", "") or "").strip()
+    if not consumer_path_value:
+        return
+
+    consumer_path = Path(consumer_path_value)
+    st.markdown('<div class="sqlma-section-label">Final Workbook</div>', unsafe_allow_html=True)
+    st.success("Consumer workbook ready.")
+    st.caption(str(consumer_path))
+    if consumer_path.exists():
+        st.download_button(
+            "Download final workbook",
+            data=consumer_path.read_bytes(),
+            file_name=consumer_path.name,
+            mime="application/xml",
+            key="download_final_consumer_workbook",
+            use_container_width=True,
+        )
+
+
+def _schedule_visual_source_sidebar_sync(path_value: str) -> None:
+    st.session_state.sql_model_assistant_tableau_visual_source_twb_path = str(path_value or "").strip()
+    st.session_state.sql_model_assistant_tableau_visual_source_twb_path_pending_sync = True
 
 
 def _start_conversation(sql_query: str) -> None:
@@ -6674,12 +7056,13 @@ def _append_assistant_response() -> None:
     conversation = st.session_state.sql_model_assistant_messages
     llm_config_path = st.session_state.sql_model_assistant_llm_config
 
-    with st.spinner("Building dimensional model..."):
+    with st.spinner("Thinking..."):
         assistant_text, structured_result, used_fallback = _generate_response(
             sql_query=sql_query,
             conversation=conversation,
             llm_config_path=llm_config_path,
         )
+    display_mode = _assistant_display_mode(conversation, structured_result)
 
     st.session_state.sql_model_assistant_messages.append(
         {
@@ -6687,7 +7070,136 @@ def _append_assistant_response() -> None:
             "content": assistant_text,
             "structured_result": structured_result,
             "used_fallback": used_fallback,
+            "display_mode": display_mode,
         }
+    )
+
+
+def _seed_initial_sql_model_conversation() -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": "Analyze this SQL query and produce the current dimensional model.",
+        }
+    ]
+
+
+def _resolve_existing_sql_assistant_llm_config_path(llm_config_path: str) -> Path:
+    candidates: list[Path] = []
+    raw_value = str(llm_config_path or "").strip()
+    if raw_value:
+        raw_path = Path(raw_value).expanduser()
+        candidates.append(raw_path)
+        if not raw_path.is_absolute():
+            candidates.append(ROOT_DIR / raw_path)
+    candidates.extend([SQL_ASSISTANT_LLM_CONFIG, DEFAULT_LLM_CONFIG, FALLBACK_LLM_CONFIG])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "No usable LLM config file was found for SQL Model Assistant or visual migration."
+    )
+
+
+def _flux1_output_dir_for_rdl(file_name: str) -> Path:
+    report_stem = Path(str(file_name or "uploaded_report.rdl")).stem or "uploaded_report"
+    safe_report_name = _tableau_safe_name(report_stem)
+    return ROOT_DIR / "output" / "sql_model_assistant_flux1" / safe_report_name
+
+
+def _run_flux1_visual_migration(
+    rdl_payload: bytes,
+    file_name: str,
+    llm_config_path: str,
+) -> dict[str, str]:
+    if not rdl_payload:
+        raise ValueError("RDL payload is missing for Flux 1 visual migration.")
+
+    suffix = Path(str(file_name or "uploaded_report.rdl")).suffix or ".rdl"
+    output_dir = _flux1_output_dir_for_rdl(file_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp_rdl_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            handle.write(rdl_payload)
+            temp_rdl_path = Path(handle.name)
+
+        result = run_conversion(
+            rdl_path=temp_rdl_path,
+            rdl_xsd_path=ROOT_DIR / "ReportDefinition.xsd",
+            twb_xsd_path=ROOT_DIR / "twb_2026.1.0.xsd",
+            output_dir=output_dir,
+            config_path=_resolve_existing_sql_assistant_llm_config_path(llm_config_path),
+            publish_enabled=False,
+        )
+    finally:
+        if temp_rdl_path is not None and temp_rdl_path.exists():
+            temp_rdl_path.unlink(missing_ok=True)
+
+    visual_workbook_path = str(result.get("twb") or "").strip()
+    if not visual_workbook_path:
+        raise RuntimeError("Flux 1 completed without producing a visual workbook.")
+
+    return {
+        "visual_workbook_path": visual_workbook_path,
+        "output_dir": str(output_dir),
+    }
+
+
+def _run_flux2_schema_analysis(
+    sql_query: str,
+    llm_config_path: str,
+    database_context: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any], bool]:
+    return _generate_response(
+        sql_query=sql_query,
+        conversation=_seed_initial_sql_model_conversation(),
+        llm_config_path=llm_config_path,
+        database_context=database_context,
+    )
+
+
+def _run_parallel_fluxes_for_current_selection(query: str) -> None:
+    rdl_payload = st.session_state.get("sql_model_assistant_rdl_payload", b"")
+    rdl_file_name = str(st.session_state.get("sql_model_assistant_rdl_filename", "") or "uploaded_report.rdl")
+    llm_config_path = str(st.session_state.get("sql_model_assistant_llm_config", "") or "")
+    database_context = _build_current_database_context()
+
+    if not isinstance(rdl_payload, (bytes, bytearray)) or not rdl_payload:
+        raise ValueError("RDL payload is not available anymore. Re-upload the report first.")
+
+    _clear_parallel_flux_state(cancel_running=True)
+    initial_conversation = _seed_initial_sql_model_conversation()
+
+    st.session_state.sql_model_assistant_sql_query = query
+    st.session_state.sql_model_assistant_pending_sql = query
+    st.session_state.sql_model_assistant_messages = initial_conversation
+    st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+    st.session_state.sql_model_assistant_flux1_output_dir = ""
+    st.session_state.sql_model_assistant_flux1_error = ""
+    st.session_state.sql_model_assistant_parallel_query = query
+    _schedule_visual_source_sidebar_sync("")
+    _clear_validation_outputs()
+
+    st.session_state.sql_model_assistant_parallel_flux1_future = FLUX_PIPELINE_EXECUTOR.submit(
+        _run_flux1_visual_migration,
+        bytes(rdl_payload),
+        rdl_file_name,
+        llm_config_path,
+    )
+    st.session_state.sql_model_assistant_parallel_flux2_future = FLUX_PIPELINE_EXECUTOR.submit(
+        _run_flux2_schema_analysis,
+        query,
+        llm_config_path,
+        database_context,
     )
 
 
@@ -6825,9 +7337,6 @@ def _preferred_sql_assistant_llm_config_path() -> Path:
 
 
 def _render_tableau_publish_settings() -> None:
-    st.markdown("---")
-    st.subheader("Tableau Cloud Publish")
-
     st.session_state.setdefault(
         "sql_model_assistant_tableau_auto_publish_input",
         bool(st.session_state.sql_model_assistant_tableau_auto_publish),
@@ -6864,55 +7373,65 @@ def _render_tableau_publish_settings() -> None:
         "sql_model_assistant_tableau_visual_source_twb_path_input",
         st.session_state.sql_model_assistant_tableau_visual_source_twb_path,
     )
+    if st.session_state.get("sql_model_assistant_tableau_visual_source_twb_path_pending_sync", False):
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input = str(
+            st.session_state.sql_model_assistant_tableau_visual_source_twb_path or ""
+        )
+        st.session_state.sql_model_assistant_tableau_visual_source_twb_path_pending_sync = False
 
     st.checkbox(
-        "Auto publish after TWB generation",
+        "Auto publish",
         key="sql_model_assistant_tableau_auto_publish_input",
     )
-    st.text_input(
-        "Server URL",
-        key="sql_model_assistant_tableau_server_url_input",
-        help="Example: https://<pod>.online.tableau.com",
-    )
-    st.text_input(
-        "Site Content URL (URI)",
-        key="sql_model_assistant_tableau_site_content_url_input",
-        help="Example: roualagha-8b8824bac1",
-    )
-    st.text_input(
-        "Project Name",
-        key="sql_model_assistant_tableau_project_name_input",
-    )
-    st.text_input(
-        "Username",
-        key="sql_model_assistant_tableau_username_input",
-    )
+    server_col, site_col = st.columns(2)
+    with server_col:
+        st.text_input(
+            "Server URL",
+            key="sql_model_assistant_tableau_server_url_input",
+            placeholder="https://<pod>.online.tableau.com",
+        )
+    with site_col:
+        st.text_input(
+            "Site URI",
+            key="sql_model_assistant_tableau_site_content_url_input",
+            placeholder="site-content-url",
+        )
+
+    project_col, user_col = st.columns(2)
+    with project_col:
+        st.text_input(
+            "Project",
+            key="sql_model_assistant_tableau_project_name_input",
+        )
+    with user_col:
+        st.text_input(
+            "Username",
+            key="sql_model_assistant_tableau_username_input",
+        )
+
     st.text_input(
         "Password",
         type="password",
         key="sql_model_assistant_tableau_password_input",
     )
-    st.text_input(
-        "Source Datasource Name (optional)",
-        key="sql_model_assistant_tableau_source_ds_name_input",
-        help="If empty, the first non-Parameters datasource in the generated TWB is used.",
+
+    show_optional_fields = st.checkbox(
+        "Show optional fields",
+        key="sql_model_assistant_tableau_show_optional_publish_fields",
     )
-    st.text_input(
-        "Empty Workbook Template Path (.twb, optional)",
-        key="sql_model_assistant_tableau_empty_workbook_template_path_input",
-        help=(
-            "Legacy option kept for backward compatibility. "
-            "The linked workbook now keeps converted report visuals, so this template is ignored."
-        ),
-    )
-    st.text_input(
-        "Visual Source TWB Path (.twb, optional)",
-        key="sql_model_assistant_tableau_visual_source_twb_path_input",
-        help=(
-            "Optional TWB used as visual source (worksheets/dashboards/windows). "
-            "Datasource connection is kept from the linked workbook."
-        ),
-    )
+    if show_optional_fields:
+        st.text_input(
+            "Source datasource name",
+            key="sql_model_assistant_tableau_source_ds_name_input",
+        )
+        st.text_input(
+            "Template path (.twb)",
+            key="sql_model_assistant_tableau_empty_workbook_template_path_input",
+        )
+        st.text_input(
+            "Visual source TWB path (.twb)",
+            key="sql_model_assistant_tableau_visual_source_twb_path_input",
+        )
 
     st.session_state.sql_model_assistant_tableau_auto_publish = bool(
         st.session_state.sql_model_assistant_tableau_auto_publish_input
@@ -7002,8 +7521,33 @@ def _sync_tableau_settings_from_config_if_needed() -> None:
     st.session_state.sql_model_assistant_tableau_loaded_config_path = current_config_path
 
 
-def _load_tableau_publish_defaults(config_path: str) -> dict[str, str]:
-    defaults: dict[str, str] = {}
+def _tableau_normalize_datasource_publish_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    if normalized in {"tds", "live", "live_tds", "live_datasource", "live_datasource_tds"}:
+        return "live_tds"
+    if normalized in {"tdsx", "extract", "hyper", "hyper_extract", "extract_tdsx", "tdsx_extract"}:
+        return "extract"
+    return ""
+
+
+def _tableau_datasource_publish_mode_from_config(tableau_cfg: dict[str, Any]) -> str:
+    for key in [
+        "datasource_publish_mode",
+        "datasource_publish_format",
+        "publish_datasource_mode",
+        "publish_datasource_format",
+    ]:
+        mode = _tableau_normalize_datasource_publish_mode(tableau_cfg.get(key))
+        if mode:
+            return mode
+    return "extract" if bool(tableau_cfg.get("build_hyper_extract", False)) else "live_tds"
+
+
+def _load_tableau_publish_defaults(config_path: str) -> dict[str, Any]:
+    defaults: dict[str, Any] = {}
     raw_path = Path(str(config_path or "")).expanduser()
     candidates = [raw_path]
     if not raw_path.is_absolute():
@@ -7047,6 +7591,20 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, str]:
         if isinstance(value, str) and value.strip():
             defaults[key] = value.strip()
 
+    datasource_publish_mode = _tableau_datasource_publish_mode_from_config(tableau_cfg)
+    defaults["datasource_publish_mode"] = datasource_publish_mode
+    defaults["build_hyper_extract"] = datasource_publish_mode == "extract"
+    try:
+        defaults["hyper_max_rows_per_table"] = int(tableau_cfg.get("hyper_max_rows_per_table") or 0)
+    except (TypeError, ValueError):
+        defaults["hyper_max_rows_per_table"] = 0
+
+    raw_auth_method = str(tableau_cfg.get("auth_method") or tableau_cfg.get("auth_type") or "").strip().lower()
+    if raw_auth_method in {"pat", "personal_access_token", "personalaccesstoken"}:
+        defaults["auth_method"] = "pat"
+    elif raw_auth_method in {"username_password", "usernamepassword", "password"}:
+        defaults["auth_method"] = "username_password"
+
     username = _resolve_config_secret(tableau_cfg.get("username"), fallback_env="TABLEAU_USERNAME")
     if username:
         defaults["username"] = username
@@ -7054,6 +7612,14 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, str]:
     password = _resolve_config_secret(tableau_cfg.get("password"), fallback_env="TABLEAU_PASSWORD")
     if password:
         defaults["password"] = password
+
+    pat_name = _resolve_config_secret(tableau_cfg.get("pat_name"), fallback_env="TABLEAU_PAT_NAME")
+    if pat_name:
+        defaults["pat_name"] = pat_name
+
+    pat_secret = _resolve_config_secret(tableau_cfg.get("pat_secret"), fallback_env="TABLEAU_PAT_SECRET")
+    if pat_secret:
+        defaults["pat_secret"] = pat_secret
 
     return defaults
 
@@ -7079,7 +7645,7 @@ def _resolve_config_secret(value: object, fallback_env: str) -> str | None:
 
 
 def _render_rdl_intake() -> None:
-    st.markdown("### First Step")
+    st.markdown('<div class="sqlma-section-label">Source Report</div>', unsafe_allow_html=True)
     uploaded_rdl = st.file_uploader(
         "Upload report (.rdl)",
         type=["rdl"],
@@ -7088,7 +7654,7 @@ def _render_rdl_intake() -> None:
 
     action_col, clear_col = st.columns(2)
     with action_col:
-        if st.button("Extract SQL from RDL", type="primary", key="extract_sql_from_rdl"):
+        if st.button("Load RDL", type="primary", key="extract_sql_from_rdl", use_container_width=True):
             if uploaded_rdl is None:
                 st.warning("Please upload an RDL file first.")
             else:
@@ -7097,6 +7663,10 @@ def _render_rdl_intake() -> None:
                 except Exception as exc:
                     st.error(f"Failed to parse RDL: {exc}")
                 else:
+                    _clear_parallel_flux_state(cancel_running=True)
+                    st.session_state.sql_model_assistant_rdl_payload = uploaded_rdl.getvalue()
+                    st.session_state.sql_model_assistant_sql_query = ""
+                    st.session_state.sql_model_assistant_messages = []
                     st.session_state.sql_model_assistant_rdl_report = report
                     st.session_state.sql_model_assistant_rdl_filename = str(
                         getattr(uploaded_rdl, "name", "uploaded_report.rdl")
@@ -7108,22 +7678,34 @@ def _render_rdl_intake() -> None:
                     st.session_state.sql_model_assistant_selected_datasource_name = str(
                         datasource.get("name", "") if datasource else ""
                     )
+                    st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+                    st.session_state.sql_model_assistant_flux1_output_dir = ""
+                    st.session_state.sql_model_assistant_flux1_error = ""
+                    _schedule_visual_source_sidebar_sync("")
                     _clear_validation_outputs()
                     st.rerun()
 
     with clear_col:
-        if st.button("Clear RDL Selection", key="clear_rdl_selection"):
+        if st.button("Clear", key="clear_rdl_selection", use_container_width=True):
+            _clear_parallel_flux_state(cancel_running=True)
+            st.session_state.sql_model_assistant_rdl_payload = b""
+            st.session_state.sql_model_assistant_sql_query = ""
+            st.session_state.sql_model_assistant_messages = []
             st.session_state.sql_model_assistant_rdl_report = {}
             st.session_state.sql_model_assistant_rdl_filename = ""
             st.session_state.sql_model_assistant_selected_dataset_name = ""
             st.session_state.sql_model_assistant_selected_datasource_name = ""
+            st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+            st.session_state.sql_model_assistant_flux1_output_dir = ""
+            st.session_state.sql_model_assistant_flux1_error = ""
+            _schedule_visual_source_sidebar_sync("")
             st.session_state.sql_model_assistant_pending_sql = ""
             _clear_validation_outputs()
             st.rerun()
 
-    report = st.session_state.sql_model_assistant_rdl_report
+    report = st.session_state.get("sql_model_assistant_rdl_report", {})
     if not isinstance(report, dict) or not report:
-        st.caption("Upload an RDL file, then extract SQL from one dataset.")
+        st.caption("Upload an RDL file to begin.")
         return
 
     data_sets = report.get("data_sets", [])
@@ -7151,6 +7733,15 @@ def _render_rdl_intake() -> None:
         options=dataset_names,
         index=dataset_names.index(current_name),
     )
+    if selected_name != current_name:
+        _clear_parallel_flux_state(cancel_running=True)
+        st.session_state.sql_model_assistant_sql_query = ""
+        st.session_state.sql_model_assistant_messages = []
+        st.session_state.sql_model_assistant_flux1_visual_workbook_path = ""
+        st.session_state.sql_model_assistant_flux1_output_dir = ""
+        st.session_state.sql_model_assistant_flux1_error = ""
+        _schedule_visual_source_sidebar_sync("")
+        _clear_validation_outputs()
     st.session_state.sql_model_assistant_selected_dataset_name = selected_name
 
     dataset = _find_dataset_by_name(data_sets, selected_name)
@@ -7163,9 +7754,20 @@ def _render_rdl_intake() -> None:
         datasource.get("name", "") if datasource else ""
     )
 
+    summary_file = str(st.session_state.get("sql_model_assistant_rdl_filename", "") or "").strip() or "Uploaded report"
+    summary_source = str(datasource.get("name", "") if datasource else "").strip() or "Unknown datasource"
+    file_col, dataset_col, source_col = st.columns(3)
+    with file_col:
+        st.metric("RDL", summary_file)
+    with dataset_col:
+        st.metric("Datasets", str(len(dataset_names)))
+    with source_col:
+        st.metric("Datasource", summary_source)
+
     query = str(dataset.get("query", "") or "").strip()
     if query:
-        st.code(query, language="sql")
+        with st.expander("SQL preview", expanded=False):
+            st.code(query, language="sql")
     else:
         st.warning("The selected dataset does not contain a SQL CommandText.")
 
@@ -7183,11 +7785,15 @@ def _render_rdl_intake() -> None:
         else:
             st.caption("No datasource metadata found for this dataset.")
 
-    if st.button("Analyze Extracted SQL", type="primary", key="analyze_rdl_sql"):
+    if st.button("Run Flux 1 + Flux 2", type="primary", key="analyze_rdl_sql", use_container_width=True):
         if not query:
             st.warning("The selected dataset has no SQL query to analyze.")
             return
-        _start_conversation(query)
+        try:
+            _run_parallel_fluxes_for_current_selection(query)
+        except Exception as exc:
+            st.error(f"Failed to start the parallel pipeline: {exc}")
+            return
         st.rerun()
 
 
@@ -7265,12 +7871,12 @@ def _find_datasource_for_dataset(report: dict[str, Any], dataset: dict[str, Any]
 
 
 def _resolve_current_rdl_context() -> tuple[dict[str, Any], dict[str, Any]]:
-    report = st.session_state.sql_model_assistant_rdl_report
+    report = st.session_state.get("sql_model_assistant_rdl_report", {})
     if not isinstance(report, dict) or not report:
         return {}, {}
 
     data_sets = report.get("data_sets", [])
-    selected_name = str(st.session_state.sql_model_assistant_selected_dataset_name or "").strip()
+    selected_name = str(st.session_state.get("sql_model_assistant_selected_dataset_name", "") or "").strip()
     dataset = _find_dataset_by_name(data_sets, selected_name)
     if not dataset:
         fallback_name = _pick_default_dataset_name(data_sets)
@@ -7293,41 +7899,46 @@ def _latest_assistant_model() -> dict[str, Any]:
 
 
 def _render_validation_and_twb_tools(latest_model: dict[str, Any]) -> None:
-    st.markdown("### Validation & Template Update")
-    if st.button("Validate Schema", type="primary", key="validate_star_schema"):
+    st.markdown('<div class="sqlma-section-label">Actions</div>', unsafe_allow_html=True)
+    validate_col, status_col = st.columns([1, 2])
+    with validate_col:
+        validate_clicked = st.button("Validate schema", type="primary", key="validate_star_schema", use_container_width=True)
+    with status_col:
+        if st.session_state.sql_model_assistant_schema_validated:
+            st.caption("Schema locked and ready for workbook generation.")
+
+    if validate_clicked:
         st.session_state.sql_model_assistant_schema_validated = True
         st.session_state.sql_model_assistant_validated_model = copy.deepcopy(latest_model)
-        st.success("Schema validated.")
 
     if not st.session_state.sql_model_assistant_schema_validated:
         return
-
-    st.success("Validated model locked for template update.")
 
     datasource, dataset = _resolve_current_rdl_context()
     if not datasource or not dataset:
         st.error("RDL context is missing. Re-upload the report and analyze a dataset before generating TWB.")
         return
 
-    template_upload = st.file_uploader(
-        "Optional: upload the semantic model template (.twb)",
-        type=["twb"],
-        key="sql_model_assistant_template_upload",
-    )
-    template_path = st.text_input(
-        "Template path (.twb)",
-        value=st.session_state.sql_model_assistant_template_path,
-        key="sql_model_assistant_template_path_input",
-    )
-    st.session_state.sql_model_assistant_template_path = template_path
+    with st.expander("Workbook settings", expanded=False):
+        template_upload = st.file_uploader(
+            "Template upload (.twb)",
+            type=["twb"],
+            key="sql_model_assistant_template_upload",
+        )
+        template_path = st.text_input(
+            "Template path (.twb)",
+            value=st.session_state.sql_model_assistant_template_path,
+            key="sql_model_assistant_template_path_input",
+        )
+        st.session_state.sql_model_assistant_template_path = template_path
 
-    output_name = st.text_input(
-        "Output TWB filename",
-        value=st.session_state.sql_model_assistant_generated_twb_name,
-        key="sql_model_assistant_output_twb_name",
-    )
+        output_name = st.text_input(
+            "Output workbook name",
+            value=st.session_state.sql_model_assistant_generated_twb_name,
+            key="sql_model_assistant_output_twb_name",
+        )
 
-    if st.button("Update Template TWB", type="primary", key="update_template_twb"):
+    if st.button("Generate semantic workbook", type="primary", key="update_template_twb", use_container_width=True):
         try:
             template_xml = _load_template_xml(template_upload, template_path)
             validated_model = st.session_state.sql_model_assistant_validated_model
@@ -7350,20 +7961,24 @@ def _render_validation_and_twb_tools(latest_model: dict[str, Any]) -> None:
             output_path = ROOT_DIR / "output" / safe_name
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(generated_xml, encoding="utf-8")
-            st.success(f"Generated TWB saved to: {output_path}")
+            st.success("Semantic workbook saved.")
+            st.caption(str(output_path))
 
             if st.session_state.sql_model_assistant_tableau_auto_publish:
                 try:
                     with st.spinner(
-                        "Publishing validated semantic model to Tableau Cloud "
-                        "(datasource with timestamp + linked workbook)..."
+                        "Publishing the validated datasource and building the final consumer workbook..."
                     ):
                         publish_report = _run_tableau_cloud_publish_workflow(output_path)
                     st.session_state.sql_model_assistant_tableau_last_publish_report = publish_report
                     st.session_state.sql_model_assistant_tableau_last_publish_error = ""
+                    st.session_state.sql_model_assistant_consumer_workbook_path = str(
+                        publish_report.get("consumer_workbook_path") or ""
+                    ).strip()
                     _tableau_render_publish_outcome_message(publish_report)
                 except Exception as publish_exc:
                     publish_error_message = _tableau_format_user_publish_failure(publish_exc)
+                    st.session_state.sql_model_assistant_consumer_workbook_path = ""
                     st.session_state.sql_model_assistant_tableau_last_publish_error = publish_error_message
                     st.error(publish_error_message)
         except Exception as exc:
@@ -7373,34 +7988,39 @@ def _render_validation_and_twb_tools(latest_model: dict[str, Any]) -> None:
     generated_twb_path = ROOT_DIR / "output" / st.session_state.sql_model_assistant_generated_twb_name
     if generated_twb:
         st.download_button(
-            "Download Generated TWB",
+            "Download semantic workbook",
             data=generated_twb.encode("utf-8"),
             file_name=st.session_state.sql_model_assistant_generated_twb_name,
             mime="application/xml",
             key="download_generated_twb",
+            use_container_width=True,
         )
-        if st.button("Publish to Tableau Cloud Now", key="publish_generated_twb_now"):
+        if st.button("Publish datasource and build final workbook", key="publish_generated_twb_now", use_container_width=True):
             try:
                 with st.spinner(
-                    "Publishing validated semantic model to Tableau Cloud "
-                    "(datasource with timestamp + linked workbook)..."
+                    "Publishing the validated datasource and building the final consumer workbook..."
                 ):
                     publish_report = _run_tableau_cloud_publish_workflow(generated_twb_path)
                 st.session_state.sql_model_assistant_tableau_last_publish_report = publish_report
                 st.session_state.sql_model_assistant_tableau_last_publish_error = ""
+                st.session_state.sql_model_assistant_consumer_workbook_path = str(
+                    publish_report.get("consumer_workbook_path") or ""
+                ).strip()
                 _tableau_render_publish_outcome_message(publish_report)
             except Exception as exc:
                 publish_error_message = _tableau_format_user_publish_failure(exc)
+                st.session_state.sql_model_assistant_consumer_workbook_path = ""
                 st.session_state.sql_model_assistant_tableau_last_publish_error = publish_error_message
                 st.error(publish_error_message)
 
     publish_report = st.session_state.sql_model_assistant_tableau_last_publish_report
     publish_error = str(st.session_state.sql_model_assistant_tableau_last_publish_error or "").strip()
     if publish_report:
-        st.markdown("#### Tableau Cloud Publish Report")
-        st.json(publish_report)
+        with st.expander("Publish report", expanded=False):
+            st.json(publish_report)
     elif publish_error:
-        st.error(f"Last Tableau Cloud publish error: {publish_error}")
+        with st.expander("Publish error", expanded=True):
+            st.error(publish_error)
 
 
 def _safe_output_twb_name(value: str) -> str:
@@ -7414,6 +8034,7 @@ def _tableau_render_publish_outcome_message(publish_report: dict[str, Any]) -> N
     status = str(publish_report.get("status") or "").strip().lower()
     datasource_name = str(publish_report.get("datasource_name") or "-")
     workbook_name = str(publish_report.get("workbook_name") or "-")
+    consumer_workbook_path = str(publish_report.get("consumer_workbook_path") or "").strip()
 
     if status == "datasource_published_workbook_publish_skipped_for_validation":
         linked_artifact = str(
@@ -7427,6 +8048,8 @@ def _tableau_render_publish_outcome_message(publish_report: dict[str, Any]) -> N
         )
         if linked_artifact:
             guidance += f" Linked workbook artifact: {linked_artifact}."
+        if consumer_workbook_path:
+            guidance += f" Final consumer workbook: {consumer_workbook_path}."
         st.info(guidance)
         return
 
@@ -7443,6 +8066,8 @@ def _tableau_render_publish_outcome_message(publish_report: dict[str, Any]) -> N
         )
         if linked_artifact:
             guidance += f" Linked workbook artifact: {linked_artifact}."
+        if consumer_workbook_path:
+            guidance += f" Final consumer workbook: {consumer_workbook_path}."
         if details:
             guidance += f" Details: {details}"
         st.warning(guidance)
@@ -7462,6 +8087,13 @@ def _tableau_format_user_publish_failure(error: Exception | str) -> str:
             "Tableau Cloud publish failed because Tableau returned a temporary server error "
             "(503/upstream connection termination). Your TWB was saved successfully. "
             "Wait 1-2 minutes, then click 'Publish to Tableau Cloud Now' to retry without regenerating.\n\n"
+            f"Details: {details}"
+        )
+    if "401001" in details and "signin error" in details.lower():
+        return (
+            "Tableau Cloud publish failed because Tableau rejected the sign-in. "
+            "Verify `server_url`, `site_content_url`, and the credentials in your active config. "
+            "If your Tableau Cloud site uses MFA/SSO, switch the config to PAT authentication.\n\n"
             f"Details: {details}"
         )
     return f"Tableau Cloud publish failed: {details}"
@@ -7500,12 +8132,11 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     if not generated_twb_path.exists():
         raise FileNotFoundError(f"Generated TWB file not found: {generated_twb_path}")
 
-    source_twb_path_for_publish = _tableau_resolve_source_twb_for_publish(generated_twb_path)
-    if source_twb_path_for_publish != generated_twb_path:
-        try:
-            st.info(f"Using canonical source TWB for publish: {source_twb_path_for_publish}")
-        except Exception:
-            pass
+    canonical_generated_source_path = _tableau_resolve_generated_source_content_path(
+        generated_twb_path,
+        "generated_source_twb",
+    )
+    datasource_source_twb_path = canonical_generated_source_path
 
     cfg_defaults = _load_tableau_publish_defaults(str(st.session_state.sql_model_assistant_llm_config or ""))
 
@@ -7515,6 +8146,17 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     project_name = str(st.session_state.sql_model_assistant_tableau_project_name or "").strip()
     username = str(st.session_state.sql_model_assistant_tableau_username or "").strip()
     password = str(st.session_state.sql_model_assistant_tableau_password or "")
+    auth_method = str(cfg_defaults.get("auth_method") or "username_password").strip().lower()
+    pat_name = str(cfg_defaults.get("pat_name") or "").strip()
+    pat_secret = str(cfg_defaults.get("pat_secret") or "")
+    datasource_publish_mode = str(cfg_defaults.get("datasource_publish_mode") or "").strip().lower()
+    if not datasource_publish_mode:
+        datasource_publish_mode = "extract" if bool(cfg_defaults.get("build_hyper_extract", False)) else "live_tds"
+    publish_extract = datasource_publish_mode == "extract"
+    try:
+        hyper_max_rows_per_table = int(cfg_defaults.get("hyper_max_rows_per_table") or 0)
+    except (TypeError, ValueError):
+        hyper_max_rows_per_table = 0
     source_datasource_name = str(st.session_state.sql_model_assistant_tableau_source_datasource_name or "").strip()
     empty_workbook_template_path = str(
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path or ""
@@ -7528,67 +8170,64 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     if "public.tableau.com" in server_url.lower() and cfg_server_url and "public.tableau.com" not in cfg_server_url.lower():
         server_url = _tableau_normalize_server_url(cfg_server_url)
         st.session_state.sql_model_assistant_tableau_server_url = server_url
-        st.session_state.sql_model_assistant_tableau_server_url_input = server_url
 
     if not site_content_url:
         inferred_site_content_url = _tableau_extract_site_content_url(raw_server_url)
         if inferred_site_content_url:
             site_content_url = inferred_site_content_url
             st.session_state.sql_model_assistant_tableau_site_content_url = site_content_url
-            st.session_state.sql_model_assistant_tableau_site_content_url_input = site_content_url
 
     if not site_content_url and cfg_defaults.get("site_content_url"):
         site_content_url = str(cfg_defaults.get("site_content_url") or "").strip()
         st.session_state.sql_model_assistant_tableau_site_content_url = site_content_url
-        st.session_state.sql_model_assistant_tableau_site_content_url_input = site_content_url
     if not project_name and cfg_defaults.get("project_name"):
         project_name = str(cfg_defaults.get("project_name") or "").strip()
         st.session_state.sql_model_assistant_tableau_project_name = project_name
-        st.session_state.sql_model_assistant_tableau_project_name_input = project_name
     if not username and cfg_defaults.get("username"):
         username = str(cfg_defaults.get("username") or "").strip()
         st.session_state.sql_model_assistant_tableau_username = username
-        st.session_state.sql_model_assistant_tableau_username_input = username
     if not password and cfg_defaults.get("password"):
         password = str(cfg_defaults.get("password") or "")
         st.session_state.sql_model_assistant_tableau_password = password
-        st.session_state.sql_model_assistant_tableau_password_input = password
     if not source_datasource_name and cfg_defaults.get("source_datasource_name"):
         source_datasource_name = str(cfg_defaults.get("source_datasource_name") or "").strip()
         st.session_state.sql_model_assistant_tableau_source_datasource_name = source_datasource_name
-        st.session_state.sql_model_assistant_tableau_source_ds_name_input = source_datasource_name
     if not empty_workbook_template_path and cfg_defaults.get("empty_workbook_template_path"):
         empty_workbook_template_path = str(cfg_defaults.get("empty_workbook_template_path") or "").strip()
         st.session_state.sql_model_assistant_tableau_empty_workbook_template_path = empty_workbook_template_path
-        st.session_state.sql_model_assistant_tableau_empty_workbook_template_path_input = empty_workbook_template_path
     if not visual_source_twb_path_value and cfg_defaults.get("visual_source_twb_path"):
         visual_source_twb_path_value = str(cfg_defaults.get("visual_source_twb_path") or "").strip()
-        st.session_state.sql_model_assistant_tableau_visual_source_twb_path = visual_source_twb_path_value
-        st.session_state.sql_model_assistant_tableau_visual_source_twb_path_input = visual_source_twb_path_value
+        _schedule_visual_source_sidebar_sync(visual_source_twb_path_value)
 
-    linked_workbook_source_path = source_twb_path_for_publish
-    linked_workbook_source_mode = "generated_twb"
+    linked_workbook_source_path = canonical_generated_source_path
+    linked_workbook_source_mode = (
+        "generated_twb"
+        if _template_path_key(canonical_generated_source_path) == _template_path_key(generated_twb_path)
+        else "generated_twb_canonical"
+    )
     linked_workbook_source_datasource_name = source_datasource_name
-    if empty_workbook_template_path:
-        st.info(
-            "Ignoring empty workbook template path for linked workbook generation. "
-            "Converted report visuals are preserved by default."
-        )
 
     visual_source_twb_path = _tableau_resolve_visual_source_twb_path(
-        generated_twb_path=source_twb_path_for_publish,
+        generated_twb_path=generated_twb_path,
         configured_path=visual_source_twb_path_value,
     )
     if visual_source_twb_path is not None:
-        linked_workbook_source_mode = "generated_twb_with_visual_overlay"
-        st.info(f"Using visual source workbook: {visual_source_twb_path}")
+        linked_workbook_source_mode = f"{linked_workbook_source_mode}_with_visual_overlay"
 
     if not server_url:
         raise ValueError("Missing Tableau Cloud Server URL.")
     if "public.tableau.com" in server_url.lower():
         raise ValueError("Tableau Public is not supported for this REST publish workflow. Use Tableau Cloud URL.")
-    if not username or not password:
-        raise ValueError("Missing Tableau Cloud username/password in SQL Model Assistant sidebar settings.")
+
+    if auth_method == "pat":
+        if not pat_name or not pat_secret:
+            raise ValueError(
+                "Missing Tableau Cloud PAT settings. Set `auth_method`/`auth_type` to `pat` and provide "
+                "`pat_name` plus `pat_secret` in the active config or environment."
+            )
+    else:
+        if not username or not password:
+            raise ValueError("Missing Tableau Cloud username/password in SQL Model Assistant sidebar settings.")
 
     try:
         import tableauserverclient as TSC
@@ -7604,8 +8243,9 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     extract_report: dict[str, Any] | None = None
     saved_publish_artifacts: dict[str, str] = {}
     linked_workbook_artifact = ""
+    consumer_workbook_path = ""
     generated_source_artifact = _tableau_copy_publish_artifact(
-        source_path=source_twb_path_for_publish,
+        source_path=generated_twb_path,
         timestamp_utc=timestamp_utc,
         label="generated_source_twb",
     )
@@ -7623,26 +8263,43 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     with tempfile.TemporaryDirectory(prefix="sql_model_assistant_tableau_publish_") as tmp_raw:
         tmp_dir = Path(tmp_raw)
 
-        datasource_package_path, resolved_source_datasource_name = _build_live_datasource_tds_for_publish(
-            source_twb_path=source_twb_path_for_publish,
-            output_dir=tmp_dir,
-            datasource_name=datasource_name,
-            source_datasource_name=source_datasource_name,
-        )
+        if publish_extract:
+            datasource_package_path, resolved_source_datasource_name, extract_report = (
+                _build_extract_datasource_package_for_publish(
+                    source_twb_path=datasource_source_twb_path,
+                    output_dir=tmp_dir,
+                    datasource_name=datasource_name,
+                    source_datasource_name=source_datasource_name,
+                    hyper_max_rows_per_table=hyper_max_rows_per_table or None,
+                )
+            )
+            datasource_package_label = "extract_datasource_tdsx_for_tableau_cloud"
+        else:
+            datasource_package_path, resolved_source_datasource_name = _build_live_datasource_tds_for_publish(
+                source_twb_path=datasource_source_twb_path,
+                output_dir=tmp_dir,
+                datasource_name=datasource_name,
+                source_datasource_name=source_datasource_name,
+            )
+            datasource_package_label = "live_datasource_tds_for_tableau_cloud"
         if linked_workbook_source_mode.startswith("generated_twb"):
             linked_workbook_source_datasource_name = resolved_source_datasource_name
-        package_size_mb = datasource_package_path.stat().st_size / (1024 * 1024)
-        st.info(f"Live datasource TDS size: {package_size_mb:.1f} MB. Publishing to Tableau Cloud...")
         datasource_package_artifact = _tableau_copy_publish_artifact(
             source_path=datasource_package_path,
             timestamp_utc=timestamp_utc,
-            label="live_datasource_tds_for_tableau_cloud",
+            label=datasource_package_label,
         )
         if datasource_package_artifact:
             saved_publish_artifacts["datasource_package"] = datasource_package_artifact
-            st.info(f"Saved Tableau live datasource TDS to: {datasource_package_artifact}")
 
-        auth = TSC.TableauAuth(username=username, password=password, site_id=site_content_url)
+        if auth_method == "pat":
+            auth = TSC.PersonalAccessTokenAuth(
+                token_name=pat_name,
+                personal_access_token=pat_secret,
+                site_id=site_content_url,
+            )
+        else:
+            auth = TSC.TableauAuth(username=username, password=password, site_id=site_content_url)
         server = TSC.Server(server_url, use_server_version=True)
         try:
             server.add_http_options({"timeout": 600})
@@ -7657,11 +8314,10 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             )
 
             datasource_item = TSC.DatasourceItem(project_id=project_id, name=datasource_name)
-            # Publish datasource with Tableau Bridge/private network routing.
-            datasource_item.use_remote_query_agent = True
+            if not publish_extract:
+                # Live datasource mode requires Tableau Bridge/private network routing.
+                datasource_item.use_remote_query_agent = True
             try:
-                # Live datasource mode intentionally publishes the .tds directly.
-                # Do not fall back to .tdsx here; that path is for packaged/extract publishing.
                 published_datasource = _tableau_publish_datasource(
                     server=server,
                     tsc_module=TSC,
@@ -7705,7 +8361,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                             )
                         )
                     raise RuntimeError(
-                        "Failed to publish extract datasource to Tableau Cloud. "
+                        "Failed to publish datasource to Tableau Cloud. "
                         f"Error: {datasource_publish_exc}.{debug_detail}"
                     ) from datasource_publish_exc
 
@@ -7729,6 +8385,11 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                 )
                 linked_twb_path = visualized_linked_twb_path
 
+            _tableau_finalize_linked_workbook_datasource_schema(
+                workbook_path=linked_twb_path,
+                preferred_datasource_name=linked_workbook_source_datasource_name,
+            )
+
             linked_workbook_artifact = _tableau_copy_publish_artifact(
                 source_path=linked_twb_path,
                 timestamp_utc=timestamp_utc,
@@ -7736,15 +8397,15 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             )
             if linked_workbook_artifact:
                 saved_publish_artifacts["linked_workbook"] = linked_workbook_artifact
-                st.info(f"Saved Tableau linked workbook to: {linked_workbook_artifact}")
+
+            consumer_output_path = ROOT_DIR / "output" / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final.twb"
+            consumer_output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(linked_twb_path, consumer_output_path)
+            consumer_workbook_path = str(consumer_output_path)
 
             published_workbook = None
             workbook_publish_status = "skipped_validation_pending"
             workbook_publish_error = ""
-            st.info(
-                "Workbook publish is intentionally skipped for validation. "
-                "Use the saved linked workbook artifact for manual checks."
-            )
 
     overall_status = "datasource_published_workbook_publish_skipped_for_validation"
     if workbook_publish_status == "forbidden":
@@ -7756,13 +8417,14 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         "server_url": server_url,
         "site_content_url": site_content_url,
         "project_id": project_id,
-        "datasource_publish_mode": "live_tds",
+        "datasource_publish_mode": datasource_publish_mode,
         "consumer_workbook_source_mode": linked_workbook_source_mode,
         "consumer_workbook_source_path": str(linked_workbook_source_path),
         "workbook_publish_status": workbook_publish_status,
         "workbook_publish_error": workbook_publish_error,
         "workbook_publish_attempted": False,
         "linked_workbook_artifact": linked_workbook_artifact,
+        "consumer_workbook_path": consumer_workbook_path,
         "extract_report": extract_report or {},
         "saved_publish_artifacts": saved_publish_artifacts,
         "source_datasource_name": resolved_source_datasource_name,
@@ -7818,6 +8480,7 @@ def _build_extract_datasource_package_for_publish(
     output_dir: Path,
     datasource_name: str,
     source_datasource_name: str,
+    hyper_max_rows_per_table: int | None = None,
 ) -> tuple[Path, str, dict[str, Any]]:
     publish_context = st.session_state.get("sql_model_assistant_tableau_publish_context", {})
     if not isinstance(publish_context, dict):
@@ -7854,7 +8517,7 @@ def _build_extract_datasource_package_for_publish(
         output_hyper_path=hyper_path,
         data_sources=[data_source],
         db_catalog=db_catalog,
-        max_rows_per_table=None,
+        max_rows_per_table=hyper_max_rows_per_table,
     )
     if str(extract_report.get("status", "")).strip().lower() != "created":
         reason = str(extract_report.get("reason") or extract_report.get("error") or "unknown error").strip()
@@ -7889,7 +8552,7 @@ def _build_live_datasource_tds_for_publish(
         output_tds_path=output_dir / f"{safe_name}.tds",
         datasource_name=datasource_name,
         source_datasource_name=source_datasource_name,
-        strict_mode=False,
+        strict_mode=True,
     )
 
 
@@ -7997,8 +8660,6 @@ def _tableau_prepare_datasource_payload_for_publish(
     datasource_payload.attrib.pop("hasconnection", None)
 
     tags_to_remove = {"repository-location"}
-    if strict_mode:
-        tags_to_remove.update({"layout", "style", "semantic-values", "object-graph"})
 
     for child in [c for c in list(datasource_payload) if _tableau_local_name(c.tag) in tags_to_remove]:
         datasource_payload.remove(child)
@@ -8056,6 +8717,12 @@ def _tableau_resolve_visual_source_twb_path(
     configured_path: str,
 ) -> Path | None:
     candidates: list[Path] = []
+
+    flux1_visual_workbook_path = str(
+        st.session_state.get("sql_model_assistant_flux1_visual_workbook_path", "") or ""
+    ).strip()
+    if flux1_visual_workbook_path:
+        candidates.append(Path(flux1_visual_workbook_path).expanduser())
 
     configured_value = str(configured_path or "").strip()
     if configured_value:
@@ -8148,6 +8815,7 @@ def _tableau_clone_linked_workbook_with_visual_content(
         target_root=linked_root,
         visual_source_root=visual_root,
     )
+    _tableau_normalize_cloned_visual_sections(inserted_sections)
     _tableau_rebind_visual_datasource_references(
         section_roots=inserted_sections,
         source_datasource_names=visual_datasource_names,
@@ -8214,6 +8882,38 @@ def _tableau_replace_visual_sections(
         insert_index += 1
         inserted.append(section_node)
     return inserted
+
+
+def _tableau_normalize_cloned_visual_sections(section_roots: list[ET.Element]) -> None:
+    for section_root in section_roots:
+        section_name = _tableau_local_name(section_root.tag)
+        if section_name == "worksheets":
+            for worksheet_node in list(section_root):
+                if _tableau_local_name(worksheet_node.tag) != "worksheet":
+                    continue
+                _tableau_ensure_simple_id_node(worksheet_node)
+        elif section_name == "dashboards":
+            for dashboard_node in list(section_root):
+                if _tableau_local_name(dashboard_node.tag) != "dashboard":
+                    continue
+                _tableau_ensure_simple_id_node(dashboard_node)
+        elif section_name == "windows":
+            for window_node in list(section_root):
+                if _tableau_local_name(window_node.tag) != "window":
+                    continue
+                _tableau_ensure_simple_id_node(window_node)
+
+
+def _tableau_ensure_simple_id_node(parent_node: ET.Element) -> None:
+    existing_simple_id = _tableau_find_first_child(parent_node, "simple-id")
+    if existing_simple_id is not None:
+        return
+
+    ET.SubElement(parent_node, "simple-id", attrib={"uuid": _tableau_new_simple_id_uuid()})
+
+
+def _tableau_new_simple_id_uuid() -> str:
+    return "{" + str(uuid.uuid4()).upper() + "}"
 
 
 def _tableau_rebind_visual_datasource_references(
@@ -8573,6 +9273,7 @@ def _build_linked_workbook_for_published_datasource(
     published_name = str(getattr(published_datasource, "name", "") or "").strip() or "published_datasource"
     content_url = str(getattr(published_datasource, "content_url", "") or "").strip() or published_name
     datasource_id = str(getattr(published_datasource, "id", "") or "").strip() or content_url
+    remote_datasource_name = published_name
 
     datasources_node = _tableau_find_first_child(root, "datasources")
     if datasources_node is None:
@@ -8597,14 +9298,23 @@ def _build_linked_workbook_for_published_datasource(
                 continue
             datasources_node.remove(datasource_node)
     else:
-        selected_name = f"sqlproxy.{_tableau_safe_name(published_name)}"
+        selected_name = remote_datasource_name
         selected = ET.SubElement(datasources_node, "datasource", attrib={"name": selected_name})
 
-    # Keep datasource 'name' unchanged so worksheet references remain valid.
+    previous_datasource_name = str(selected.attrib.get("name", "") or "").strip()
+    if previous_datasource_name and previous_datasource_name != remote_datasource_name:
+        _tableau_rebind_visual_datasource_references(
+            section_roots=[root],
+            source_datasource_names=[previous_datasource_name],
+            target_datasource_name=remote_datasource_name,
+        )
+
+    selected.attrib["name"] = remote_datasource_name
     selected.attrib["caption"] = published_name
     selected.attrib.setdefault("inline", "true")
     selected.attrib.setdefault("version", "18.1")
     _tableau_ensure_exposed_columns_from_connection_metadata(selected)
+    _tableau_strip_embedded_logical_model_from_linked_datasource(selected)
 
     for child in [
         c
@@ -8618,7 +9328,7 @@ def _build_linked_workbook_for_published_datasource(
     if normalized_site:
         repository_path = f"/t/{normalized_site}/datasources"
 
-    repository_id = content_url or published_name or datasource_id
+    repository_id = datasource_id or content_url or published_name
     repository_attrs: dict[str, str] = {
         "id": repository_id,
         "path": repository_path,
@@ -8636,7 +9346,7 @@ def _build_linked_workbook_for_published_datasource(
 
     connection_attrs = _tableau_build_sqlproxy_connection_attrs(
         server_url=server_url,
-        datasource_content_url=content_url,
+        datasource_content_url=content_url or datasource_id or published_name,
         datasource_name=published_name,
     )
     connection_node = ET.SubElement(selected, "connection", attrib=connection_attrs)
@@ -8660,6 +9370,45 @@ def _build_linked_workbook_for_published_datasource(
     ET.register_namespace("user", "http://www.tableausoftware.com/xml/user")
     output_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     output_twb_path.write_bytes(output_bytes)
+
+
+def _tableau_strip_embedded_logical_model_from_linked_datasource(datasource_node: ET.Element) -> None:
+    _tableau_remove_internal_table_object_columns(datasource_node)
+
+    for child in list(datasource_node):
+        if _tableau_local_name(child.tag) == "object-graph":
+            datasource_node.remove(child)
+
+
+def _tableau_finalize_linked_workbook_datasource_schema(
+    workbook_path: Path,
+    preferred_datasource_name: str,
+) -> None:
+    root = ET.fromstring(workbook_path.read_text(encoding="utf-8"))
+    _tableau_strip_namespaces(root)
+
+    datasources_node = _tableau_find_first_child(root, "datasources")
+    if datasources_node is None:
+        return
+
+    datasource_nodes = [
+        node for node in list(datasources_node) if _tableau_local_name(node.tag) == "datasource"
+    ]
+    if not datasource_nodes:
+        return
+
+    selected = _tableau_select_datasource_node(datasource_nodes, preferred_datasource_name)
+    _tableau_reduce_linked_datasource_to_remote_reference(selected)
+    _tableau_reorder_datasource_children(selected)
+
+    workbook_path.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+
+def _tableau_reduce_linked_datasource_to_remote_reference(datasource_node: ET.Element) -> None:
+    preserved_tags = {"repository-location", "connection", "aliases"}
+    for child in list(datasource_node):
+        if _tableau_local_name(child.tag) not in preserved_tags:
+            datasource_node.remove(child)
 
 
 def _tableau_rebuild_workbook_as_empty_consumer(
@@ -9187,6 +9936,124 @@ def _tableau_find_published_datasource_by_name(
     return None
 
 
+def _tableau_is_template_semantic_model_source(path: Path) -> bool:
+    name_key = _tableau_compact_token_key(str(path.stem or path.name or ""))
+    return "templatesemanticmodel" in name_key
+
+
+def _tableau_is_generated_semantic_model_source(path: Path) -> bool:
+    name_key = _tableau_compact_token_key(str(path.stem or path.name or ""))
+    return "templatesemanticmodel" in name_key or "validatedsemanticmodel" in name_key
+
+
+def _tableau_compact_token_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _tableau_semantic_template_structure_score(path: Path) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    try:
+        if not path.exists() or not path.is_file():
+            return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        root = ET.fromstring(_read_twb_text_with_fallback(path))
+        datasource_node = root.find("datasources/datasource")
+        if datasource_node is None:
+            return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        connection_node = datasource_node.find("connection")
+        relation_names: list[str] = []
+        map_count = 0
+        metadata_count = 0
+        if connection_node is not None:
+            relation_collection = connection_node.find("relation")
+            if relation_collection is not None:
+                relation_names = [
+                    str(child.attrib.get("name", "") or "").strip()
+                    for child in list(relation_collection)
+                    if _tableau_local_name(child.tag) == "relation"
+                ]
+
+            cols_node = connection_node.find("cols")
+            if cols_node is not None:
+                map_count = len([child for child in list(cols_node) if _tableau_local_name(child.tag) == "map"])
+
+            metadata_node = connection_node.find("metadata-records")
+            if metadata_node is not None:
+                metadata_count = len(
+                    [child for child in list(metadata_node) if _tableau_local_name(child.tag) == "metadata-record"]
+                )
+
+        object_nodes = datasource_node.findall("object-graph/objects/object")
+        relationship_nodes = datasource_node.findall("object-graph/relationships/relationship")
+        relation_keys = {_name_key(name) for name in relation_names}
+        object_keys = {_name_key(str(node.attrib.get("caption", "") or "")) for node in object_nodes}
+        known_keys = relation_keys | object_keys
+        expected_prefix = ["FactResellerSales", "DimCurrency", "DimDate", "FactSalesQuota"]
+
+        stat = path.stat()
+        return (
+            1 if "factresellersales" in known_keys else 0,
+            1 if "dimcurrency" in known_keys else 0,
+            1 if relation_names[: len(expected_prefix)] == expected_prefix else 0,
+            len(relation_names),
+            map_count,
+            metadata_count,
+            len(object_nodes),
+            len(relationship_nodes),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+    except Exception:
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def _tableau_canonical_generated_source_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    env_override = str(os.getenv("SQL_MODEL_ASSISTANT_CANONICAL_TWB") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    candidates.extend([OUTPUT_TEMPLATE_COPY_PATH, OUTPUT_TEMPLATE_PATH])
+
+    artifact_dir = ROOT_DIR / "output" / "tableau_publish_artifacts"
+    if artifact_dir.exists():
+        candidates.extend(sorted(artifact_dir.glob("*generated_source_twb_template_semantic_model*.twb")))
+
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        try:
+            resolved = path.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if not resolved.is_file() or resolved.suffix.lower() != ".twb":
+            continue
+        path_key = _template_path_key(resolved)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        existing.append(resolved)
+
+    return existing
+
+
+def _tableau_resolve_generated_source_content_path(source_path: Path, label: str) -> Path:
+    if _tableau_compact_token_key(label) != "generatedsourcetwb":
+        return source_path
+    if not _tableau_is_generated_semantic_model_source(source_path):
+        return source_path
+
+    candidates = [source_path]
+    candidates.extend(_tableau_canonical_generated_source_candidates())
+    candidates = [candidate for candidate in candidates if candidate.exists() and candidate.is_file()]
+    if not candidates:
+        return source_path
+
+    return max(candidates, key=_tableau_semantic_template_structure_score)
+
+
 def _tableau_copy_publish_artifact(
     source_path: Path,
     timestamp_utc: str,
@@ -9197,6 +10064,7 @@ def _tableau_copy_publish_artifact(
         if not source_path.exists():
             return ""
 
+        content_source_path = _tableau_resolve_generated_source_content_path(source_path, label)
         artifact_dir = ROOT_DIR / "output" / output_folder_name
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_name = (
@@ -9205,7 +10073,7 @@ def _tableau_copy_publish_artifact(
             f"{_tableau_safe_name(source_path.name)}"
         )
         artifact_path = artifact_dir / artifact_name
-        shutil.copy2(source_path, artifact_path)
+        shutil.copy2(content_source_path, artifact_path)
         size_mb = artifact_path.stat().st_size / (1024 * 1024)
         return f"{artifact_path} ({size_mb:.2f} MB)"
     except Exception:
@@ -9515,6 +10383,18 @@ def _generate_twb_from_validated_model(
         dataset=dataset_payload,
         table_instances=table_instances,
     )
+    canonical_model = _canonicalize_model_physical_tables_from_catalog(validated_model, db_catalog)
+    if canonical_model != validated_model:
+        table_instances = _build_table_instances_from_model(canonical_model)
+        refreshed_catalog = _build_db_catalog_for_twb_generation(
+            data_source=datasource_payload,
+            dataset=dataset_payload,
+            table_instances=table_instances,
+        )
+        if refreshed_catalog:
+            db_catalog = refreshed_catalog
+    else:
+        canonical_model = validated_model
 
     if _is_sql_datasource(datasource_payload):
         ds_name = str(datasource_payload.get("name", "") or "").strip()
@@ -9533,7 +10413,7 @@ def _generate_twb_from_validated_model(
 
     return _apply_validated_schema_to_twb(
         xml_content=connected_xml,
-        model=validated_model,
+        model=canonical_model,
         data_source=datasource_payload,
         target_datasource_name=template_datasource_name,
         preferred_exposed_names=preferred_exposed_names,
@@ -9577,6 +10457,16 @@ def _build_tableau_publish_context(
         dataset=dataset_payload,
         table_instances=table_instances,
     )
+    canonical_model = _canonicalize_model_physical_tables_from_catalog(validated_model, db_catalog)
+    if canonical_model != validated_model:
+        table_instances = _build_table_instances_from_model(canonical_model)
+        refreshed_catalog = _build_db_catalog_for_twb_generation(
+            data_source=datasource_payload,
+            dataset=dataset_payload,
+            table_instances=table_instances,
+        )
+        if refreshed_catalog:
+            db_catalog = refreshed_catalog
 
     return {
         "data_source": datasource_payload,
@@ -9629,6 +10519,67 @@ def _extract_template_exposed_name_preferences(
         preferences[(_name_key(table_name), _name_key(column_name))] = exposed_name
 
     return preferences
+
+
+def _canonicalize_model_physical_tables_from_catalog(
+    model: dict[str, Any],
+    db_catalog: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(model, dict):
+        return {}
+
+    lookup = _schema_flow_catalog_lookup(db_catalog or {})
+    if not lookup:
+        return copy.deepcopy(model)
+
+    canonical_model = copy.deepcopy(model)
+
+    def _canonical_table_name(*candidates: str) -> str:
+        payload = _schema_flow_first_catalog_match([candidate for candidate in candidates if candidate], lookup)
+        if not payload:
+            return ""
+        table_name = str(payload.get("name", "") or "").strip()
+        if table_name:
+            return table_name
+        return _table_leaf_from_table_reference(str(payload.get("full_name", "") or "").strip())
+
+    for fact in canonical_model.get("fact_tables", []) if isinstance(canonical_model.get("fact_tables", []), list) else []:
+        if not isinstance(fact, dict):
+            continue
+        fact_name = str(fact.get("name", "") or "").strip()
+        canonical_name = _canonical_table_name(fact_name)
+        if canonical_name:
+            fact["name"] = canonical_name
+
+    for group_name in ("direct_dimensions", "snowflake_dimensions", "dimension_tables"):
+        group = canonical_model.get(group_name, [])
+        if not isinstance(group, list):
+            continue
+        for dimension in group:
+            if not isinstance(dimension, dict):
+                continue
+            raw_name = str(dimension.get("name", "") or "").strip()
+            parsed_physical, parsed_role = _split_dimension_name_role(raw_name)
+            current_physical = str(dimension.get("physical_table", "") or parsed_physical or raw_name).strip()
+            canonical_name = _canonical_table_name(current_physical, raw_name, parsed_physical)
+            if not canonical_name:
+                continue
+            dimension["physical_table"] = canonical_name
+            if _same_name(parsed_physical, current_physical):
+                dimension["name"] = f"{canonical_name} [role: {parsed_role}]" if parsed_role else canonical_name
+
+    relationships = canonical_model.get("relationships", [])
+    if isinstance(relationships, list):
+        for relationship in relationships:
+            if not isinstance(relationship, dict):
+                continue
+            for side in ("from", "to"):
+                current_table = str(relationship.get(f"{side}_table", "") or "").strip()
+                canonical_name = _canonical_table_name(current_table)
+                if canonical_name:
+                    relationship[f"{side}_table"] = canonical_name
+
+    return canonical_model
 
 
 def _build_db_catalog_for_twb_generation(
@@ -10976,6 +11927,16 @@ def _set_relationship_endpoint_attributes(
         attrs["guaranteed-value"] = "true"
         attrs["is-db-set-guaranteed-value"] = "true"
 
+    if relation_type == "dimension_to_dimension":
+        if cardinality == "one-to-one":
+            _set_unique(first_attrs)
+            _set_unique(second_attrs)
+        elif cardinality == "one-to-many":
+            _set_unique(first_attrs)
+        elif cardinality == "many-to-one":
+            _set_unique(second_attrs)
+        return
+
     if cardinality in {"one-to-one", "one-to-many"}:
         _set_unique(first_attrs)
     if cardinality in {"one-to-one", "many-to-one"}:
@@ -11368,6 +12329,7 @@ def _generate_response(
     sql_query: str,
     conversation: list[dict[str, Any]],
     llm_config_path: str,
+    database_context: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], bool]:
     if not sql_query.strip():
         raise ValueError("SQL query must be non-empty.")
@@ -11377,11 +12339,20 @@ def _generate_response(
     if previous_model and _follow_up_user_messages(conversation):
         sql_evidence_model = copy.deepcopy(previous_model)
     _apply_follow_up_corrections(sql_evidence_model, conversation)
+    if not isinstance(database_context, dict):
+        database_context = _build_current_database_context()
 
     llm = _load_optional_llm(llm_config_path)
     if llm is not None:
         try:
-            raw = llm.chat(SYSTEM_PROMPT, _build_user_prompt(sql_query, conversation))
+            raw = llm.chat(
+                SYSTEM_PROMPT,
+                _build_user_prompt(
+                    sql_query,
+                    conversation,
+                    database_context=database_context,
+                ),
+            )
             payload = _parse_json_payload(raw)
             assistant_text = payload.get("assistant_response") or "Generated an updated dimensional model."
             llm_model = _normalize_model(payload.get("model", {}))
@@ -11390,20 +12361,42 @@ def _generate_response(
                 sql_evidence_model,
                 forced_model_type=_forced_model_type_from_conversation(conversation),
             )
+            structured_result["database_context"] = database_context
+            assistant_text = _augment_assistant_response_text(
+                assistant_text,
+                conversation,
+                previous_model,
+                structured_result,
+                database_context,
+            )
             return assistant_text, structured_result, False
         except Exception as exc:
             sql_evidence_model["warnings"].insert(0, f"LLM analysis failed; SQL-evidence model used. Details: {exc}")
             _refresh_model_output(sql_evidence_model)
+            sql_evidence_model["database_context"] = database_context
             return (
-                "Built the dimensional model from SQL evidence and applied any recognized follow-up corrections.",
+                _augment_assistant_response_text(
+                    "Built the dimensional model from SQL evidence and applied any recognized follow-up corrections.",
+                    conversation,
+                    previous_model,
+                    sql_evidence_model,
+                    database_context,
+                ),
                 sql_evidence_model,
                 True,
             )
 
     sql_evidence_model["warnings"].insert(0, "LLM config not available; SQL-evidence model used.")
     _refresh_model_output(sql_evidence_model)
+    sql_evidence_model["database_context"] = database_context
     return (
-        "Built the dimensional model from SQL evidence and applied any recognized follow-up corrections.",
+        _augment_assistant_response_text(
+            "Built the dimensional model from SQL evidence and applied any recognized follow-up corrections.",
+            conversation,
+            previous_model,
+            sql_evidence_model,
+            database_context,
+        ),
         sql_evidence_model,
         True,
     )
@@ -11566,6 +12559,261 @@ def _known_table_keys(model: dict[str, Any]) -> set[str]:
     return keys
 
 
+def _build_current_database_context() -> dict[str, Any]:
+    datasource, dataset = _resolve_current_rdl_context()
+    context = {
+        "datasource_name": "",
+        "dataset_name": "",
+        "provider": "",
+        "server": "",
+        "database": "",
+        "connected": False,
+        "inventory_source": "rdl_context",
+        "total_tables": 0,
+        "available_tables": [],
+        "error": "",
+    }
+
+    if isinstance(dataset, dict):
+        context["dataset_name"] = str(dataset.get("name", "") or "").strip()
+
+    if not isinstance(datasource, dict) or not datasource:
+        context["error"] = "Datasource context is not available."
+        return context
+
+    context["datasource_name"] = str(datasource.get("name", "") or "").strip()
+    context["provider"] = str(datasource.get("provider", "") or "").strip()
+
+    connection_info = datasource.get("connection_info", {})
+    if isinstance(connection_info, dict):
+        context["server"] = str(connection_info.get("server", "") or "").strip()
+        context["database"] = str(connection_info.get("database", "") or "").strip()
+
+    inventory = _cached_datasource_inventory(datasource)
+    if not inventory:
+        return context
+
+    context["server"] = str(inventory.get("server", "") or context["server"]).strip()
+    context["database"] = str(inventory.get("database", "") or context["database"]).strip()
+    context["connected"] = bool(inventory.get("connected", False))
+    context["error"] = str(inventory.get("error", "") or "").strip()
+
+    table_rows: list[dict[str, str]] = []
+    for table in inventory.get("tables", []) if isinstance(inventory.get("tables", []), list) else []:
+        if not isinstance(table, dict):
+            continue
+        schema_name = str(table.get("schema", "") or "").strip()
+        table_name = str(table.get("name", "") or "").strip()
+        full_name = str(table.get("full_name", "") or "").strip()
+        table_type = str(table.get("table_type", "") or "").strip()
+        if not full_name and schema_name and table_name:
+            full_name = f"[{schema_name}].[{table_name}]"
+        if not table_name and not full_name:
+            continue
+        table_rows.append(
+            {
+                "schema": schema_name,
+                "name": table_name,
+                "full_name": full_name or table_name,
+                "table_type": table_type,
+            }
+        )
+
+    if table_rows:
+        context["available_tables"] = table_rows
+        context["total_tables"] = len(table_rows)
+        context["inventory_source"] = "database_inventory"
+
+    return context
+
+
+def _cached_datasource_inventory(datasource: dict[str, Any]) -> dict[str, Any]:
+    cache_key = _database_inventory_cache_key(datasource)
+    if not cache_key:
+        return {}
+
+    cache = st.session_state.setdefault("sql_model_assistant_database_inventory_cache", {})
+    if cache_key not in cache:
+        cache[cache_key] = inspect_sqlserver_datasource_inventory(datasource)
+
+    cached_inventory = cache.get(cache_key, {})
+    return cached_inventory if isinstance(cached_inventory, dict) else {}
+
+
+def _database_inventory_cache_key(datasource: dict[str, Any]) -> str:
+    if not isinstance(datasource, dict) or not datasource:
+        return ""
+
+    connection_info = datasource.get("connection_info", {})
+    if not isinstance(connection_info, dict):
+        connection_info = {}
+
+    payload = {
+        "name": str(datasource.get("name", "") or ""),
+        "provider": str(datasource.get("provider", "") or ""),
+        "connection_string_hash": hashlib.md5(
+            str(datasource.get("connection_string", "") or "").encode("utf-8")
+        ).hexdigest(),
+        "server": str(connection_info.get("server", "") or ""),
+        "database": str(connection_info.get("database", "") or ""),
+    }
+    return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _database_context_for_prompt(database_context: dict[str, Any]) -> dict[str, Any]:
+    available_tables = database_context.get("available_tables", [])
+    table_names: list[str] = []
+    if isinstance(available_tables, list):
+        for item in available_tables[:200]:
+            if not isinstance(item, dict):
+                continue
+            full_name = str(item.get("full_name", "") or "").strip()
+            table_name = str(item.get("name", "") or "").strip()
+            if full_name:
+                table_names.append(full_name)
+            elif table_name:
+                table_names.append(table_name)
+
+    return {
+        "datasource_name": str(database_context.get("datasource_name", "") or "").strip(),
+        "dataset_name": str(database_context.get("dataset_name", "") or "").strip(),
+        "provider": str(database_context.get("provider", "") or "").strip(),
+        "server": str(database_context.get("server", "") or "").strip(),
+        "database": str(database_context.get("database", "") or "").strip(),
+        "connected": bool(database_context.get("connected", False)),
+        "total_tables": int(database_context.get("total_tables", 0) or 0),
+        "available_tables": table_names,
+        "error": str(database_context.get("error", "") or "").strip(),
+    }
+
+
+def _latest_user_message(conversation: list[dict[str, Any]]) -> str:
+    for message in reversed(conversation):
+        if message.get("role") == "user":
+            return str(message.get("content", "") or "").strip()
+    return ""
+
+
+def _message_requests_database_inventory(message: str) -> bool:
+    folded = _fold_correction_text(message)
+    if not folded:
+        return False
+
+    table_inventory_patterns = [
+        r"\ball\b.*\bavailable tables\b",
+        r"\bavailable tables\b",
+        r"\bshow\b.*\btables\b",
+        r"\blist\b.*\btables\b",
+        r"\bwhat tables\b",
+        r"\btables available\b",
+        r"\btables? disponibles?\b",
+        r"\bmontre\b.*\btables?\b",
+        r"\bliste\b.*\btables?\b",
+        r"\bquelles?\s+tables?\b",
+        r"\bbase de donnees\b",
+        r"\bdatabase\b",
+    ]
+    return any(re.search(pattern, folded) for pattern in table_inventory_patterns)
+
+
+def _message_requests_schema_change(message: str) -> bool:
+    folded = _fold_correction_text(message)
+    if not folded:
+        return False
+
+    change_patterns = [
+        r"\b(?:add|create|update|modify|change|remove|delete|drop|rename|set)\b[^\n]{0,80}\b(?:relationship|relation|schema|model|dimension|fact|table|column|attribute|join|cardinality)\b",
+        r"\b(?:ajoute(?:r)?|cree(?:r)?|modifie(?:r)?|change(?:r)?|supprime(?:r)?|enleve(?:r)?|renomme(?:r)?|mettre)\b[^\n]{0,80}\b(?:relationship|relation|schema|modele|dimension|fait|table|colonne|attribut|jointure|cardinalite)\b",
+    ]
+    return any(re.search(pattern, folded, flags=re.IGNORECASE) for pattern in change_patterns)
+
+
+def _message_requests_schema_view(message: str) -> bool:
+    folded = _fold_correction_text(message)
+    if not folded:
+        return False
+    if folded.startswith("analyze this sql query"):
+        return True
+
+    view_patterns = [
+        r"\b(?:show|display|give|open|view|see|what is|what are|current|latest)\b[^\n]{0,80}\b(?:model|schema|diagram|relationships|relationship|dimensions|dimension|fact tables|fact table|joins?)\b",
+        r"\b(?:montre|affiche|donne|voir|ouvre|quel|quels|actuel|dernier)\b[^\n]{0,80}\b(?:modele|schema|diagramme|relations?|dimensions?|faits?|jointures?)\b",
+    ]
+    return any(re.search(pattern, folded, flags=re.IGNORECASE) for pattern in view_patterns)
+
+
+def _assistant_display_mode(conversation: list[dict[str, Any]], structured_result: dict[str, Any]) -> str:
+    if not isinstance(structured_result, dict) or not structured_result:
+        return "chat"
+
+    latest_user_message = _latest_user_message(conversation)
+    if not latest_user_message:
+        return "chat"
+    if _message_requests_database_inventory(latest_user_message):
+        return "chat"
+    if _message_requests_schema_change(latest_user_message):
+        return "model"
+    if _message_requests_schema_view(latest_user_message):
+        return "model"
+    return "chat"
+
+
+def _new_review_notes_since_previous_model(
+    previous_model: dict[str, Any],
+    current_model: dict[str, Any],
+) -> list[str]:
+    previous_notes = set(_as_string_list(previous_model.get("review_notes", [])) if isinstance(previous_model, dict) else [])
+    return [
+        note
+        for note in _as_string_list(current_model.get("review_notes", []))
+        if note not in previous_notes
+    ]
+
+
+def _augment_assistant_response_text(
+    base_text: str,
+    conversation: list[dict[str, Any]],
+    previous_model: dict[str, Any],
+    current_model: dict[str, Any],
+    database_context: dict[str, Any],
+) -> str:
+    segments: list[str] = []
+    base = str(base_text or "").strip()
+    if base:
+        segments.append(base)
+
+    latest_user_message = _latest_user_message(conversation)
+    if _message_requests_database_inventory(latest_user_message):
+        datasource_name = str(database_context.get("datasource_name", "") or "").strip() or "Unknown datasource"
+        database_name = str(database_context.get("database", "") or "").strip() or "Unknown database"
+        total_tables = int(database_context.get("total_tables", 0) or 0)
+        table_rows = database_context.get("available_tables", [])
+        preview_names: list[str] = []
+        if isinstance(table_rows, list):
+            for item in table_rows[:15]:
+                if not isinstance(item, dict):
+                    continue
+                preview_name = str(item.get("full_name", "") or item.get("name", "") or "").strip()
+                if preview_name:
+                    preview_names.append(preview_name)
+        inventory_line = (
+            f"Datasource `{datasource_name}` points to database `{database_name}` and exposes "
+            f"{total_tables} table(s)."
+        )
+        if preview_names:
+            inventory_line += " Preview: " + ", ".join(preview_names) + "."
+        inventory_error = str(database_context.get("error", "") or "").strip()
+        if inventory_error and not bool(database_context.get("connected", False)):
+            inventory_line += f" Inventory warning: {inventory_error}."
+        segments.append(inventory_line)
+
+    new_notes = _new_review_notes_since_previous_model(previous_model, current_model)
+    if new_notes:
+        segments.append("Applied schema changes: " + "; ".join(new_notes[:4]))
+
+    return "\n\n".join(segment for segment in segments if segment).strip()
+
+
 def _load_optional_llm(llm_config_path: str):
     candidates: list[Path] = []
     if llm_config_path:
@@ -11594,19 +12842,33 @@ def _load_optional_llm(llm_config_path: str):
     return None
 
 
-def _build_user_prompt(sql_query: str, conversation: list[dict[str, Any]]) -> str:
+def _build_user_prompt(
+    sql_query: str,
+    conversation: list[dict[str, Any]],
+    database_context: dict[str, Any] | None = None,
+) -> str:
     history_lines: list[str] = []
     for index, message in enumerate(conversation, start=1):
         history_lines.append(f"{index}. {message['role'].upper()}: {message['content']}")
         if message.get("structured_result"):
-            history_lines.append(json.dumps(message["structured_result"], indent=2))
+            history_lines.append(json.dumps(_prompt_ready_structured_result(message["structured_result"]), indent=2))
 
     history = "\n".join(history_lines) if history_lines else "1. USER: Analyze the SQL query."
+    database_context_payload = _database_context_for_prompt(database_context or {})
     return (
         f"SQL query:\n{sql_query}\n\n"
+        f"Datasource context:\n{json.dumps(database_context_payload, indent=2)}\n\n"
         f"Conversation history:\n{history}\n\n"
         "Return JSON only."
     )
+
+
+def _prompt_ready_structured_result(structured_result: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(structured_result) if isinstance(structured_result, dict) else {}
+    database_context = payload.get("database_context", {})
+    if isinstance(database_context, dict):
+        payload["database_context"] = _database_context_for_prompt(database_context)
+    return payload
 
 
 def _parse_json_payload(raw_text: str) -> dict[str, Any]:
@@ -13375,23 +14637,90 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
     folded = _fold_correction_text(merged)
     forced_model_type = _forced_model_type_from_conversation(conversation)
     applied_notes: list[str] = []
+    handled_relationship_pairs: set[tuple[str, str]] = set()
 
     if forced_model_type:
         applied_notes.append(f"User correction applied: schema type forced to {forced_model_type}.")
 
     table_token = r"([A-Za-z0-9_\.\[\]]+)"
+    identifier_token = r"[A-Za-z0-9_\.\[\]]+"
     cardinality_token = (
         r"(one-to-one|one-to-many|many-to-one|many-to-many|"
         r"1\s*[:\-]\s*1|1\s*[:\-]\s*n|n\s*[:\-]\s*1|n\s*[:\-]\s*n|"
         r"un\s+a\s+un|un\s+a\s+plusieurs|plusieurs\s+a\s+un|plusieurs\s+a\s+plusieurs|"
         r"un\s+vers\s+un|un\s+vers\s+plusieurs|plusieurs\s+vers\s+un)"
     )
+    relationship_type_token = (
+        r"(fact[-_\s]?to[-_\s]?dimension|dimension[-_\s]?to[-_\s]?dimension|"
+        r"fact\s+a\s+dimension|fait\s+a\s+dimension|dimension\s+a\s+dimension|dimension\s+vers\s+dimension)"
+    )
+
+    for relation_remove_match in re.finditer(
+        fr"\b(?:remove|delete|drop|supprime(?:r)?|enleve(?:r)?)\b[^\n]{{0,80}}?"
+        fr"\b(?:relationship|relation|lien)\b[^\n]{{0,120}}?\b(?:between|entre)\s+"
+        fr"(?P<left>{identifier_token})\s+(?:and|et)\s+(?P<right>{identifier_token})",
+        folded,
+        flags=re.IGNORECASE,
+    ):
+        left_name = relation_remove_match.group("left")
+        right_name = relation_remove_match.group("right")
+        if _remove_relationship_correction(model, left_name, right_name):
+            handled_relationship_pairs.add(_relationship_pair_key(left_name, right_name))
+            applied_notes.append(f"User correction applied: removed relationship between {left_name} and {right_name}.")
+
+    for relation_change_match in re.finditer(
+        fr"\b(?:add|create|set|update|modify|change|keep|ajoute(?:r)?|cree(?:r)?|modifie(?:r)?|change(?:r)?|garde(?:r)?|mettre)\b"
+        fr"[^\n]{{0,80}}?\b(?:relationship|relation|lien)\b[^\n]{{0,160}}?\b(?:between|entre)\s+"
+        fr"(?P<left>{identifier_token})\s+(?:and|et)\s+(?P<right>{identifier_token})(?P<tail>[^\n]{{0,260}})",
+        folded,
+        flags=re.IGNORECASE,
+    ):
+        left_name = relation_change_match.group("left")
+        right_name = relation_change_match.group("right")
+        tail = str(relation_change_match.group("tail") or "")
+        pair_key = _relationship_pair_key(left_name, right_name)
+
+        cardinality_match = re.search(cardinality_token, tail, flags=re.IGNORECASE)
+        normalized_cardinality = (
+            _normalize_correction_cardinality(cardinality_match.group(1)) if cardinality_match else ""
+        )
+        relationship_type_match = re.search(relationship_type_token, tail, flags=re.IGNORECASE)
+        normalized_relationship_type = (
+            _normalize_correction_relationship_type(relationship_type_match.group(1))
+            if relationship_type_match
+            else ""
+        )
+        left_column, right_column = _extract_relationship_columns_from_text(tail, left_name, right_name)
+
+        _apply_relationship_correction(
+            model=model,
+            left_name=left_name,
+            right_name=right_name,
+            cardinality=normalized_cardinality,
+            relationship_type=normalized_relationship_type,
+            left_column=left_column,
+            right_column=right_column,
+        )
+        handled_relationship_pairs.add(pair_key)
+
+        note_parts = [f"User correction applied: relationship ensured between {left_name} and {right_name}"]
+        if left_column and right_column:
+            note_parts.append(f"using {left_column} = {right_column}")
+        if normalized_cardinality:
+            note_parts.append(f"cardinality {normalized_cardinality}")
+        if normalized_relationship_type:
+            note_parts.append(f"type {normalized_relationship_type}")
+        applied_notes.append(", ".join(note_parts) + ".")
 
     for relation_match in re.finditer(
         fr"{table_token}\s+(?:to|->|vers|a|avec)\s+{table_token}[^\n]{{0,160}}?\b{cardinality_token}\b",
         folded,
     ):
         left_name, right_name, cardinality = relation_match.groups()
+        if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
+            continue
+        if _relationship_pair_key(left_name, right_name) in handled_relationship_pairs:
+            continue
         normalized_cardinality = _normalize_correction_cardinality(cardinality)
         if not normalized_cardinality:
             continue
@@ -13414,6 +14743,10 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
         folded,
     ):
         left_name, right_name, relation_type = relation_type_match.groups()
+        if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
+            continue
+        if _relationship_pair_key(left_name, right_name) in handled_relationship_pairs:
+            continue
         normalized_relation_type = _normalize_correction_relationship_type(relation_type)
         if normalized_relation_type:
             _apply_relationship_correction(
@@ -13479,6 +14812,10 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
         flags=re.IGNORECASE,
     ):
         left_name, right_name = link_match.groups()
+        if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
+            continue
+        if _relationship_pair_key(left_name, right_name) in handled_relationship_pairs:
+            continue
         _apply_relationship_correction(
             model=model,
             left_name=left_name,
@@ -13495,6 +14832,10 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
         flags=re.IGNORECASE,
     ):
         left_name, right_name = link_match.groups()
+        if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
+            continue
+        if _relationship_pair_key(left_name, right_name) in handled_relationship_pairs:
+            continue
         _apply_relationship_correction(
             model=model,
             left_name=left_name,
@@ -13580,7 +14921,12 @@ def _apply_relationship_correction(
     right_name: str,
     cardinality: str,
     relationship_type: str,
+    left_column: str = "",
+    right_column: str = "",
 ) -> None:
+    if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
+        return
+
     relationships = model.get("relationships", [])
     if not isinstance(relationships, list):
         relationships = []
@@ -13600,6 +14946,23 @@ def _apply_relationship_correction(
             continue
         if cardinality:
             relationship["cardinality"] = cardinality if direct_match else _reverse_cardinality(cardinality)
+        if left_column and right_column:
+            if direct_match:
+                relationship["join_condition"] = _build_relationship_join_condition(
+                    model,
+                    str(relationship.get("from_table", "") or left_name),
+                    left_column,
+                    str(relationship.get("to_table", "") or right_name),
+                    right_column,
+                )
+            else:
+                relationship["join_condition"] = _build_relationship_join_condition(
+                    model,
+                    str(relationship.get("from_table", "") or right_name),
+                    right_column,
+                    str(relationship.get("to_table", "") or left_name),
+                    left_column,
+                )
         if relationship_type:
             relationship["relationship_type"] = relationship_type
             relationship["_user_corrected_relationship_type"] = True
@@ -13619,10 +14982,135 @@ def _apply_relationship_correction(
             "to_table": resolved_right,
             "relationship_type": inferred_type,
             "cardinality": cardinality,
-            "join_condition": "",
+            "join_condition": _build_relationship_join_condition(
+                model,
+                resolved_left,
+                left_column,
+                resolved_right,
+                right_column,
+            )
+            if left_column and right_column
+            else "",
             "_user_corrected_relationship_type": bool(relationship_type),
         }
     )
+
+
+def _relationship_pair_key(left_name: str, right_name: str) -> tuple[str, str]:
+    left_key = _name_key(left_name)
+    right_key = _name_key(right_name)
+    return tuple(sorted([left_key, right_key]))
+
+
+def _remove_relationship_correction(model: dict[str, Any], left_name: str, right_name: str) -> bool:
+    relationships = model.get("relationships", [])
+    if not isinstance(relationships, list):
+        return False
+
+    filtered_relationships = []
+    removed = False
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            filtered_relationships.append(relationship)
+            continue
+        direct_match = _same_name(str(relationship.get("from_table", "")), left_name) and _same_name(
+            str(relationship.get("to_table", "")), right_name
+        )
+        reverse_match = _same_name(str(relationship.get("from_table", "")), right_name) and _same_name(
+            str(relationship.get("to_table", "")), left_name
+        )
+        if direct_match or reverse_match:
+            removed = True
+            continue
+        filtered_relationships.append(relationship)
+
+    if removed:
+        model["relationships"] = filtered_relationships
+    return removed
+
+
+def _invalid_relationship_endpoint_name(value: str) -> bool:
+    token = _fold_correction_text(value).strip().lower()
+    if not token:
+        return True
+    return token in {
+        "add",
+        "create",
+        "set",
+        "update",
+        "modify",
+        "change",
+        "keep",
+        "relationship",
+        "relation",
+        "link",
+        "lien",
+    }
+
+
+def _extract_relationship_columns_from_text(
+    text: str,
+    left_name: str,
+    right_name: str,
+) -> tuple[str, str]:
+    identifier_token = r"[A-Za-z0-9_\.\[\]]+"
+    match = re.search(
+        fr"(?:columns?|colonnes?|keys?|cles?)\s+(?P<left>{identifier_token})\s*(?:=|and|et|to|vers)\s*(?P<right>{identifier_token})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+
+    left_column = _normalize_relationship_column_name(match.group("left"), left_name)
+    right_column = _normalize_relationship_column_name(match.group("right"), right_name)
+    return left_column, right_column
+
+
+def _normalize_relationship_column_name(value: str, table_name: str) -> str:
+    cleaned = _clean_name(value)
+    if not cleaned:
+        return ""
+    parts = [part.strip() for part in cleaned.split(".") if part.strip()]
+    if len(parts) >= 2 and _same_name(parts[-2], table_name):
+        return parts[-1]
+    return parts[-1] if parts else cleaned
+
+
+def _build_relationship_join_condition(
+    model: dict[str, Any],
+    left_table: str,
+    left_column: str,
+    right_table: str,
+    right_column: str,
+) -> str:
+    left_token = _relationship_join_token(model, left_table)
+    right_token = _relationship_join_token(model, right_table)
+    left_col = _clean_name(left_column)
+    right_col = _clean_name(right_column)
+    if not left_token or not right_token or not left_col or not right_col:
+        return ""
+    return f"{left_token}.{left_col} = {right_token}.{right_col}"
+
+
+def _relationship_join_token(model: dict[str, Any], table_name: str) -> str:
+    resolved_name = _resolve_table_name(model, table_name) or table_name
+
+    for dimension in _normalize_dimension_list(model.get("direct_dimensions", [])) + _normalize_dimension_list(
+        model.get("snowflake_dimensions", [])
+    ):
+        if not _same_name(str(dimension.get("name", "") or ""), resolved_name):
+            continue
+        alias = str(dimension.get("alias", "") or "").strip()
+        if alias:
+            return alias
+        physical_table = str(dimension.get("physical_table", "") or "").strip()
+        leaf = _table_leaf_from_table_reference(physical_table or resolved_name)
+        return _clean_name(leaf)
+
+    clean_name = _clean_name(resolved_name)
+    leaf = _table_leaf_from_table_reference(clean_name)
+    return _clean_name(leaf)
 
 
 def _move_dimension_between_groups(model: dict[str, Any], table_name: str, target_group: str) -> None:
@@ -14149,6 +15637,7 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
     direct_dimensions = _normalize_dimension_list(model.get("direct_dimensions", []))
     snowflake_dimensions = _normalize_dimension_list(model.get("snowflake_dimensions", []))
     relationships = [item for item in model.get("relationships", []) if isinstance(item, dict)]
+    database_context = model.get("database_context", {}) if isinstance(model.get("database_context", {}), dict) else {}
     snowflake_origins = _snowflake_origin_lookup(
         fact_table=primary_fact,
         direct_dimensions=direct_dimensions,
@@ -14168,7 +15657,10 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
         st.metric("Relationships", str(len(relationships)))
 
     if model.get("model_summary"):
-        st.info(str(model["model_summary"]))
+        st.markdown(
+            f"<div class='sqlma-callout'>{html.escape(str(model['model_summary']))}</div>",
+            unsafe_allow_html=True,
+        )
 
     schema_flow_payload: dict[str, Any] = {}
     schema_flow_table_metadata: dict[str, dict[str, Any]] = {}
@@ -14177,7 +15669,7 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
         schema_metadata = schema_flow_payload.get("schema_metadata", {})
         if isinstance(schema_metadata, dict) and isinstance(schema_metadata.get("tables"), dict):
             schema_flow_table_metadata = schema_metadata["tables"]
-        st.markdown("### Schema Diagram")
+        st.markdown('<div class="sqlma-section-label">Schema Diagram</div>', unsafe_allow_html=True)
         schema_flow_key = hashlib.md5(
             json.dumps(schema_flow_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
@@ -14188,8 +15680,8 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
             schema_signature=schema_flow_key,
         )
 
-    facts_tab, dimensions_tab, relationships_tab, notes_tab = st.tabs(
-        ["Fact Tables", "Dimensions", "Relationships", "Review"]
+    facts_tab, dimensions_tab, relationships_tab, database_tab, notes_tab = st.tabs(
+        ["Facts", "Dimensions", "Relations", "Database", "Notes"]
     )
 
     with facts_tab:
@@ -14245,7 +15737,7 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
     with dimensions_tab:
         direct_col, snowflake_col = st.columns(2)
         with direct_col:
-            st.markdown("#### Direct Dimensions")
+            st.markdown("**Direct dimensions**")
             if direct_dimensions:
                 st.dataframe(
                     [
@@ -14273,7 +15765,7 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
             else:
                 st.write("No direct dimensions identified.")
         with snowflake_col:
-            st.markdown("#### Snowflake Dimensions")
+            st.markdown("**Snowflake dimensions**")
             if snowflake_dimensions:
                 st.dataframe(
                     [
@@ -14356,16 +15848,65 @@ def _render_structured_result(model: dict[str, Any], render_key_suffix: str = ""
                     else:
                         st.caption(f"{label}: no SQL join predicate captured.")
 
+    with database_tab:
+        datasource_name = str(database_context.get("datasource_name", "") or "").strip()
+        dataset_name = str(database_context.get("dataset_name", "") or "").strip()
+        database_name = str(database_context.get("database", "") or "").strip()
+        server_name = str(database_context.get("server", "") or "").strip()
+        provider_name = str(database_context.get("provider", "") or "").strip()
+        inventory_error = str(database_context.get("error", "") or "").strip()
+        available_tables = database_context.get("available_tables", [])
+        total_tables = int(database_context.get("total_tables", 0) or 0)
+
+        db_col, ds_col, server_col, tables_col = st.columns(4)
+        with db_col:
+            st.metric("Database", database_name or "Unknown")
+        with ds_col:
+            st.metric("Datasource", datasource_name or "Unknown")
+        with server_col:
+            st.metric("Server", server_name or "Unknown")
+        with tables_col:
+            st.metric("Available Tables", str(total_tables))
+
+        if provider_name or dataset_name:
+            st.caption(
+                f"Provider: {provider_name or 'Unknown'} | "
+                f"Dataset: {dataset_name or 'Unknown'}"
+            )
+
+        if inventory_error:
+            st.warning(inventory_error)
+
+        if isinstance(available_tables, list) and available_tables:
+            st.dataframe(
+                [
+                    {
+                        "Schema": str(item.get("schema", "") or "").strip() or "-",
+                        "Table": str(item.get("name", "") or "").strip()
+                        or str(item.get("full_name", "") or "").strip(),
+                        "Full Name": str(item.get("full_name", "") or "").strip()
+                        or str(item.get("name", "") or "").strip(),
+                        "Type": str(item.get("table_type", "") or "").strip() or "-",
+                    }
+                    for item in available_tables
+                    if isinstance(item, dict)
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.write("No database table inventory available for the current datasource.")
+
     with notes_tab:
         review_col, assumptions_col, warnings_col = st.columns(3)
         with review_col:
-            st.markdown("#### Review Notes")
+            st.markdown("**Review**")
             _render_text_list(_as_string_list(model.get("review_notes", [])), "None")
         with assumptions_col:
-            st.markdown("#### Assumptions")
+            st.markdown("**Assumptions**")
             _render_text_list(_as_string_list(model.get("assumptions", [])), "None")
         with warnings_col:
-            st.markdown("#### Warnings")
+            st.markdown("**Warnings**")
             _render_text_list(_as_string_list(model.get("warnings", [])), "None")
 
 
