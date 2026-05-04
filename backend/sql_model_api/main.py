@@ -30,6 +30,10 @@ except ImportError:
     from api.routes import dispatch_post
 
 from src.rdl_to_twb.rdl_parser import parse_rdl_file
+from src.rdl_to_twb.db_introspection import (
+    inspect_sqlserver_datasource_inventory,
+    inspect_tableau_workbook_inventory,
+)
 from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agent, validate_patch
 from src.rdl_ai_editor.logging_utils import write_patch_log
 from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
@@ -86,6 +90,7 @@ def _initial_app_state() -> dict[str, Any]:
         "publish_report": {},
         "publish_error": "",
         "consumer_workbook_path": "",
+        "database_inventory_cache": {},
     }
 
 
@@ -298,7 +303,134 @@ def _database_context(datasource: dict[str, Any], dataset: dict[str, Any]) -> di
         context["database"] = str(connection_info.get("database", "") or "")
     if not datasource:
         context["error"] = "Datasource context is not available."
+        return context
+
+    inventory = _cached_datasource_inventory(datasource)
+    if inventory and (not inventory.get("connected") or not inventory.get("tables")):
+        fallback_inventory = _database_workbook_metadata_fallback(datasource, str(inventory.get("error", "") or ""))
+        if fallback_inventory.get("tables"):
+            inventory = fallback_inventory
+    if inventory:
+        context["server"] = str(inventory.get("server", "") or context["server"]).strip()
+        context["database"] = str(inventory.get("database", "") or context["database"]).strip()
+        context["connected"] = bool(inventory.get("connected", False))
+        context["error"] = str(inventory.get("error", "") or "").strip()
+        context["warning"] = str(inventory.get("warning", "") or "").strip()
+        tables = _database_inventory_tables(inventory)
+        if tables:
+            context["available_tables"] = tables
+            context["total_tables"] = len(tables)
+            context["inventory_source"] = str(inventory.get("inventory_source", "") or "database_inventory")
+            if context["inventory_source"] == "workbook_metadata":
+                context["error"] = ""
     return context
+
+
+def _database_workbook_metadata_fallback(datasource: dict[str, Any], live_error: str) -> dict[str, Any]:
+    for path in _database_workbook_metadata_candidates(datasource):
+        inventory = inspect_tableau_workbook_inventory(path, datasource, live_error=live_error)
+        if inventory.get("tables"):
+            return inventory
+    return {}
+
+
+def _database_workbook_metadata_candidates(datasource: dict[str, Any]) -> list[Path]:
+    candidates: list[Path] = []
+    database = ""
+    connection_info = datasource.get("connection_info", {}) if isinstance(datasource, dict) else {}
+    if isinstance(connection_info, dict):
+        database = str(connection_info.get("database", "") or "").strip().lower()
+
+    if database == "adventureworksdw2022":
+        candidates.append(OUTPUT_DIR / "Book1.twb")
+
+    generated = APP_STATE.get("generated_twb_path")
+    if generated:
+        candidates.append(Path(str(generated)))
+    candidates.extend(
+        [
+            OUTPUT_DIR / "validated_semantic_model_consumer_final.twb",
+            OUTPUT_DIR / "validated_semantic_model.twb",
+        ]
+    )
+
+    artifacts_dir = OUTPUT_DIR / "tableau_publish_artifacts"
+    if artifacts_dir.exists():
+        candidates.extend(
+            sorted(
+                artifacts_dir.glob("*live_datasource_tds_for_tableau_cloud*.tds"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
+    seen: set[str] = set()
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _cached_datasource_inventory(datasource: dict[str, Any]) -> dict[str, Any]:
+    cache_key = _database_inventory_cache_key(datasource)
+    if not cache_key:
+        return {}
+
+    cache = APP_STATE.setdefault("database_inventory_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        APP_STATE["database_inventory_cache"] = cache
+    if cache_key not in cache:
+        cache[cache_key] = inspect_sqlserver_datasource_inventory(datasource)
+
+    cached_inventory = cache.get(cache_key, {})
+    return cached_inventory if isinstance(cached_inventory, dict) else {}
+
+
+def _database_inventory_cache_key(datasource: dict[str, Any]) -> str:
+    if not isinstance(datasource, dict) or not datasource:
+        return ""
+    connection_info = datasource.get("connection_info", {})
+    if not isinstance(connection_info, dict):
+        connection_info = {}
+    payload = {
+        "name": str(datasource.get("name", "") or ""),
+        "provider": str(datasource.get("provider", "") or ""),
+        "connection_string": str(datasource.get("connection_string", "") or ""),
+        "server": str(connection_info.get("server", "") or ""),
+        "database": str(connection_info.get("database", "") or ""),
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _database_inventory_tables(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for table in inventory.get("tables", []) if isinstance(inventory.get("tables", []), list) else []:
+        if not isinstance(table, dict):
+            continue
+        schema_name = str(table.get("schema", "") or "").strip()
+        table_name = str(table.get("name", "") or "").strip()
+        full_name = str(table.get("full_name", "") or "").strip()
+        if not full_name and schema_name and table_name:
+            full_name = f"[{schema_name}].[{table_name}]"
+        if not table_name and not full_name:
+            continue
+        rows.append(
+            {
+                "schema": schema_name,
+                "name": table_name,
+                "full_name": full_name or table_name,
+                "table_type": str(table.get("table_type", "") or "").strip(),
+                "columns": table.get("columns", []) if isinstance(table.get("columns"), list) else [],
+                "primary_key": table.get("primary_key", []) if isinstance(table.get("primary_key"), list) else [],
+                "foreign_keys": table.get("foreign_keys", []) if isinstance(table.get("foreign_keys"), list) else [],
+            }
+        )
+    return rows
 
 
 def _model_summary(model: dict[str, Any]) -> dict[str, Any]:
@@ -331,8 +463,10 @@ def _tableau_defaults_payload() -> dict[str, Any]:
         "datasource_publish_mode": str(defaults.get("datasource_publish_mode") or ""),
         "auth_method": str(defaults.get("auth_method") or "username_password"),
         "username": str(defaults.get("username") or ""),
+        "pat_name": str(defaults.get("pat_name") or ""),
         "credentials_ready": bool(defaults.get("password") or defaults.get("pat_secret")),
         "pat_name_configured": bool(defaults.get("pat_name")),
+        "pat_secret_ready": bool(defaults.get("pat_secret")),
     }
     return safe_defaults
 
@@ -367,22 +501,79 @@ def _publish_context_summary() -> dict[str, Any]:
     }
 
 
-def _consumer_workbook_payload() -> dict[str, Any]:
-    path_value = str(APP_STATE.get("consumer_workbook_path") or "").strip()
+def _artifact_path_value(value: Any) -> str:
+    text = str(value or "").strip()
+    return re.sub(r"\s+\(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB)\)$", "", text, flags=re.IGNORECASE)
+
+
+def _consumer_workbook_path_value() -> str:
+    path_value = _artifact_path_value(APP_STATE.get("consumer_workbook_path"))
     publish_report = APP_STATE.get("publish_report", {})
     if not path_value and isinstance(publish_report, dict):
-        path_value = str(publish_report.get("consumer_workbook_path") or "").strip()
+        path_value = _artifact_path_value(publish_report.get("consumer_workbook_path"))
         if not path_value:
             saved_artifacts = publish_report.get("saved_publish_artifacts")
             if isinstance(saved_artifacts, dict):
-                path_value = str(saved_artifacts.get("linked_workbook") or "").strip()
-    return _file_payload(path_value)
+                path_value = _artifact_path_value(saved_artifacts.get("linked_workbook"))
+    return path_value
+
+
+def _consumer_workbook_payload() -> dict[str, Any]:
+    payload = _file_payload(_consumer_workbook_path_value())
+    if payload.get("exists"):
+        payload["download_url"] = "/api/consumer-workbook/download"
+    return payload
+
+
+def _resolve_template_path_value(path_value: str) -> str:
+    candidates: list[Path] = []
+
+    raw_value = str(path_value or "").strip()
+    if raw_value:
+        requested = Path(raw_value).expanduser()
+        candidates.append(requested if requested.is_absolute() else PROJECT_ROOT / requested)
+
+    default_path = Path(str(_template_default_path() or "")).expanduser()
+    candidates.append(default_path if default_path.is_absolute() else PROJECT_ROOT / default_path)
+    candidates.extend(
+        [
+            OUTPUT_DIR / "Book1.twb",
+            OUTPUT_DIR / "book1.twb",
+            OUTPUT_TEMPLATE_COPY_PATH,
+            OUTPUT_TEMPLATE_PATH,
+        ]
+    )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if resolved.suffix.lower() != ".twb" or not resolved.is_file():
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        return str(resolved)
+
+    return raw_value or str(default_path)
+
+
+def _current_database_context() -> dict[str, Any]:
+    datasource, dataset = _selected_context()
+    return _database_context(datasource, dataset)
 
 
 def _state_snapshot() -> dict[str, Any]:
     report = APP_STATE.get("report", {})
     model = APP_STATE.get("latest_model", {})
     validated_model = APP_STATE.get("validated_model", {})
+    database_context = _current_database_context()
+    model_payload = copy.deepcopy(model) if isinstance(model, dict) else {}
+    if model_payload:
+        model_payload["database_context"] = database_context
     return {
         "ok": True,
         "report_name": APP_STATE.get("report_name", ""),
@@ -391,8 +582,9 @@ def _state_snapshot() -> dict[str, Any]:
         "selected_datasource_name": APP_STATE.get("selected_datasource_name", ""),
         "sql_query": APP_STATE.get("sql_query", ""),
         "conversation": APP_STATE.get("conversation", []),
-        "latest_model": model if isinstance(model, dict) else {},
-        "latest_model_summary": _model_summary(model if isinstance(model, dict) else {}),
+        "latest_model": model_payload,
+        "latest_model_summary": _model_summary(model_payload),
+        "database_context": database_context,
         "schema_validated": bool(validated_model),
         "generated_twb": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
         "generated_twb_name": APP_STATE.get("generated_twb_name", "validated_semantic_model.twb"),
@@ -402,7 +594,7 @@ def _state_snapshot() -> dict[str, Any]:
         "consumer_workbook": _consumer_workbook_payload(),
         "defaults": {
             "config_path": str(_preferred_config_path()),
-            "template_path": _template_default_path(),
+            "template_path": _resolve_template_path_value(""),
             "output_name": "validated_semantic_model.twb",
             "tableau": _tableau_defaults_payload(),
         },
@@ -449,6 +641,9 @@ def _parse_rdl(payload: dict[str, Any]) -> dict[str, Any]:
             "consumer_workbook_path": "",
         }
     )
+    st.session_state.sql_model_assistant_rdl_report = copy.deepcopy(report)
+    st.session_state.sql_model_assistant_rdl_filename = file_name
+    st.session_state.sql_model_assistant_selected_dataset_name = selected_name
     return _state_snapshot()
 
 
@@ -473,6 +668,7 @@ def _select_dataset(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
+    st.session_state.sql_model_assistant_selected_dataset_name = dataset_name
     return _state_snapshot()
 
 
@@ -534,7 +730,7 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     if not datasource or not dataset:
         raise ValueError("RDL datasource/dataset context is missing.")
 
-    template_path = str(payload.get("template_path") or _template_default_path())
+    template_path = _resolve_template_path_value(str(payload.get("template_path") or ""))
     output_name = _safe_output_twb_name(str(payload.get("output_name") or "validated_semantic_model.twb"))
     template_xml = _load_template_xml(None, template_path)
     generated_xml = _generate_twb_from_validated_model(
@@ -574,11 +770,16 @@ def _configure_streamlit_publish_state(config_path: str, overrides: dict[str, An
         return str(defaults.get(key) or default)
 
     st.session_state.sql_model_assistant_llm_config = config_path
+    st.session_state.sql_model_assistant_rdl_report = copy.deepcopy(APP_STATE.get("report", {}))
+    st.session_state.sql_model_assistant_rdl_filename = str(APP_STATE.get("report_name") or "")
+    st.session_state.sql_model_assistant_selected_dataset_name = str(APP_STATE.get("selected_dataset_name") or "")
     st.session_state.sql_model_assistant_tableau_server_url = pick("server_url")
     st.session_state.sql_model_assistant_tableau_site_content_url = pick("site_content_url")
     st.session_state.sql_model_assistant_tableau_project_name = pick("project_name", "Default")
     st.session_state.sql_model_assistant_tableau_username = pick("username")
     st.session_state.sql_model_assistant_tableau_password = pick("password")
+    st.session_state.sql_model_assistant_tableau_pat_name = pick("pat_name")
+    st.session_state.sql_model_assistant_tableau_pat_secret = pick("pat_secret")
     st.session_state.sql_model_assistant_tableau_source_datasource_name = pick("source_datasource_name")
     st.session_state.sql_model_assistant_tableau_datasource_publish_mode = pick("datasource_publish_mode")
     st.session_state.sql_model_assistant_tableau_auth_method = pick("auth_method", "username_password")
@@ -757,6 +958,9 @@ class ReactSqlModelHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/file":
                 self._serve_file_download(parsed.query)
                 return
+            if parsed.path == "/api/consumer-workbook/download":
+                self._serve_consumer_workbook_download()
+                return
             if parsed.path == "/schema-flow" or parsed.path.startswith("/schema-flow/"):
                 self._serve_schema_flow_static(parsed.path)
                 return
@@ -812,6 +1016,28 @@ class ReactSqlModelHandler(BaseHTTPRequestHandler):
         raw = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+        self.close_connection = True
+
+    def _serve_consumer_workbook_download(self) -> None:
+        path_value = _consumer_workbook_path_value()
+        if not path_value:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        if not _is_safe_download_path(path):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        raw = path.read_bytes()
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Connection", "close")
         self.end_headers()

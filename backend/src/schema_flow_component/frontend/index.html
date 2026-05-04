@@ -7,7 +7,8 @@
     <style>
       :root {
         color-scheme: light;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-sans: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, "Roboto", "Helvetica Neue", Arial, sans-serif;
+        font-family: var(--font-sans);
         --bg: #f7f8fb;
         --panel: rgba(255, 255, 255, 0.97);
         --border: #e5e9f1;
@@ -37,10 +38,21 @@
         margin: 0;
         overflow: hidden;
         background: var(--bg);
+        font-family: var(--font-sans);
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      button,
+      input,
+      textarea,
+      select {
+        font-family: var(--font-sans);
       }
 
       .schema-flow-shell {
         box-sizing: border-box;
+        font-family: var(--font-sans);
         height: 100%;
         width: 100%;
         border: 1px solid var(--border);
@@ -102,7 +114,7 @@
       .schema-flow-title {
         color: var(--text);
         font-size: 18px;
-        font-weight: 800;
+        font-weight: 700;
         letter-spacing: 0;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -230,7 +242,7 @@
       .schema-flow-legend-title {
         color: var(--text);
         font-size: 14px;
-        font-weight: 800;
+        font-weight: 700;
       }
 
       .schema-flow-legend-row {
@@ -294,6 +306,7 @@
         background: transparent;
         border: 0;
         box-shadow: none;
+        font-family: var(--font-sans);
         font-size: 12px;
       }
 
@@ -320,6 +333,7 @@
       }
 
       .react-flow__edge-text {
+        font-family: var(--font-sans);
         font-size: 11px;
         font-weight: 700;
         fill: #334155;
@@ -338,8 +352,9 @@
       .relationship-cardinality-label text {
         dominant-baseline: central;
         fill: #111827;
+        font-family: var(--font-sans);
         font-size: 13px;
-        font-weight: 800;
+        font-weight: 700;
         pointer-events: none;
       }
 
@@ -2026,44 +2041,6 @@
               React.createElement("span", { className: "schema-flow-pill direct" }, dimensionLabel),
               React.createElement("span", { className: "schema-flow-pill snowflake" }, snowflakeLabel),
               React.createElement("span", { className: "schema-flow-pill relation" }, relationshipLabel)
-            )
-          ),
-
-          React.createElement(
-            "div",
-            { className: "schema-flow-legend" },
-            React.createElement("div", { className: "schema-flow-legend-title" }, "Legend"),
-            React.createElement(
-              "div",
-              { className: "schema-flow-legend-row" },
-              React.createElement("span", { className: "schema-flow-dot", style: { background: "#1d4ed8" } }),
-              React.createElement("span", null, "Fact table")
-            ),
-            React.createElement(
-              "div",
-              { className: "schema-flow-legend-row" },
-              React.createElement("span", { className: "schema-flow-dot", style: { background: "#16a34a" } }),
-              React.createElement("span", null, "Dimension")
-            ),
-            React.createElement(
-              "div",
-              { className: "schema-flow-legend-row" },
-              React.createElement("span", { className: "schema-flow-dot", style: { background: "#8b5cf6" } }),
-              React.createElement("span", null, "Snowflake")
-            ),
-            React.createElement(
-              "div",
-              { className: "schema-flow-legend-relation" },
-              React.createElement("span", { className: "schema-flow-line-sample" }),
-              React.createElement("span", { className: "schema-flow-legend-relation-main" }, "Star (Fact - Dim)"),
-              React.createElement("span", { className: "schema-flow-legend-relation-cardinality" }, "1 - *")
-            ),
-            React.createElement(
-              "div",
-              { className: "schema-flow-legend-relation" },
-              React.createElement("span", { className: "schema-flow-line-sample snowflake" }),
-              React.createElement("span", { className: "schema-flow-legend-relation-main" }, "Snowflake (Dim - Dim)"),
-              React.createElement("span", { className: "schema-flow-legend-relation-cardinality" }, "1 - *")
             )
           ),
 

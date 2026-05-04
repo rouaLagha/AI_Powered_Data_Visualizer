@@ -14,10 +14,34 @@ export default function RightChatPanel({
   onSendCorrection,
   onApplyProposal,
   onRejectProposal,
+  panelWidth,
+  onResize,
 }) {
   const [draft, setDraft] = useState("");
   const chatEnabled = activeStep >= 3;
   const visibleMessages = chatMessages.slice(-4);
+
+  function startResize(event) {
+    if (!onResize) return;
+    event.preventDefault();
+
+    const startX = event.clientX;
+    const startWidth = panelWidth;
+
+    function handleMove(moveEvent) {
+      onResize(startWidth - (moveEvent.clientX - startX));
+    }
+
+    function stopResize() {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", stopResize);
+      document.body.classList.remove("resizing-panel");
+    }
+
+    document.body.classList.add("resizing-panel");
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", stopResize);
+  }
 
   function submit(event) {
     event.preventDefault();
@@ -72,6 +96,13 @@ export default function RightChatPanel({
           Apply correction
         </button>
       </form>
+      <div
+        className="resize-handle resize-handle-left"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize chat panel"
+        onPointerDown={startResize}
+      />
     </aside>
   );
 }

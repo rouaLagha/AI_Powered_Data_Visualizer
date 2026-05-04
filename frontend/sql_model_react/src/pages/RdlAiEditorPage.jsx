@@ -65,7 +65,7 @@ export default function RdlAiEditorPage({ defaultConfigPath = "" }) {
   const patchPreview = result?.patch_validated ? JSON.stringify(result.patch_validated, null, 2) : "";
 
   return (
-    <div className="page-stack">
+    <div className="page-stack editor-page">
       <Card
         title="RDL AI editor"
         eyebrow="Instruction to patch"

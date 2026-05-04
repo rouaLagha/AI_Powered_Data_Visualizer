@@ -5,7 +5,7 @@ import Badge from "../shared/Badge.jsx";
 
 export default function ConsumerWorkbookStep({ consumerWorkbook, datasourceConfig, onGenerateConsumer, onStartNew }) {
   return (
-    <Card title="10. Final workbook" eyebrow="Consumer artifact">
+    <Card title="10. Final workbook" eyebrow="Consumer artifact" className="consumer-workbook-card">
       {consumerWorkbook.generated ? (
         <div className="consumer-success">
           <Badge tone="green">Workbook ready</Badge>
@@ -23,7 +23,7 @@ export default function ConsumerWorkbookStep({ consumerWorkbook, datasourceConfi
           <Button variant="primary" onClick={onGenerateConsumer}>Check workbook</Button>
         )}
         {consumerWorkbook.generated && (
-          <a className="btn btn-primary btn-md" href={consumerWorkbook.downloadUrl}>
+          <a className="btn btn-primary btn-md" href={consumerWorkbook.downloadUrl} download={consumerWorkbook.name}>
             Download workbook
           </a>
         )}

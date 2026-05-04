@@ -7228,10 +7228,14 @@ def _template_default_candidates() -> list[Path]:
     if configured_path:
         candidates.append(Path(configured_path).expanduser())
 
+    if _is_active_regionalsales_report():
+        candidates.extend(_regional_sales_semantic_workbook_candidates())
+
     output_dir = OUTPUT_TEMPLATE_PATH.parent
     if output_dir.exists():
         candidates.extend(sorted(output_dir.glob("template_semantic_model*.twb")))
 
+    candidates.extend([OUTPUT_DIR / "Book1.twb", OUTPUT_DIR / "book1.twb"])
     candidates.extend([OUTPUT_TEMPLATE_PATH, DEFAULT_TEMPLATE_PATH, FALLBACK_TEMPLATE_PATH])
 
     existing_candidates: list[Path] = []
@@ -8116,6 +8120,7 @@ def _tableau_resolve_source_twb_for_publish(generated_twb_path: Path) -> Path:
 
     candidates.extend(
         [
+            *_regional_sales_semantic_workbook_candidates(),
             OUTPUT_DIR / "template_semantic_model - Copy.twb",
             ROOT_DIR / "config" / "RegionalSales.canonical.twb",
             OUTPUT_DIR / "template_semantic_model.twb",
@@ -8131,6 +8136,73 @@ def _tableau_resolve_source_twb_for_publish(generated_twb_path: Path) -> Path:
             return resolved
 
     return generated_twb_path
+
+
+def _is_active_regionalsales_report() -> bool:
+    file_name = str(st.session_state.get("sql_model_assistant_rdl_filename", "") or "").strip().lower()
+    if Path(file_name).stem == "regionalsales":
+        return True
+
+    report = st.session_state.get("sql_model_assistant_rdl_report", {})
+    if isinstance(report, dict):
+        report_name = str(report.get("name") or report.get("report_name") or "").strip().lower()
+        if Path(report_name).stem == "regionalsales" or report_name == "regionalsales":
+            return True
+
+    return False
+
+
+def _regional_sales_semantic_workbook_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_override = str(os.getenv("REGIONALSALES_PUBLISH_WORKBOOK_TWB") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    candidates.extend(
+        [
+            OUTPUT_DIR / "Book1.twb",
+            OUTPUT_DIR / "book1.twb",
+            PROJECT_ROOT / "outputs" / "Book1.twb",
+            PROJECT_ROOT / "outputs" / "book1.twb",
+        ]
+    )
+    return candidates
+
+
+def _regional_sales_visual_workbook_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_override = str(os.getenv("REGIONALSALES_VISUAL_TWB") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    candidates.extend(
+        [
+            OUTPUT_DIR / "converted_report_perfect.twb",
+            PROJECT_ROOT / "outputs" / "converted_report_perfect.twb",
+            PROJECT_ROOT / "converted_report_perfect.twb",
+        ]
+    )
+    return candidates
+
+
+def _first_existing_twb(candidates: list[Path]) -> Path | None:
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        try:
+            resolved = path.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if resolved.suffix.lower() != ".twb" or not resolved.is_file():
+            continue
+        key = _template_path_key(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        return resolved
+    return None
 
 
 def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, Any]:
@@ -8151,12 +8223,30 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     project_name = str(st.session_state.sql_model_assistant_tableau_project_name or "").strip()
     username = str(st.session_state.sql_model_assistant_tableau_username or "").strip()
     password = str(st.session_state.sql_model_assistant_tableau_password or "")
-    auth_method = str(cfg_defaults.get("auth_method") or "username_password").strip().lower()
-    pat_name = str(cfg_defaults.get("pat_name") or "").strip()
-    pat_secret = str(cfg_defaults.get("pat_secret") or "")
-    datasource_publish_mode = str(cfg_defaults.get("datasource_publish_mode") or "").strip().lower()
+    auth_method = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_auth_method", "")
+        or cfg_defaults.get("auth_method")
+        or "username_password"
+    ).strip().lower()
+    pat_name = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_pat_name", "")
+        or cfg_defaults.get("pat_name")
+        or ""
+    ).strip()
+    pat_secret = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_pat_secret", "")
+        or cfg_defaults.get("pat_secret")
+        or ""
+    )
+    datasource_publish_mode = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_datasource_publish_mode", "")
+        or cfg_defaults.get("datasource_publish_mode")
+        or ""
+    ).strip().lower()
     if not datasource_publish_mode:
         datasource_publish_mode = "extract" if bool(cfg_defaults.get("build_hyper_extract", False)) else "live_tds"
+    if _is_active_regionalsales_report():
+        datasource_publish_mode = "live_tds"
     publish_extract = datasource_publish_mode == "extract"
     try:
         hyper_max_rows_per_table = int(cfg_defaults.get("hyper_max_rows_per_table") or 0)
@@ -8265,9 +8355,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         if visual_source_artifact:
             saved_publish_artifacts["visual_source_twb"] = visual_source_artifact
 
-    with tempfile.TemporaryDirectory(prefix="sql_model_assistant_tableau_publish_") as tmp_raw:
-        tmp_dir = Path(tmp_raw)
-
+    with _TableauPublishWorkDirectory(timestamp_utc) as tmp_dir:
         if publish_extract:
             datasource_package_path, resolved_source_datasource_name, extract_report = (
                 _build_extract_datasource_package_for_publish(
@@ -8306,8 +8394,17 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         else:
             auth = TSC.TableauAuth(username=username, password=password, site_id=site_content_url)
         server = TSC.Server(server_url, use_server_version=True)
+        _tableau_disable_environment_proxies(server)
         try:
-            server.add_http_options({"timeout": 600})
+            server.add_http_options(
+                {
+                    "timeout": 600,
+                    "proxies": {
+                        "http": None,
+                        "https": None,
+                    },
+                }
+            )
         except Exception:
             pass
 
@@ -8737,8 +8834,12 @@ def _tableau_resolve_visual_source_twb_path(
             configured_candidate = ROOT_DIR / configured_candidate
         candidates.append(configured_candidate)
 
+    if _is_active_regionalsales_report():
+        candidates.extend(_regional_sales_visual_workbook_candidates())
+
     candidates.extend(
         [
+            OUTPUT_DIR / "converted_report_perfect.twb",
             OUTPUT_DIR / "converted_report_hyper.twb",
             OUTPUT_DIR / "converted_report.twb",
         ]
@@ -10020,6 +10121,9 @@ def _tableau_canonical_generated_source_candidates() -> list[Path]:
     if env_override:
         candidates.append(Path(env_override).expanduser())
 
+    if _is_active_regionalsales_report():
+        candidates.extend(_regional_sales_semantic_workbook_candidates())
+
     candidates.extend([OUTPUT_TEMPLATE_COPY_PATH, OUTPUT_TEMPLATE_PATH])
 
     artifact_dir = OUTPUT_DIR / "tableau_publish_artifacts"
@@ -10050,6 +10154,11 @@ def _tableau_resolve_generated_source_content_path(source_path: Path, label: str
         return source_path
     if not _tableau_is_generated_semantic_model_source(source_path):
         return source_path
+
+    if _is_active_regionalsales_report():
+        regional_sales_source = _first_existing_twb(_regional_sales_semantic_workbook_candidates())
+        if regional_sales_source is not None:
+            return regional_sales_source
 
     candidates = [source_path]
     candidates.extend(_tableau_canonical_generated_source_candidates())
@@ -10338,6 +10447,39 @@ def _tableau_timestamped_name(base_name: str, timestamp_utc: str) -> str:
 def _tableau_safe_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
     return cleaned.strip("._") or "artifact"
+
+
+class _TableauPublishWorkDirectory:
+    def __init__(self, timestamp_utc: str):
+        self.timestamp_utc = timestamp_utc
+        self.path: Path | None = None
+
+    def __enter__(self) -> Path:
+        root = OUTPUT_DIR / "tableau_publish_work"
+        root.mkdir(parents=True, exist_ok=True)
+        safe_timestamp = _tableau_safe_name(self.timestamp_utc)
+        self.path = root / f"{safe_timestamp}_{uuid.uuid4().hex[:8]}"
+        self.path.mkdir(parents=True, exist_ok=False)
+        return self.path
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        # Keep the publish work directory for diagnostics and to avoid Windows
+        # temp cleanup failures when Tableau/ODBC still holds a file handle.
+        return False
+
+
+def _tableau_disable_environment_proxies(server: Any) -> None:
+    session = getattr(server, "session", None)
+    if session is None:
+        return
+    try:
+        session.trust_env = False
+    except Exception:
+        pass
+    try:
+        session.proxies.clear()
+    except Exception:
+        pass
 
 
 def _load_template_xml(uploaded_template: Any, template_path: str) -> str:
@@ -12610,7 +12752,7 @@ def _build_current_database_context() -> dict[str, Any]:
     context["connected"] = bool(inventory.get("connected", False))
     context["error"] = str(inventory.get("error", "") or "").strip()
 
-    table_rows: list[dict[str, str]] = []
+    table_rows: list[dict[str, Any]] = []
     for table in inventory.get("tables", []) if isinstance(inventory.get("tables", []), list) else []:
         if not isinstance(table, dict):
             continue
@@ -12628,6 +12770,9 @@ def _build_current_database_context() -> dict[str, Any]:
                 "name": table_name,
                 "full_name": full_name or table_name,
                 "table_type": table_type,
+                "columns": table.get("columns", []) if isinstance(table.get("columns"), list) else [],
+                "primary_key": table.get("primary_key", []) if isinstance(table.get("primary_key"), list) else [],
+                "foreign_keys": table.get("foreign_keys", []) if isinstance(table.get("foreign_keys"), list) else [],
             }
         )
 

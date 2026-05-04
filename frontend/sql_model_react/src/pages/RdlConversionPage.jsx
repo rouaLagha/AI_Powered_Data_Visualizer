@@ -68,7 +68,7 @@ export default function RdlConversionPage({ defaultConfigPath = "" }) {
   const artifacts = artifactRows(result?.artifacts);
 
   return (
-    <div className="page-stack">
+    <div className="page-stack conversion-page">
       <Card
         title="RDL to TWB conversion"
         eyebrow="Direct converter"

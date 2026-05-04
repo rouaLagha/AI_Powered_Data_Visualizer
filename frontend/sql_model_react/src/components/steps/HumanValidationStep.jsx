@@ -5,6 +5,7 @@ import Badge from "../shared/Badge.jsx";
 import Button from "../shared/Button.jsx";
 import RelationshipEditor from "../model/RelationshipEditor.jsx";
 import MeasuresPanel from "../model/MeasuresPanel.jsx";
+import DatabaseOverviewPanel from "../model/DatabaseOverviewPanel.jsx";
 
 export default function HumanValidationStep({
   model,
@@ -14,6 +15,8 @@ export default function HumanValidationStep({
   onAddRelationship,
   onDeleteRelationship,
   validationStatus,
+  backendModel,
+  databaseContext,
 }) {
   const hasModel = Boolean(model.tables.length);
   const tableRows = (
@@ -38,7 +41,7 @@ export default function HumanValidationStep({
   );
 
   return (
-    <Card title="6. Validation" eyebrow="Human approval">
+    <Card title="6. Validation" eyebrow="Human approval" className="validation-card">
       <Tabs
         tabs={[
           { id: "tables", label: "Tables", content: tableRows },
@@ -54,6 +57,11 @@ export default function HumanValidationStep({
             ),
           },
           { id: "measures", label: "Measures", content: <MeasuresPanel measures={model.measures} /> },
+          {
+            id: "database",
+            label: "Database overview",
+            content: <DatabaseOverviewPanel model={model} backendModel={backendModel} databaseContext={databaseContext} />,
+          },
         ]}
       />
 

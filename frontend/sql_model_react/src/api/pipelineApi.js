@@ -428,11 +428,14 @@ export function datasourceConfigFromState(state, previous = {}) {
     authMode: previous.authMode || defaults.auth_method || "username_password",
     username: previous.username || defaults.username || "",
     password: previous.password || "",
+    patName: previous.patName || defaults.pat_name || "",
+    patSecret: previous.patSecret || "",
     sourceDatasourceName: previous.sourceDatasourceName || defaults.source_datasource_name || source.name || "",
     sourceServer: previous.sourceServer || connection.server || defaults.source_server || "",
     sourceDatabase: previous.sourceDatabase || connection.database || defaults.source_database || "",
     configPath: state?.defaults?.config_path || previous.configPath || "",
     credentialsReady: Boolean(defaults.credentials_ready),
+    patReady: Boolean(defaults.pat_secret_ready),
   };
 }
 

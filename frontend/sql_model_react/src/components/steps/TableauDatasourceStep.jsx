@@ -8,15 +8,32 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
     setDatasourceConfig({ ...datasourceConfig, [field]: value });
   }
 
+  const publishModeLabel = datasourceConfig.connectionType === "extract" ? "Extract" : "Live TDS";
+  const usesPat = datasourceConfig.authMode === "pat";
+  const sourceLabel = datasourceConfig.sourceDatabase || datasourceConfig.sourceServer || "From RDL/config";
+  const secretPlaceholder = datasourceConfig.credentialsReady ? "Already loaded from backend config" : "Required for publish";
+
   return (
-    <Card title="8. Tableau datasource" eyebrow="Publish settings">
-      <div className="source-context">
-        <div><span>Source server</span><strong>{datasourceConfig.sourceServer || "From RDL/config"}</strong></div>
-        <div><span>Source database</span><strong>{datasourceConfig.sourceDatabase || "From RDL/config"}</strong></div>
-        <div><span>Credentials</span><strong>{datasourceConfig.credentialsReady ? "Loaded" : "Enter below"}</strong></div>
+    <Card title="8. Tableau datasource" eyebrow="Publish settings" className="tableau-datasource-card">
+      <div className="publish-minimal-strip">
+        <div>
+          <span>Source</span>
+          <strong>{sourceLabel}</strong>
+        </div>
+        <label>
+          <span>Mode</span>
+          <select value={datasourceConfig.connectionType} onChange={(event) => update("connectionType", event.target.value)}>
+            <option value="live_tds">Live TDS</option>
+            <option value="extract">Extract</option>
+          </select>
+        </label>
+        <div>
+          <span>Status</span>
+          <Badge tone={datasourcePrepared ? "green" : "indigo"}>{datasourcePrepared ? "Prepared" : publishModeLabel}</Badge>
+        </div>
       </div>
 
-      <div className="form-grid">
+      <div className="publish-minimal-form">
         <label>
           Tableau server URL
           <input value={datasourceConfig.tableauServerUrl} onChange={(event) => update("tableauServerUrl", event.target.value)} />
@@ -30,14 +47,7 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
           <input value={datasourceConfig.project} onChange={(event) => update("project", event.target.value)} />
         </label>
         <label>
-          Publish mode
-          <select value={datasourceConfig.connectionType} onChange={(event) => update("connectionType", event.target.value)}>
-            <option value="live_tds">Live TDS</option>
-            <option value="extract">Extract</option>
-          </select>
-        </label>
-        <label>
-          Source datasource name
+          Datasource name
           <input value={datasourceConfig.sourceDatasourceName} onChange={(event) => update("sourceDatasourceName", event.target.value)} />
         </label>
         <label>
@@ -47,24 +57,43 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
             <option value="pat">Personal access token</option>
           </select>
         </label>
-        <label>
-          Username
-          <input value={datasourceConfig.username} onChange={(event) => update("username", event.target.value)} />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            placeholder={datasourceConfig.credentialsReady ? "Already loaded" : "Required for publish"}
-            value={datasourceConfig.password}
-            onChange={(event) => update("password", event.target.value)}
-          />
-        </label>
+        {usesPat ? (
+          <>
+            <label>
+              PAT name
+              <input value={datasourceConfig.patName} onChange={(event) => update("patName", event.target.value)} />
+            </label>
+            <label>
+              PAT secret
+              <input
+                type="password"
+                placeholder={secretPlaceholder}
+                value={datasourceConfig.patSecret}
+                onChange={(event) => update("patSecret", event.target.value)}
+              />
+            </label>
+          </>
+        ) : (
+          <>
+            <label>
+              Username
+              <input value={datasourceConfig.username} onChange={(event) => update("username", event.target.value)} />
+            </label>
+            <label>
+              Password
+              <input
+                type="password"
+                placeholder={secretPlaceholder}
+                value={datasourceConfig.password}
+                onChange={(event) => update("password", event.target.value)}
+              />
+            </label>
+          </>
+        )}
       </div>
 
-      <div className="button-row">
+      <div className="button-row publish-actions">
         <Button variant="primary" onClick={onPrepare}>Prepare publish</Button>
-        {datasourcePrepared && <Badge tone="green">Prepared</Badge>}
       </div>
     </Card>
   );

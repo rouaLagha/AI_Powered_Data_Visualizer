@@ -98,6 +98,11 @@ def _publish_workbook(path: Path, cfg: dict) -> dict:
     as_job = bool(cfg.get("as_job", False))
 
     server = TSC.Server(server_url, use_server_version=True)
+    _disable_environment_proxies(server)
+    try:
+        server.add_http_options({"proxies": {"http": None, "https": None}})
+    except Exception:
+        pass
 
     with server.auth.sign_in(auth):
         resolved_project_id = project_id or _resolve_project_id(
@@ -130,6 +135,20 @@ def _publish_workbook(path: Path, cfg: dict) -> dict:
         "file_format": file_extension,
         "publish_mode": _optional_str(cfg.get("publish_mode"), default="overwrite"),
     }
+
+
+def _disable_environment_proxies(server: Any) -> None:
+    session = getattr(server, "session", None)
+    if session is None:
+        return
+    try:
+        session.trust_env = False
+    except Exception:
+        pass
+    try:
+        session.proxies.clear()
+    except Exception:
+        pass
 
 
 def _publish_with_fallback(

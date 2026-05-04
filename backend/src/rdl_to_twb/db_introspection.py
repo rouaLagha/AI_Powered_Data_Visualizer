@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any
 
 
@@ -164,21 +166,27 @@ def inspect_sqlserver_datasource_inventory(
                 ORDER BY TABLE_SCHEMA, TABLE_NAME
                 """
             )
-            tables = []
+            table_refs: list[tuple[str, str, str]] = []
             for row in cursor.fetchall():
                 schema_name = str(row[0] or "").strip()
                 table_name = str(row[1] or "").strip()
                 table_type = str(row[2] or "").strip()
                 if not schema_name or not table_name:
                     continue
-                tables.append(
-                    {
-                        "schema": schema_name,
-                        "name": table_name,
-                        "full_name": f"[{schema_name}].[{table_name}]",
-                        "table_type": table_type,
-                    }
-                )
+                table_refs.append((schema_name, table_name, table_type))
+
+        tables: list[dict[str, Any]] = []
+        for schema_name, table_name, table_type in table_refs:
+            table_payload = _fetch_table_metadata(conn, schema_name, table_name) or {
+                "schema": schema_name,
+                "name": table_name,
+                "full_name": f"[{schema_name}].[{table_name}]",
+                "columns": [],
+                "primary_key": [],
+                "foreign_keys": [],
+            }
+            table_payload["table_type"] = table_type
+            tables.append(table_payload)
 
         entry["tables"] = tables
         entry["connected"] = True
@@ -192,6 +200,127 @@ def inspect_sqlserver_datasource_inventory(
                 conn.close()
             except Exception:
                 pass
+
+
+def inspect_tableau_workbook_inventory(
+    workbook_path: str | Path,
+    data_source: dict[str, Any] | None = None,
+    live_error: str = "",
+) -> dict[str, Any]:
+    """Read table/column metadata from a TWB/TDS when live DB introspection is unavailable."""
+    path = Path(workbook_path)
+    entry: dict[str, Any] = {
+        "name": str(data_source.get("name") or "").strip() if isinstance(data_source, dict) else "",
+        "provider": str(data_source.get("provider") or "").strip().lower() if isinstance(data_source, dict) else "",
+        "server": "",
+        "database": "",
+        "connected": False,
+        "inventory_source": "workbook_metadata",
+        "metadata_fallback": True,
+        "tables": [],
+        "warning": live_error,
+    }
+
+    if isinstance(data_source, dict):
+        connection_info = data_source.get("connection_info", {})
+        if isinstance(connection_info, dict):
+            entry["server"] = str(connection_info.get("server", "") or "")
+            entry["database"] = str(connection_info.get("database", "") or "")
+
+    if not path.exists():
+        entry["error"] = f"Workbook metadata fallback file not found: {path}"
+        return entry
+
+    try:
+        root = ET.parse(path).getroot()
+    except Exception as exc:
+        entry["error"] = f"Workbook metadata fallback failed: {type(exc).__name__}: {exc}"
+        return entry
+
+    tables_by_name: dict[str, dict[str, Any]] = {}
+    table_order: list[str] = []
+
+    for relation in root.findall(".//relation"):
+        if str(relation.attrib.get("type", "") or "").lower() != "table":
+            continue
+        raw_name = str(relation.attrib.get("name", "") or "").strip()
+        table_attr = str(relation.attrib.get("table", "") or "").strip()
+        schema_name, table_name = _split_table_identifier(table_attr)
+        table_name = table_name or _clean_identifier(raw_name)
+        if not table_name:
+            continue
+        schema_name = schema_name or "dbo"
+        key = table_name.lower()
+        if key not in tables_by_name:
+            tables_by_name[key] = {
+                "schema": schema_name,
+                "name": table_name,
+                "full_name": f"[{schema_name}].[{table_name}]",
+                "table_type": "workbook table",
+                "columns": [],
+                "primary_key": [],
+                "foreign_keys": [],
+                "_ordinals": {},
+            }
+            table_order.append(key)
+
+    for record in root.findall(".//metadata-record"):
+        if str(record.attrib.get("class", "") or "").lower() != "column":
+            continue
+        parent_name = _clean_identifier(_xml_child_text(record, "parent-name"))
+        column_name = _clean_identifier(_xml_child_text(record, "remote-name")) or _clean_identifier(
+            _xml_child_text(record, "local-name")
+        )
+        if not parent_name or not column_name:
+            continue
+        key = parent_name.lower()
+        if key not in tables_by_name:
+            tables_by_name[key] = {
+                "schema": "dbo",
+                "name": parent_name,
+                "full_name": f"[dbo].[{parent_name}]",
+                "table_type": "workbook table",
+                "columns": [],
+                "primary_key": [],
+                "foreign_keys": [],
+                "_ordinals": {},
+            }
+            table_order.append(key)
+
+        table = tables_by_name[key]
+        existing = {str(col.get("name", "")).lower() for col in table["columns"] if isinstance(col, dict)}
+        if column_name.lower() in existing:
+            continue
+        ordinal = _safe_int(_xml_child_text(record, "ordinal"))
+        table["columns"].append(
+            {
+                "name": column_name,
+                "data_type": _xml_child_text(record, "local-type") or _remote_type_label(record),
+                "is_nullable": _xml_child_text(record, "contains-null").strip().lower() == "true",
+                "max_length": _safe_int(_xml_child_text(record, "width")),
+                "numeric_precision": _safe_int(_xml_child_text(record, "precision")),
+                "numeric_scale": _safe_int(_xml_child_text(record, "scale")),
+                "datetime_precision": None,
+            }
+        )
+        table["_ordinals"][column_name.lower()] = ordinal if ordinal is not None else len(table["columns"])
+
+    _infer_table_keys_from_workbook_metadata(tables_by_name)
+
+    tables: list[dict[str, Any]] = []
+    for key in table_order:
+        table = tables_by_name[key]
+        ordinals = table.pop("_ordinals", {})
+        table["columns"] = sorted(
+            table.get("columns", []),
+            key=lambda col: ordinals.get(str(col.get("name", "")).lower(), 10_000),
+        )
+        tables.append(table)
+
+    entry["tables"] = tables
+    if not tables:
+        entry["error"] = f"No workbook table metadata found in: {path}"
+    return entry
 
 
 def _extract_used_tables(data_sets: list[dict[str, Any]], datasource_name: str) -> list[tuple[str, str]]:
@@ -263,17 +392,36 @@ def _open_sqlserver_connection(
     if not drivers:
         return None
 
-    preferred = None
-    for candidate in ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "SQL Server"]:
-        if candidate in drivers:
-            preferred = candidate
-            break
-    if preferred is None:
-        preferred = drivers[-1]
+    errors: list[str] = []
+    last_exc: Exception | None = None
+    for driver_name in _ordered_sqlserver_driver_candidates(drivers):
+        conn_str = _normalize_sqlserver_odbc_connection_string(raw_connection_string, driver_name, overrides)
+        try:
+            return pyodbc_module.connect(conn_str, timeout=15)
+        except Exception as exc:
+            last_exc = exc
+            errors.append(f"{driver_name}: {exc}")
 
-    conn_str = _normalize_sqlserver_odbc_connection_string(raw_connection_string, preferred, overrides)
+    detail = " | ".join(errors[-3:]) if errors else "No SQL Server ODBC connection attempt was made."
+    raise RuntimeError(f"Unable to connect with available SQL Server ODBC drivers. {detail}") from last_exc
 
-    return pyodbc_module.connect(conn_str, timeout=15)
+
+def _ordered_sqlserver_driver_candidates(drivers: list[str]) -> list[str]:
+    available = {driver.lower(): driver for driver in drivers}
+    ordered: list[str] = []
+    for candidate in [
+        "ODBC Driver 17 for SQL Server",
+        "ODBC Driver 18 for SQL Server",
+        "SQL Server Native Client 11.0",
+        "SQL Server",
+    ]:
+        driver = available.get(candidate.lower())
+        if driver and driver not in ordered:
+            ordered.append(driver)
+    for driver in drivers:
+        if driver not in ordered:
+            ordered.append(driver)
+    return ordered
 
 
 def _resolve_connection_overrides(
@@ -383,11 +531,115 @@ def _connection_string_entries(raw_connection_string: str) -> dict[str, str]:
     return entries
 
 
+def _split_table_identifier(raw_table: str) -> tuple[str, str]:
+    value = str(raw_table or "").strip()
+    if not value:
+        return "", ""
+    parts = [_clean_identifier(part) for part in value.split(".") if _clean_identifier(part)]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    if len(parts) == 1:
+        return "", parts[0]
+    return "", ""
+
+
+def _xml_child_text(node: ET.Element, tag_name: str) -> str:
+    child = node.find(tag_name)
+    if child is None or child.text is None:
+        return ""
+    return str(child.text).strip()
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _remote_type_label(record: ET.Element) -> str:
+    for attribute in record.findall("./attributes/attribute"):
+        if str(attribute.attrib.get("name", "") or "").strip().lower() == "debugremotetype":
+            value = str(attribute.text or "").strip().strip('"')
+            if value:
+                return value.lower().replace("sql_", "").replace("_", " ")
+    return "unknown"
+
+
+def _infer_table_keys_from_workbook_metadata(tables_by_name: dict[str, dict[str, Any]]) -> None:
+    primary_key_lookup: dict[str, tuple[str, str]] = {}
+
+    for table in tables_by_name.values():
+        table_name = str(table.get("name", "") or "").strip()
+        columns = table.get("columns", []) if isinstance(table.get("columns"), list) else []
+        column_names = [str(col.get("name", "") or "").strip() for col in columns if isinstance(col, dict)]
+        pk_candidates = _primary_key_candidates_for_table(table_name)
+        primary_key = [column for column in column_names if column.lower() in pk_candidates]
+        if not primary_key and table_name.lower().startswith("dim"):
+            key_columns = [column for column in column_names if column.lower().endswith("key")]
+            if len(key_columns) == 1:
+                primary_key = key_columns
+        table["primary_key"] = primary_key[:1]
+        if table["primary_key"]:
+            primary_key_lookup[str(table["primary_key"][0]).lower()] = (
+                str(table.get("schema", "") or ""),
+                table_name,
+            )
+
+    for table in tables_by_name.values():
+        table_name = str(table.get("name", "") or "").strip()
+        columns = table.get("columns", []) if isinstance(table.get("columns"), list) else []
+        foreign_keys: list[dict[str, str]] = []
+        for column in columns:
+            if not isinstance(column, dict):
+                continue
+            column_name = str(column.get("name", "") or "").strip()
+            if not column_name or not column_name.lower().endswith("key"):
+                continue
+            target = primary_key_lookup.get(column_name.lower())
+            if target is None:
+                continue
+            ref_schema, ref_table = target
+            if ref_table.lower() == table_name.lower():
+                continue
+            foreign_keys.append(
+                {
+                    "column": column_name,
+                    "ref_schema": ref_schema,
+                    "ref_table": ref_table,
+                    "ref_column": column_name,
+                }
+            )
+        table["foreign_keys"] = foreign_keys
+
+
+def _primary_key_candidates_for_table(table_name: str) -> set[str]:
+    clean_name = re.sub(r"[^A-Za-z0-9]+", "", str(table_name or ""))
+    candidates = {f"{clean_name}key".lower()} if clean_name else set()
+    for prefix in ("Dim", "Fact"):
+        if clean_name.startswith(prefix) and len(clean_name) > len(prefix):
+            candidates.add(f"{clean_name[len(prefix):]}key".lower())
+    if clean_name.lower() == "dimdate":
+        candidates.add("datekey")
+    return candidates
+
+
 def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[str, Any] | None:
     with conn.cursor() as cursor:
         cursor.execute(
             """
-            SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE
+            SELECT
+                c.TABLE_SCHEMA,
+                c.TABLE_NAME,
+                c.COLUMN_NAME,
+                c.DATA_TYPE,
+                c.IS_NULLABLE,
+                c.CHARACTER_MAXIMUM_LENGTH,
+                c.NUMERIC_PRECISION,
+                c.NUMERIC_SCALE,
+                c.DATETIME_PRECISION
             FROM INFORMATION_SCHEMA.COLUMNS c
             WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
             ORDER BY c.ORDINAL_POSITION
@@ -406,6 +658,10 @@ def _fetch_table_metadata(conn: Any, schema_name: str, table_name: str) -> dict[
                 "name": str(row[2]),
                 "data_type": str(row[3]).lower() if row[3] is not None else "",
                 "is_nullable": str(row[4]).upper() == "YES",
+                "max_length": int(row[5]) if row[5] is not None else None,
+                "numeric_precision": int(row[6]) if row[6] is not None else None,
+                "numeric_scale": int(row[7]) if row[7] is not None else None,
+                "datetime_precision": int(row[8]) if row[8] is not None else None,
             }
             for row in rows
         ]

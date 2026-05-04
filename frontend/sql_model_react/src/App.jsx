@@ -113,6 +113,8 @@ function tableauPayload(config) {
     project_name: config.project,
     username: config.username,
     password: config.password,
+    pat_name: config.patName,
+    pat_secret: config.patSecret,
     source_datasource_name: config.sourceDatasourceName || config.name,
     datasource_publish_mode: config.connectionType,
     auth_method: config.authMode,
@@ -125,8 +127,42 @@ const navItems = [
   { id: "editor", label: "RDL AI editor" },
 ];
 
+const PANEL_WIDTH_LIMITS = {
+  pipeline: { min: 220, max: 500, default: 320 },
+  chat: { min: 280, max: 520, default: 360 },
+};
+
+const PANEL_WIDTH_STORAGE_KEY = "sql-model-assistant-panel-widths";
+
+function clampPanelWidth(name, value) {
+  const limits = PANEL_WIDTH_LIMITS[name];
+  const numericValue = Number(value);
+  if (!limits || !Number.isFinite(numericValue)) return limits?.default || 0;
+  return Math.min(limits.max, Math.max(limits.min, Math.round(numericValue)));
+}
+
+function readPanelWidths() {
+  const fallback = {
+    pipeline: PANEL_WIDTH_LIMITS.pipeline.default,
+    chat: PANEL_WIDTH_LIMITS.chat.default,
+  };
+
+  if (typeof window === "undefined") return fallback;
+
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(PANEL_WIDTH_STORAGE_KEY) || "{}");
+    return {
+      pipeline: clampPanelWidth("pipeline", stored.pipeline ?? fallback.pipeline),
+      chat: clampPanelWidth("chat", stored.chat ?? fallback.chat),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 export default function App() {
   const [activePage, setActivePage] = useState("pipeline");
+  const [panelWidths, setPanelWidths] = useState(readPanelWidths);
   const [activeStep, setActiveStep] = useState(0);
   const [pipelineSteps, setPipelineSteps] = useState(initialSteps);
   const [backendState, setBackendState] = useState(null);
@@ -155,6 +191,8 @@ export default function App() {
     authMode: "username_password",
     username: "",
     password: "",
+    patName: "",
+    patSecret: "",
     sourceDatasourceName: "",
     sourceServer: "",
     sourceDatabase: "",
@@ -187,6 +225,7 @@ export default function App() {
     setDatasourceConfig((previous) => ({
       ...datasourceConfigFromState(state),
       password: previous.password,
+      patSecret: previous.patSecret,
     }));
     setPublicationResult(publicationResultFromState(state));
     setConsumerWorkbook(consumerWorkbookFromState(state));
@@ -235,6 +274,21 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PANEL_WIDTH_STORAGE_KEY, JSON.stringify(panelWidths));
+    } catch {
+      // Layout preferences are optional; ignore private browsing/storage failures.
+    }
+  }, [panelWidths]);
+
+  function updatePanelWidth(name, value) {
+    setPanelWidths((previous) => ({
+      ...previous,
+      [name]: clampPanelWidth(name, value),
+    }));
+  }
 
   function activateStep(index) {
     setActiveStep(index);
@@ -413,6 +467,7 @@ export default function App() {
       setSqlText,
       analysisResult,
       loading: Boolean(loading),
+      loadingText: loading,
       model: dimensionalModel,
       changeHistory,
       validationStatus,
@@ -433,12 +488,14 @@ export default function App() {
         return (
           <HumanValidationStep
             model={dimensionalModel}
+            backendModel={backendState?.latest_model}
             changeHistory={changeHistory}
             validationStatus={validationStatus}
             onApprove={approveModel}
             onRequestReanalysis={() => runAnalysis()}
             onAddRelationship={addRelationshipProposal}
             onDeleteRelationship={deleteRelationshipProposal}
+            databaseContext={backendState?.database_context}
           />
         );
       case 6:
@@ -547,6 +604,9 @@ export default function App() {
       navItems={navItems}
       activePage={activePage}
       onNavigate={setActivePage}
+      panelWidths={panelWidths}
+      panelWidthLimits={PANEL_WIDTH_LIMITS}
+      onPanelWidthChange={updatePanelWidth}
       chatProps={{
         chatMessages,
         changeProposals,

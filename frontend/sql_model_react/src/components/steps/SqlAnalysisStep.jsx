@@ -1,6 +1,7 @@
 import React from "react";
 import Card from "../shared/Card.jsx";
 import Button from "../shared/Button.jsx";
+import ProcessingProgress from "../shared/ProcessingProgress.jsx";
 
 function ListBlock({ title, items }) {
   return (
@@ -15,7 +16,7 @@ function ListBlock({ title, items }) {
   );
 }
 
-export default function SqlAnalysisStep({ analysisResult, onRunAnalysis, loading }) {
+export default function SqlAnalysisStep({ analysisResult, onRunAnalysis, loading, loadingText }) {
   const detectedTables = analysisResult.detectedTables || [];
   const detectedJoins = analysisResult.detectedJoins || [];
   const detectedMeasures = analysisResult.detectedMeasures || [];
@@ -34,9 +35,13 @@ export default function SqlAnalysisStep({ analysisResult, onRunAnalysis, loading
         <ListBlock title="Measures" items={detectedMeasures} />
       </div>
 
-      <Button variant="primary" onClick={onRunAnalysis}>
-        {loading ? "Running..." : "Run analysis"}
-      </Button>
+      {loading && <ProcessingProgress label={loadingText || "SQL analysis and LLM reasoning"} />}
+
+      <div className="button-row analysis-actions">
+        <Button variant="primary" onClick={onRunAnalysis} disabled={loading} className={loading ? "btn-loading" : ""}>
+          {loading ? "Running..." : "Run analysis"}
+        </Button>
+      </div>
     </Card>
   );
 }
