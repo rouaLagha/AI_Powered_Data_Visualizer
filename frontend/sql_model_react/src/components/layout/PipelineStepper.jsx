@@ -40,6 +40,7 @@ export default function PipelineStepper({
           <button
             key={step.id}
             type="button"
+            data-testid={`pipeline-step-${step.id}`}
             className={`stepper-item ${index === activeStep ? "active" : ""}`}
             onClick={() => onSelectStep(index)}
           >

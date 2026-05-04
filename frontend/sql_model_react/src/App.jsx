@@ -11,6 +11,7 @@ import TwbGenerationStep from "./components/steps/TwbGenerationStep.jsx";
 import TableauDatasourceStep from "./components/steps/TableauDatasourceStep.jsx";
 import PublicationStep from "./components/steps/PublicationStep.jsx";
 import ConsumerWorkbookStep from "./components/steps/ConsumerWorkbookStep.jsx";
+import QualityComparisonStep from "./components/steps/QualityComparisonStep.jsx";
 import RdlAiEditorPage from "./pages/RdlAiEditorPage.jsx";
 import RdlConversionPage from "./pages/RdlConversionPage.jsx";
 import {
@@ -18,12 +19,14 @@ import {
   analysisFromBackend,
   analyzeModel,
   chatMessagesFromState,
+  compareQuality,
   consumerWorkbookFromState,
   datasourceConfigFromState,
   datasetsFromState,
   emptyAnalysisResult,
   emptyModel,
   emptyParsingSummary,
+  emptyQualityComparison,
   generateTwb as generateTwbApi,
   getState,
   modelFromBackend,
@@ -31,6 +34,7 @@ import {
   parsingSummaryFromState,
   pipelineDefinitions,
   publicationResultFromState,
+  qualityComparisonFromState,
   publishTableau,
   readFileAsText,
   resetBackendState,
@@ -62,6 +66,12 @@ function suggestedPipelineFromState(state) {
   const hasTwb = Boolean(state?.generated_twb?.exists);
   const hasPublishResult = Boolean(state?.publish_error || state?.publish_report?.status);
   const hasConsumerWorkbook = Boolean(state?.consumer_workbook?.exists);
+  const hasQualityComparison = Boolean(
+    state?.quality_comparison?.executed ||
+      state?.quality_comparison?.status ||
+      state?.quality_comparison?.global_score ||
+      state?.quality_comparison?.score,
+  );
 
   const statuses = pipelineDefinitions.map((step, index) => ({
     ...step,
@@ -100,7 +110,12 @@ function suggestedPipelineFromState(state) {
   }
   if (hasConsumerWorkbook) {
     statuses[9].status = STATUS.completed;
-    active = 9;
+    statuses[10].status = hasQualityComparison ? STATUS.completed : STATUS.inProgress;
+    active = 10;
+  }
+  if (hasQualityComparison) {
+    statuses[10].status = STATUS.completed;
+    active = 10;
   }
 
   return { statuses, active };
@@ -201,6 +216,7 @@ export default function App() {
   });
   const [publicationResult, setPublicationResult] = useState(publicationResultFromState({}));
   const [consumerWorkbook, setConsumerWorkbook] = useState({ generated: false, name: "", downloadUrl: "" });
+  const [qualityComparison, setQualityComparison] = useState(emptyQualityComparison);
 
   function applyBackendState(state) {
     setBackendState(state);
@@ -229,6 +245,7 @@ export default function App() {
     }));
     setPublicationResult(publicationResultFromState(state));
     setConsumerWorkbook(consumerWorkbookFromState(state));
+    setQualityComparison(qualityComparisonFromState(state));
   }
 
   function syncPipelineToState(state) {
@@ -323,6 +340,7 @@ export default function App() {
     setDatasourcePrepared(false);
     setPublicationResult(publicationResultFromState({}));
     setConsumerWorkbook({ generated: false, name: "", downloadUrl: "" });
+    setQualityComparison(emptyQualityComparison);
   }
 
   async function parseUploadedRdl() {
@@ -428,7 +446,21 @@ export default function App() {
       return;
     }
     setConsumerWorkbook(workbook);
-    setPipelineSteps(nextSteps({ 9: STATUS.completed }));
+    setPipelineSteps(nextSteps({ 9: STATUS.completed, 10: STATUS.inProgress }));
+    setActiveStep(10);
+  }
+
+  function continueToQualityComparison() {
+    setPipelineSteps(nextSteps({ 9: STATUS.completed, 10: STATUS.inProgress }));
+    setActiveStep(10);
+  }
+
+  async function runQualityComparison() {
+    setPipelineSteps(nextSteps({ 10: STATUS.inProgress }));
+    const state = await runBackendAction("Quality comparison", compareQuality);
+    setPipelineSteps(nextSteps({ 10: STATUS.completed }));
+    setActiveStep(10);
+    return state;
   }
 
   async function sendCorrection(text) {
@@ -518,7 +550,17 @@ export default function App() {
             consumerWorkbook={consumerWorkbook}
             datasourceConfig={datasourceConfig}
             onGenerateConsumer={generateConsumerWorkbook}
+            onContinueQuality={continueToQualityComparison}
             onStartNew={resetPipeline}
+          />
+        );
+      case 10:
+        return (
+          <QualityComparisonStep
+            qualityComparison={qualityComparison}
+            onRunComparison={runQualityComparison}
+            loading={Boolean(loading)}
+            loadingText={loading}
           />
         );
       default:
@@ -543,6 +585,7 @@ export default function App() {
     datasourcePrepared,
     publicationResult,
     consumerWorkbook,
+    qualityComparison,
   ]);
 
   const headerContext = {

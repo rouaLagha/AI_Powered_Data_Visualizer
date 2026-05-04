@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Report xmlns="http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition">
+  <DataSources>
+    <DataSource Name="AdventureWorksDW">
+      <ConnectionProperties>
+        <DataProvider>SQL</DataProvider>
+        <ConnectString>Data Source=localhost;Initial Catalog=AdventureWorksDW2022</ConnectString>
+      </ConnectionProperties>
+    </DataSource>
+  </DataSources>
+  <DataSets>
+    <DataSet Name="SalesDataset">
+      <Query>
+        <DataSourceName>AdventureWorksDW</DataSourceName>
+        <CommandText>
+          SELECT
+            fis.SalesOrderNumber,
+            fis.SalesAmount,
+            fis.OrderQuantity,
+            dp.EnglishProductName,
+            dd.CalendarYear,
+            dc.CustomerKey
+          FROM dbo.FactInternetSales fis
+          INNER JOIN dbo.DimProduct dp ON fis.ProductKey = dp.ProductKey
+          INNER JOIN dbo.DimDate dd ON fis.OrderDateKey = dd.DateKey
+          INNER JOIN dbo.DimCustomer dc ON fis.CustomerKey = dc.CustomerKey
+        </CommandText>
+      </Query>
+      <Fields>
+        <Field Name="SalesAmount"><DataField>SalesAmount</DataField></Field>
+        <Field Name="OrderQuantity"><DataField>OrderQuantity</DataField></Field>
+        <Field Name="EnglishProductName"><DataField>EnglishProductName</DataField></Field>
+        <Field Name="CalendarYear"><DataField>CalendarYear</DataField></Field>
+      </Fields>
+    </DataSet>
+  </DataSets>
+  <ReportSections>
+    <ReportSection>
+      <Body>
+        <ReportItems>
+          <Tablix Name="RegionalSalesTable">
+            <DataSetName>SalesDataset</DataSetName>
+          </Tablix>
+        </ReportItems>
+      </Body>
+    </ReportSection>
+  </ReportSections>
+</Report>

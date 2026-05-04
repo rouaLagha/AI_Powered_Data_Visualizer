@@ -3,7 +3,13 @@ import Card from "../shared/Card.jsx";
 import Button from "../shared/Button.jsx";
 import Badge from "../shared/Badge.jsx";
 
-export default function ConsumerWorkbookStep({ consumerWorkbook, datasourceConfig, onGenerateConsumer, onStartNew }) {
+export default function ConsumerWorkbookStep({
+  consumerWorkbook,
+  datasourceConfig,
+  onGenerateConsumer,
+  onContinueQuality,
+  onStartNew,
+}) {
   return (
     <Card title="10. Final workbook" eyebrow="Consumer artifact" className="consumer-workbook-card">
       {consumerWorkbook.generated ? (
@@ -26,6 +32,9 @@ export default function ConsumerWorkbookStep({ consumerWorkbook, datasourceConfi
           <a className="btn btn-primary btn-md" href={consumerWorkbook.downloadUrl} download={consumerWorkbook.name}>
             Download workbook
           </a>
+        )}
+        {consumerWorkbook.generated && (
+          <Button onClick={onContinueQuality}>Compare quality</Button>
         )}
         <Button onClick={onStartNew}>Start new pipeline</Button>
       </div>

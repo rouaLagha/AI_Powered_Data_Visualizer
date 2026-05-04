@@ -3083,6 +3083,79 @@ textarea {
   margin-top: 0.2rem;
 }
 
+.quality-comparison-card .card-body {
+  gap: 1rem;
+}
+
+.quality-score-panel {
+  align-items: flex-start;
+  background: #f8fafc;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+}
+
+.quality-score-panel > div {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.quality-score-panel span {
+  color: #64748b;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.quality-score-panel strong {
+  color: #0f172a;
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.quality-score-panel p {
+  color: #475569;
+  margin: 0;
+}
+
+.quality-metric-list {
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.quality-metric-row {
+  align-items: center;
+  background: #ffffff;
+  border-bottom: 1px solid #e5edf5;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: 0.85rem 1rem;
+}
+
+.quality-metric-row:last-child {
+  border-bottom: 0;
+}
+
+.quality-metric-row > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.quality-metric-row strong {
+  color: #0f172a;
+}
+
+.quality-metric-row span {
+  color: #64748b;
+  font-size: 0.85rem;
+}
+
 @keyframes processing-spin {
   to {
     transform: rotate(360deg);

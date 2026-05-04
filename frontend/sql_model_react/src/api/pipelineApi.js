@@ -59,6 +59,11 @@ export const pipelineDefinitions = [
     title: "Workbook",
     description: "Create the workbook connected to the published datasource.",
   },
+  {
+    id: "quality-comparison",
+    title: "Quality",
+    description: "Compare the source RDL with the generated Tableau output.",
+  },
 ];
 
 export const emptyParsingSummary = {
@@ -89,6 +94,14 @@ export const emptyModel = {
   relationships: [],
   measures: [],
   warnings: [],
+};
+
+export const emptyQualityComparison = {
+  executed: false,
+  status: "not_started",
+  globalScore: 0,
+  summary: "",
+  metrics: [],
 };
 
 function apiUrl(path) {
@@ -169,6 +182,10 @@ export function publishTableau({ configPath = "", tableau = {} } = {}) {
     method: "POST",
     body: JSON.stringify({ config_path: configPath, tableau }),
   });
+}
+
+export function compareQuality() {
+  return requestJson("/api/quality/compare", { method: "POST", body: "{}" });
 }
 
 export function runRdlConversion({
@@ -485,5 +502,62 @@ export function twbStateFromState(state) {
     downloadUrl: twb.download_url || "",
     path: twb.path || "",
     sizeBytes: twb.size_bytes || 0,
+  };
+}
+
+function normalizeQualityScore(value) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return 0;
+  const percentValue = numericValue <= 1 ? numericValue * 100 : numericValue;
+  return Math.max(0, Math.min(100, Math.round(percentValue)));
+}
+
+function normalizeQualityMetrics(metrics) {
+  if (Array.isArray(metrics)) {
+    return metrics
+      .filter((metric) => metric && typeof metric === "object")
+      .map((metric, index) => {
+        const label = metric.label || metric.name || `Metric ${index + 1}`;
+        return {
+          id: slug(label, `metric_${index + 1}`),
+          label,
+          score: normalizeQualityScore(metric.score ?? metric.value ?? metric.percent),
+          detail: metric.detail || metric.description || "",
+          status: metric.status || "",
+        };
+      });
+  }
+
+  if (metrics && typeof metrics === "object") {
+    return Object.entries(metrics).map(([label, value], index) => ({
+      id: slug(label, `metric_${index + 1}`),
+      label,
+      score: normalizeQualityScore(typeof value === "object" ? value.score : value),
+      detail: typeof value === "object" ? value.detail || value.description || "" : "",
+      status: typeof value === "object" ? value.status || "" : "",
+    }));
+  }
+
+  return [];
+}
+
+export function qualityComparisonFromState(state) {
+  const comparison = state?.quality_comparison || {};
+  if (!comparison || typeof comparison !== "object" || !Object.keys(comparison).length) {
+    return emptyQualityComparison;
+  }
+
+  const metrics = normalizeQualityMetrics(comparison.metrics);
+  const globalScore = normalizeQualityScore(
+    comparison.global_score ?? comparison.globalScore ?? comparison.score ?? comparison.overall_score,
+  );
+  const status = comparison.status || (globalScore ? "completed" : "not_started");
+
+  return {
+    executed: Boolean(comparison.executed || (status && status !== "not_started") || metrics.length || globalScore),
+    status,
+    globalScore,
+    summary: comparison.summary || comparison.message || "",
+    metrics,
   };
 }
