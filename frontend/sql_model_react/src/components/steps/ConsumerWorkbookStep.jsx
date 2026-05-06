@@ -11,7 +11,7 @@ export default function ConsumerWorkbookStep({
   onStartNew,
 }) {
   return (
-    <Card title="10. Final workbook" eyebrow="Consumer artifact" className="consumer-workbook-card">
+    <Card title="11. Final workbook" eyebrow="Consumer artifact" className="consumer-workbook-card">
       {consumerWorkbook.generated ? (
         <div className="consumer-success">
           <Badge tone="green">Workbook ready</Badge>

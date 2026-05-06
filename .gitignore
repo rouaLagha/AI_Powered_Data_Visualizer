@@ -1,9 +1,15 @@
 __pycache__/
 *.pyc
 *.log
+/package-lock.json
 frontend/**/node_modules/
 frontend/**/dist/
 outputs/**
 !outputs/
 !outputs/.gitkeep
+output/**
+output_qix_real_test/**
+frontend/**/playwright-report/
+frontend/**/test-results/
+frontend/sql_model_react/e2e/reports/
 backend/config/llm_config.json

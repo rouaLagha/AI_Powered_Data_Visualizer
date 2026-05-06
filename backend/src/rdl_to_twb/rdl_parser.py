@@ -521,7 +521,7 @@ def _extract_chart_subtype(node: ET.Element) -> str | None:
 
 def _extract_textbox_values(node: ET.Element, ns: str) -> list[str]:
     values = [
-        value.text.strip()
+        value.text
         for value in node.findall(f".//{_qn(ns, 'TextRun')}/{_qn(ns, 'Value')}")
         if value.text and value.text.strip()
     ]
@@ -925,7 +925,11 @@ def _extract_embedded_visuals(
         expressions = _collect_expressions(element)
         if local == "Textbox":
             text_values = _extract_textbox_values(element, ns)
-            if not _looks_kpi_textbox(expressions, text_values):
+            has_static_text = any(
+                isinstance(value, str) and value.strip() and not _looks_like_expression(value)
+                for value in text_values
+            )
+            if not _looks_kpi_textbox(expressions, text_values) and not has_static_text:
                 continue
 
         child_name = element.attrib.get("Name") if isinstance(element.attrib.get("Name"), str) else ""
@@ -949,6 +953,8 @@ def _extract_embedded_visuals(
             expressions,
             container_section=container_section,
         )
+        if local == "Textbox" and not _looks_kpi_textbox(expressions, _extract_textbox_values(element, ns)):
+            properties["semantic_hint"] = "static_text"
         properties["embedded_parent"] = parent_visual_name
 
         visuals.append(
@@ -1035,7 +1041,7 @@ def _parse_report_items(
                 parent_dataset_name=dataset_name,
             )
 
-        if local in {"Tablix", "Rectangle"}:
+        if local == "Tablix":
             embedded_visuals = _extract_embedded_visuals(
                 node=child,
                 ns=ns,

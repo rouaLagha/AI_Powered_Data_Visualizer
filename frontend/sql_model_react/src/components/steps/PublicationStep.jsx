@@ -13,7 +13,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
   const statusTone = isPublished ? "success" : isError ? "error" : "pending";
 
   return (
-    <Card title="9. Publish" eyebrow="Tableau Cloud" className="publication-card">
+    <Card title="10. Publish" eyebrow="Tableau Cloud" className="publication-card">
       <div className={`publication-status-panel publication-${statusTone}`}>
         <div className="publication-status-copy">
           <Badge tone={isPublished ? "green" : isError ? "red" : "indigo"}>{publicationResult.status || "pending"}</Badge>

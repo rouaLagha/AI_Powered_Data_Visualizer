@@ -127,6 +127,11 @@ function defaultState(overrides = {}) {
       error: "",
     },
     schema_validated: false,
+    artifact_workspace: {
+      root: {},
+      manifest: {},
+      folders: {},
+    },
     generated_twb: {
       exists: false,
       name: "",
@@ -134,7 +139,26 @@ function defaultState(overrides = {}) {
       download_url: "",
       size_bytes: 0,
     },
-    generated_twb_name: "validated_semantic_model.twb",
+    visual_conversion: {
+      exists: false,
+      name: "",
+      path: "",
+      download_url: "",
+      size_bytes: 0,
+      status: "not_started",
+      output_dir: "",
+      error: "",
+    },
+    visual_model_twb: {
+      exists: false,
+      name: "",
+      path: "",
+      download_url: "",
+      size_bytes: 0,
+      status: "not_started",
+      error: "",
+    },
+    generated_twb_name: "data_model_to_publish.twb",
     publish_context_summary: {},
     publish_report: {},
     publish_error: "",
@@ -149,7 +173,7 @@ function defaultState(overrides = {}) {
     defaults: {
       config_path: "backend/config/llm_config.example.json",
       template_path: "backend/config/RegionalSales.canonical.twb",
-      output_name: "validated_semantic_model.twb",
+      output_name: "data_model_to_publish.twb",
       tableau: {
         server_url: "https://tableau.example.test",
         site_content_url: "qa",
@@ -175,6 +199,7 @@ async function installMockApi(page) {
     analyze: 0,
     correction: 0,
     validate: 0,
+    visual: 0,
     twb: 0,
     publish: 0,
     quality: 0,
@@ -319,18 +344,60 @@ async function installMockApi(page) {
       return;
     }
 
-    if (request.method() === "POST" && pathname === "/api/twb/generate") {
-      calls.twb += 1;
-      expect(body.output_name).toBe("validated_semantic_model.twb");
+    if (request.method() === "POST" && pathname === "/api/visual/map") {
+      calls.visual += 1;
       await fulfill(
         route,
         setState({
+          visual_conversion: {
+            exists: true,
+            name: "visual_content_mapped.twb",
+            path: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales/03_conversion_and_visual_mapping/visual_content_mapped.twb",
+            download_url: "/api/file?path=C%3A%2Ftmp%2Foutputs%2Frdl_to_twb%2F20260506T120000Z_RegionalSales%2F03_conversion_and_visual_mapping%2Fvisual_content_mapped.twb",
+            size_bytes: 58291,
+            status: "completed",
+            output_dir: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales/03_conversion_and_visual_mapping",
+            error: "",
+          },
+        }),
+      );
+      return;
+    }
+
+    if (request.method() === "POST" && pathname === "/api/twb/generate") {
+      calls.twb += 1;
+      expect(body.output_name).toBe("data_model_to_publish.twb");
+      await fulfill(
+        route,
+        setState({
+          artifact_workspace: {
+            root: {
+              exists: true,
+              name: "20260506T120000Z_RegionalSales",
+              path: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales",
+            },
+            manifest: {
+              exists: true,
+              name: "artifact_manifest.json",
+              path: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales/artifact_manifest.json",
+              download_url: "/api/file?path=C%3A%2Ftmp%2Foutputs%2Frdl_to_twb%2F20260506T120000Z_RegionalSales%2Fartifact_manifest.json",
+            },
+          },
           generated_twb: {
             exists: true,
-            name: "validated_semantic_model.twb",
-            path: "C:/tmp/validated_semantic_model.twb",
-            download_url: "/api/file?path=C%3A%2Ftmp%2Fvalidated_semantic_model.twb",
+            name: "data_model_to_publish.twb",
+            path: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales/04_data_model_to_publish/data_model_to_publish.twb",
+            download_url: "/api/file?path=C%3A%2Ftmp%2Foutputs%2Frdl_to_twb%2F20260506T120000Z_RegionalSales%2F04_data_model_to_publish%2Fdata_model_to_publish.twb",
             size_bytes: 48291,
+          },
+          visual_model_twb: {
+            exists: true,
+            name: "data_model_with_mapped_visuals.twb",
+            path: "C:/tmp/outputs/rdl_to_twb/20260506T120000Z_RegionalSales/05_final_workbook_with_visuals/data_model_with_mapped_visuals.twb",
+            download_url: "/api/file?path=C%3A%2Ftmp%2Foutputs%2Frdl_to_twb%2F20260506T120000Z_RegionalSales%2F05_final_workbook_with_visuals%2Fdata_model_with_mapped_visuals.twb",
+            size_bytes: 68291,
+            status: "completed",
+            error: "",
           },
           publish_context_summary: {
             data_source: {
@@ -498,27 +565,39 @@ test("TC-CONV-001 - Complete RDL to Tableau conversion with quality comparison",
     await expect(page.getByRole("row").filter({ hasText: "SalesAmount" })).toBeVisible();
 
     await page.getByRole("button", { name: "Approve model", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "7. TWB generation" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "7. Visual mapping" })).toBeVisible();
+  });
+
+  await test.step("visual content mapping works after schema validation", async () => {
+    await page.getByRole("button", { name: "Map visual content", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "8. TWB generation" })).toBeVisible();
+    await page.getByTestId("pipeline-step-visual-mapping").click();
+    await expect(page.getByText("Mapped", { exact: true })).toBeVisible();
+    await expect(page.locator(".file-summary strong").filter({ hasText: "visual_content_mapped.twb" })).toBeVisible();
+    await page.getByTestId("pipeline-step-twb-generation").click();
   });
 
   await test.step("TWB generation works and generated file link appears", async () => {
     await page.getByRole("button", { name: "Generate TWB", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "8. Tableau datasource" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "9. Tableau datasource" })).toBeVisible();
     await page.getByTestId("pipeline-step-twb-generation").click();
     await expect(page.getByText("Generated", { exact: true })).toBeVisible();
-    await expect(page.locator(".file-summary strong").filter({ hasText: "validated_semantic_model.twb" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Download TWB" })).toHaveAttribute("href", /\/api\/file/);
+    await expect(page.locator(".file-summary").filter({ hasText: "Data model TWB to publish" })).toContainText("data_model_to_publish.twb");
+    await expect(page.locator(".file-summary").filter({ hasText: "Data model + mapped visuals TWB" })).toContainText("data_model_with_mapped_visuals.twb");
+    await expect(page.locator(".file-summary").filter({ hasText: "Output workspace" })).toContainText("outputs/rdl_to_twb");
+    await expect(page.getByRole("link", { name: "Download data model TWB" })).toHaveAttribute("href", /\/api\/file/);
+    await expect(page.getByRole("link", { name: "Download data model + visuals TWB" })).toHaveAttribute("href", /\/api\/file/);
     await page.getByTestId("pipeline-step-tableau-datasource").click();
   });
 
   await test.step("Tableau datasource is prepared and published, then consumer workbook is generated", async () => {
-    await expect(page.getByRole("heading", { name: "8. Tableau datasource" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "9. Tableau datasource" })).toBeVisible();
     await expect(page.getByLabel("Datasource name")).toHaveValue("Regional Sales Datasource");
     await page.getByRole("button", { name: "Prepare publish" }).click();
 
-    await expect(page.getByRole("heading", { name: "9. Publish" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "10. Publish" })).toBeVisible();
     await page.getByRole("button", { name: "Publish datasource" }).click();
-    await expect(page.getByRole("heading", { name: "10. Final workbook" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "11. Final workbook" })).toBeVisible();
     await expect(page.getByText("Workbook ready")).toBeVisible();
     await expect(page.getByText("regional_sales_consumer.twb")).toBeVisible();
     await expect(page.getByRole("link", { name: "Download workbook" })).toHaveAttribute(
@@ -529,7 +608,7 @@ test("TC-CONV-001 - Complete RDL to Tableau conversion with quality comparison",
 
   await test.step("quality comparison is executed with global score >= 85% and detailed metrics", async () => {
     await page.getByRole("button", { name: "Compare quality" }).click();
-    await expect(page.getByRole("heading", { name: "11. Quality comparison" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "12. Quality comparison" })).toBeVisible();
 
     await page.getByRole("button", { name: "Run quality comparison" }).click();
     await expect(page.getByText("Quality comparison completed between the source RDL and generated Tableau workbook.")).toBeVisible();
@@ -553,6 +632,7 @@ test("TC-CONV-001 - Complete RDL to Tableau conversion with quality comparison",
     analyze: 1,
     correction: 1,
     validate: 1,
+    visual: 1,
     twb: 1,
     publish: 1,
     quality: 1,

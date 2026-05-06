@@ -28,7 +28,7 @@ export default function QualityComparisonStep({
 
   return (
     <Card
-      title="11. Quality comparison"
+      title="12. Quality comparison"
       eyebrow="RDL vs Tableau output"
       className="quality-comparison-card"
       actions={<Badge tone={comparison.executed ? scoreTone(globalScore) : "indigo"}>{statusLabel(comparison)}</Badge>}

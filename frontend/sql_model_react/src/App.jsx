@@ -7,6 +7,7 @@ import DatasetSelectionStep from "./components/steps/DatasetSelectionStep.jsx";
 import SqlAnalysisStep from "./components/steps/SqlAnalysisStep.jsx";
 import DimensionalModelStep from "./components/steps/DimensionalModelStep.jsx";
 import HumanValidationStep from "./components/steps/HumanValidationStep.jsx";
+import VisualMappingStep from "./components/steps/VisualMappingStep.jsx";
 import TwbGenerationStep from "./components/steps/TwbGenerationStep.jsx";
 import TableauDatasourceStep from "./components/steps/TableauDatasourceStep.jsx";
 import PublicationStep from "./components/steps/PublicationStep.jsx";
@@ -14,6 +15,7 @@ import ConsumerWorkbookStep from "./components/steps/ConsumerWorkbookStep.jsx";
 import QualityComparisonStep from "./components/steps/QualityComparisonStep.jsx";
 import RdlAiEditorPage from "./pages/RdlAiEditorPage.jsx";
 import RdlConversionPage from "./pages/RdlConversionPage.jsx";
+import QlikConversionPage from "./pages/QlikConversionPage.jsx";
 import {
   STATUS,
   analysisFromBackend,
@@ -29,6 +31,7 @@ import {
   emptyQualityComparison,
   generateTwb as generateTwbApi,
   getState,
+  mapVisualContent,
   modelFromBackend,
   parseRdl,
   parsingSummaryFromState,
@@ -63,6 +66,8 @@ function suggestedPipelineFromState(state) {
   const hasSql = Boolean(String(state?.sql_query || "").trim());
   const hasModel = Boolean(state?.latest_model && Object.keys(state.latest_model).length);
   const schemaValidated = Boolean(state?.schema_validated);
+  const hasVisualMapping = Boolean(state?.visual_conversion?.exists);
+  const visualMappingStatus = state?.visual_conversion?.status || "";
   const hasTwb = Boolean(state?.generated_twb?.exists);
   const hasPublishResult = Boolean(state?.publish_error || state?.publish_report?.status);
   const hasConsumerWorkbook = Boolean(state?.consumer_workbook?.exists);
@@ -95,27 +100,32 @@ function suggestedPipelineFromState(state) {
   if (schemaValidated) {
     statuses[4].status = STATUS.completed;
     statuses[5].status = STATUS.completed;
-    statuses[6].status = STATUS.inProgress;
+    statuses[6].status = visualMappingStatus === "failed" ? STATUS.error : STATUS.inProgress;
     active = 6;
   }
-  if (hasTwb) {
+  if (hasVisualMapping) {
     statuses[6].status = STATUS.completed;
     statuses[7].status = STATUS.inProgress;
     active = 7;
   }
-  if (hasPublishResult) {
+  if (hasTwb) {
     statuses[7].status = STATUS.completed;
-    statuses[8].status = state.publish_error ? STATUS.error : STATUS.completed;
+    statuses[8].status = STATUS.inProgress;
     active = 8;
   }
+  if (hasPublishResult) {
+    statuses[8].status = STATUS.completed;
+    statuses[9].status = state.publish_error ? STATUS.error : STATUS.completed;
+    active = 9;
+  }
   if (hasConsumerWorkbook) {
-    statuses[9].status = STATUS.completed;
-    statuses[10].status = hasQualityComparison ? STATUS.completed : STATUS.inProgress;
-    active = 10;
+    statuses[10].status = STATUS.completed;
+    statuses[11].status = hasQualityComparison ? STATUS.completed : STATUS.inProgress;
+    active = 11;
   }
   if (hasQualityComparison) {
-    statuses[10].status = STATUS.completed;
-    active = 10;
+    statuses[11].status = STATUS.completed;
+    active = 11;
   }
 
   return { statuses, active };
@@ -139,6 +149,7 @@ function tableauPayload(config) {
 const navItems = [
   { id: "pipeline", label: "SQL model flow" },
   { id: "conversion", label: "RDL to TWB" },
+  { id: "qlik", label: "Qlik metadata" },
   { id: "editor", label: "RDL AI editor" },
 ];
 
@@ -396,14 +407,25 @@ export default function App() {
     return state;
   }
 
-  async function generateTwb() {
+  async function mapVisuals() {
     setPipelineSteps(nextSteps({ 6: STATUS.inProgress }));
-    setTwbState((state) => ({ ...state, generated: false, progress: 35 }));
-    const state = await runBackendAction("TWB generation", () =>
-      generateTwbApi({ outputName: backendState?.defaults?.output_name || "validated_semantic_model.twb" }),
+    const state = await runBackendAction("Mapping report visuals", () =>
+      mapVisualContent({ configPath: backendState?.defaults?.config_path || "" }),
     );
     setPipelineSteps(nextSteps({ 6: STATUS.completed, 7: STATUS.inProgress }));
     setActiveStep(7);
+    setShowXml(false);
+    return state;
+  }
+
+  async function generateTwb() {
+    setPipelineSteps(nextSteps({ 7: STATUS.inProgress }));
+    setTwbState((state) => ({ ...state, generated: false, progress: 35 }));
+    const state = await runBackendAction("TWB generation", () =>
+      generateTwbApi({ outputName: backendState?.defaults?.output_name || "data_model_to_publish.twb" }),
+    );
+    setPipelineSteps(nextSteps({ 7: STATUS.completed, 8: STATUS.inProgress }));
+    setActiveStep(8);
     return state;
   }
 
@@ -417,12 +439,12 @@ export default function App() {
       return;
     }
     setDatasourcePrepared(true);
-    setPipelineSteps(nextSteps({ 7: STATUS.completed, 8: STATUS.inProgress }));
-    setActiveStep(8);
+    setPipelineSteps(nextSteps({ 8: STATUS.completed, 9: STATUS.inProgress }));
+    setActiveStep(9);
   }
 
   async function publishDatasource() {
-    setPipelineSteps(nextSteps({ 8: STATUS.inProgress }));
+    setPipelineSteps(nextSteps({ 9: STATUS.inProgress }));
     const state = await runBackendAction("Publishing datasource", () =>
       publishTableau({
         configPath: datasourceConfig.configPath || backendState?.defaults?.config_path || "",
@@ -430,10 +452,10 @@ export default function App() {
       }),
     );
     if (state.publish_error) {
-      setPipelineSteps(nextSteps({ 8: STATUS.error }));
+      setPipelineSteps(nextSteps({ 9: STATUS.error }));
     } else {
-      setPipelineSteps(nextSteps({ 8: STATUS.completed, 9: STATUS.inProgress }));
-      setActiveStep(9);
+      setPipelineSteps(nextSteps({ 9: STATUS.completed, 10: STATUS.inProgress }));
+      setActiveStep(10);
     }
     return state;
   }
@@ -446,20 +468,20 @@ export default function App() {
       return;
     }
     setConsumerWorkbook(workbook);
-    setPipelineSteps(nextSteps({ 9: STATUS.completed, 10: STATUS.inProgress }));
-    setActiveStep(10);
+    setPipelineSteps(nextSteps({ 10: STATUS.completed, 11: STATUS.inProgress }));
+    setActiveStep(11);
   }
 
   function continueToQualityComparison() {
-    setPipelineSteps(nextSteps({ 9: STATUS.completed, 10: STATUS.inProgress }));
-    setActiveStep(10);
+    setPipelineSteps(nextSteps({ 10: STATUS.completed, 11: STATUS.inProgress }));
+    setActiveStep(11);
   }
 
   async function runQualityComparison() {
-    setPipelineSteps(nextSteps({ 10: STATUS.inProgress }));
+    setPipelineSteps(nextSteps({ 11: STATUS.inProgress }));
     const state = await runBackendAction("Quality comparison", compareQuality);
-    setPipelineSteps(nextSteps({ 10: STATUS.completed }));
-    setActiveStep(10);
+    setPipelineSteps(nextSteps({ 11: STATUS.completed }));
+    setActiveStep(11);
     return state;
   }
 
@@ -531,8 +553,10 @@ export default function App() {
           />
         );
       case 6:
-        return <TwbGenerationStep twbState={twbState} onGenerate={generateTwb} showXml={showXml} setShowXml={setShowXml} />;
+        return <VisualMappingStep twbState={twbState} onMapVisuals={mapVisuals} loading={Boolean(loading)} />;
       case 7:
+        return <TwbGenerationStep twbState={twbState} onGenerate={generateTwb} showXml={showXml} setShowXml={setShowXml} />;
+      case 8:
         return (
           <TableauDatasourceStep
             datasourceConfig={datasourceConfig}
@@ -542,9 +566,9 @@ export default function App() {
             onPrepare={prepareDatasource}
           />
         );
-      case 8:
-        return <PublicationStep datasourceConfig={datasourceConfig} publicationResult={publicationResult} onPublish={publishDatasource} />;
       case 9:
+        return <PublicationStep datasourceConfig={datasourceConfig} publicationResult={publicationResult} onPublish={publishDatasource} />;
+      case 10:
         return (
           <ConsumerWorkbookStep
             consumerWorkbook={consumerWorkbook}
@@ -554,7 +578,7 @@ export default function App() {
             onStartNew={resetPipeline}
           />
         );
-      case 10:
+      case 11:
         return (
           <QualityComparisonStep
             qualityComparison={qualityComparison}
@@ -632,6 +656,27 @@ export default function App() {
           {loading && <div className="loading-banner">{loading} in progress...</div>}
           {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
           <RdlAiEditorPage defaultConfigPath={defaultConfigPath} />
+        </main>
+      </div>
+    );
+  }
+
+  if (activePage === "qlik") {
+    return (
+      <div className="app-shell">
+        <Header
+          activeStepTitle="Qlik metadata"
+          validationStatus={validationStatus}
+          context={headerContext}
+          navItems={navItems}
+          activePage={activePage}
+          onNavigate={setActivePage}
+          showValidationBadge={false}
+        />
+        <main className="page-workspace">
+          {loading && <div className="loading-banner">{loading} in progress...</div>}
+          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
+          <QlikConversionPage />
         </main>
       </div>
     );

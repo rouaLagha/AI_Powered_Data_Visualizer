@@ -72,6 +72,9 @@ def generate_semantic_models(
     (output_dir / "mapping.json").write_text(
         json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
     )
+    (output_dir / "mapping_model.json").write_text(
+        json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
 
     return data_model, visual_model, mapping
 
@@ -303,20 +306,18 @@ def _build_deterministic_semantic_payload(parsed_rdl: dict) -> dict:
                 }
             )
 
-        if isinstance(dataset_name, str) and dataset_name.strip():
-            visual_to_dataset.append(
-                {
-                    "visual_name": v_name,
-                    "dataset_name": dataset_name,
-                }
-            )
-        if fields:
-            visual_to_fields.append(
-                {
-                    "visual_name": v_name,
-                    "fields": fields,
-                }
-            )
+        visual_to_dataset.append(
+            {
+                "visual_name": v_name,
+                "dataset_name": dataset_name if isinstance(dataset_name, str) and dataset_name.strip() else None,
+            }
+        )
+        visual_to_fields.append(
+            {
+                "visual_name": v_name,
+                "fields": fields,
+            }
+        )
 
     parameter_usage: list[dict] = []
     for p in report_parameters:

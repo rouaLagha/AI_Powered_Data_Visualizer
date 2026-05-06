@@ -10511,6 +10511,7 @@ def _generate_twb_from_validated_model(
     data_source: dict[str, Any],
     dataset: dict[str, Any],
     validated_model: dict[str, Any],
+    preserve_template_exposed_columns: bool = False,
 ) -> str:
     datasource_payload = copy.deepcopy(data_source) if isinstance(data_source, dict) else {}
     dataset_payload = copy.deepcopy(dataset) if isinstance(dataset, dict) else {}
@@ -10552,11 +10553,15 @@ def _generate_twb_from_validated_model(
             # Passing None lets twb_builder fall back to RDL fields and SQL joins.
             db_catalog = None
 
-    connected_xml = inject_datasource_connections(
-        xml_content=template_xml,
-        data_sources=[datasource_payload] if datasource_payload else [],
-        data_sets=[dataset_payload] if dataset_payload else [],
-        db_catalog=db_catalog,
+    connected_xml = (
+        template_xml
+        if preserve_template_exposed_columns
+        else inject_datasource_connections(
+            xml_content=template_xml,
+            data_sources=[datasource_payload] if datasource_payload else [],
+            data_sets=[dataset_payload] if dataset_payload else [],
+            db_catalog=db_catalog,
+        )
     )
 
     return _apply_validated_schema_to_twb(
@@ -10565,6 +10570,7 @@ def _generate_twb_from_validated_model(
         data_source=datasource_payload,
         target_datasource_name=template_datasource_name,
         preferred_exposed_names=preferred_exposed_names,
+        preserve_template_exposed_columns=preserve_template_exposed_columns,
     )
 
 
@@ -10860,6 +10866,7 @@ def _apply_validated_schema_to_twb(
     data_source: dict[str, Any],
     target_datasource_name: str = "",
     preferred_exposed_names: dict[tuple[str, str], str] | None = None,
+    preserve_template_exposed_columns: bool = False,
 ) -> str:
     root = ET.fromstring(xml_content)
     datasources_node = root.find("datasources")
@@ -10877,6 +10884,12 @@ def _apply_validated_schema_to_twb(
         datasource_node = datasources_node.find("datasource")
     if datasource_node is None:
         raise ValueError("Template TWB has no datasource node.")
+
+    template_exposed_columns = (
+        [copy.deepcopy(child) for child in list(datasource_node) if child.tag == "column"]
+        if preserve_template_exposed_columns
+        else []
+    )
 
     # Tableau can infer this; removing the flag keeps generated files closer to canonical templates.
     datasource_node.attrib.pop("hasconnection", None)
@@ -10963,7 +10976,10 @@ def _apply_validated_schema_to_twb(
         connection_node=connection_node,
         datasource_node=datasource_node,
     )
-    _tableau_ensure_exposed_columns_from_connection_metadata(datasource_node)
+    if preserve_template_exposed_columns:
+        _restore_template_exposed_columns(datasource_node, template_exposed_columns)
+    else:
+        _tableau_ensure_exposed_columns_from_connection_metadata(datasource_node)
 
     _normalize_connection_child_order(connection_node)
 
@@ -10999,6 +11015,26 @@ def _normalize_connection_child_order(connection_node: ET.Element) -> None:
 
     for child in trailing:
         connection_node.append(child)
+
+
+def _restore_template_exposed_columns(datasource_node: ET.Element, template_columns: list[ET.Element]) -> None:
+    if not template_columns:
+        return
+
+    for child in [item for item in list(datasource_node) if item.tag == "column"]:
+        datasource_node.remove(child)
+
+    children = list(datasource_node)
+    insert_at = 0
+    for index, child in enumerate(children):
+        if child.tag == "aliases":
+            insert_at = index + 1
+            break
+        if child.tag == "connection":
+            insert_at = index + 1
+
+    for offset, column_node in enumerate(template_columns):
+        datasource_node.insert(insert_at + offset, copy.deepcopy(column_node))
 
 
 def _order_table_instances_for_structure(
@@ -12490,7 +12526,8 @@ def _generate_response(
 
     sql_evidence_model = _heuristic_model(sql_query, conversation, apply_corrections=False)
     previous_model = _latest_assistant_model_from_conversation(conversation)
-    if previous_model and _follow_up_user_messages(conversation):
+    has_follow_up = bool(_follow_up_user_messages(conversation))
+    if previous_model and has_follow_up:
         sql_evidence_model = copy.deepcopy(previous_model)
     _apply_follow_up_corrections(sql_evidence_model, conversation)
     if not isinstance(database_context, dict):
@@ -12514,6 +12551,7 @@ def _generate_response(
                 llm_model,
                 sql_evidence_model,
                 forced_model_type=_forced_model_type_from_conversation(conversation),
+                allow_llm_schema_changes=has_follow_up,
             )
             structured_result["database_context"] = database_context
             assistant_text = _augment_assistant_response_text(
@@ -12570,6 +12608,7 @@ def _merge_llm_with_sql_evidence(
     llm_model: dict[str, Any],
     sql_evidence_model: dict[str, Any],
     forced_model_type: str = "",
+    allow_llm_schema_changes: bool = False,
 ) -> dict[str, Any]:
     merged = copy.deepcopy(sql_evidence_model)
 
@@ -12600,18 +12639,13 @@ def _merge_llm_with_sql_evidence(
         llm_dimensions,
     )
 
-    if not merged.get("relationships") and llm_model.get("relationships"):
-        candidate_relationships: list[dict[str, Any]] = []
-        for relationship in llm_model.get("relationships", []):
-            if not isinstance(relationship, dict):
-                continue
-            from_table = str(relationship.get("from_table", "")).strip()
-            to_table = str(relationship.get("to_table", "")).strip()
-            if not from_table or not to_table:
-                continue
-            if _name_key(from_table) not in known_table_keys or _name_key(to_table) not in known_table_keys:
-                continue
-            candidate_relationships.append(relationship)
+    if allow_llm_schema_changes:
+        _apply_llm_dimension_grouping(merged, llm_model, known_table_keys)
+        candidate_relationships = _known_llm_relationships_for_model(merged, llm_model, known_table_keys)
+        if candidate_relationships:
+            merged["relationships"] = candidate_relationships
+    elif not merged.get("relationships") and llm_model.get("relationships"):
+        candidate_relationships = _known_llm_relationships_for_model(merged, llm_model, known_table_keys)
         if candidate_relationships:
             merged["relationships"] = candidate_relationships
 
@@ -12633,6 +12667,183 @@ def _merge_llm_with_sql_evidence(
 
     _refresh_model_output(merged, forced_model_type=forced_model_type or None)
     return merged
+
+
+def _known_llm_relationships_for_model(
+    base_model: dict[str, Any],
+    llm_model: dict[str, Any],
+    known_table_keys: set[str],
+) -> list[dict[str, Any]]:
+    relationships: list[dict[str, Any]] = []
+    for relationship in llm_model.get("relationships", []):
+        if not isinstance(relationship, dict):
+            continue
+        from_table = _resolve_known_llm_table_name(
+            base_model,
+            str(relationship.get("from_table", "")).strip(),
+            known_table_keys,
+        )
+        to_table = _resolve_known_llm_table_name(
+            base_model,
+            str(relationship.get("to_table", "")).strip(),
+            known_table_keys,
+        )
+        if not from_table or not to_table:
+            continue
+        existing_relationship, reverse_match = _find_existing_relationship(base_model, from_table, to_table)
+        existing_cardinality = str(existing_relationship.get("cardinality", "")).strip()
+        if reverse_match and existing_cardinality:
+            existing_cardinality = _reverse_cardinality(existing_cardinality)
+        relationships.append(
+            {
+                "from_table": from_table,
+                "to_table": to_table,
+                "from_alias": str(relationship.get("from_alias", "")).strip(),
+                "to_alias": str(relationship.get("to_alias", "")).strip(),
+                "relationship_type": _normalize_relationship_type(
+                    str(relationship.get("relationship_type", "") or "")
+                )
+                or str(existing_relationship.get("relationship_type", "")).strip(),
+                "cardinality": str(relationship.get("cardinality", "")).strip() or existing_cardinality,
+                "join_condition": str(relationship.get("join_condition", "")).strip()
+                or str(existing_relationship.get("join_condition", "")).strip(),
+            }
+        )
+    return _dedupe_relationships(relationships)
+
+
+def _find_existing_relationship(
+    base_model: dict[str, Any],
+    from_table: str,
+    to_table: str,
+) -> tuple[dict[str, Any], bool]:
+    for relationship in base_model.get("relationships", []):
+        if not isinstance(relationship, dict):
+            continue
+        direct_match = _same_name(str(relationship.get("from_table", "")), from_table) and _same_name(
+            str(relationship.get("to_table", "")),
+            to_table,
+        )
+        if direct_match:
+            return relationship, False
+        reverse_match = _same_name(str(relationship.get("from_table", "")), to_table) and _same_name(
+            str(relationship.get("to_table", "")),
+            from_table,
+        )
+        if reverse_match:
+            return relationship, True
+    return {}, False
+
+
+def _apply_llm_dimension_grouping(
+    base_model: dict[str, Any],
+    llm_model: dict[str, Any],
+    known_table_keys: set[str],
+) -> None:
+    direct_dimensions = _known_llm_dimensions_for_model(
+        base_model,
+        _normalize_dimension_list(llm_model.get("direct_dimensions", [])),
+        known_table_keys,
+    )
+    snowflake_dimensions = _known_llm_dimensions_for_model(
+        base_model,
+        _normalize_dimension_list(llm_model.get("snowflake_dimensions", [])),
+        known_table_keys,
+    )
+    if not direct_dimensions and not snowflake_dimensions:
+        return
+
+    grouped_keys = {
+        _dimension_identity_key(dimension)
+        for dimension in direct_dimensions + snowflake_dimensions
+        if _dimension_identity_key(dimension)
+    }
+
+    for dimension in _normalize_dimension_list(base_model.get("direct_dimensions", [])):
+        key = _dimension_identity_key(dimension)
+        if key and key not in grouped_keys:
+            direct_dimensions.append(dimension)
+            grouped_keys.add(key)
+
+    for dimension in _normalize_dimension_list(base_model.get("snowflake_dimensions", [])):
+        key = _dimension_identity_key(dimension)
+        if key and key not in grouped_keys:
+            snowflake_dimensions.append(dimension)
+            grouped_keys.add(key)
+
+    base_model["direct_dimensions"] = _merge_dimensions(direct_dimensions)
+    base_model["snowflake_dimensions"] = _merge_dimensions(snowflake_dimensions)
+
+
+def _known_llm_dimensions_for_model(
+    base_model: dict[str, Any],
+    dimensions: list[dict[str, Any]],
+    known_table_keys: set[str],
+) -> list[dict[str, Any]]:
+    known_dimensions: list[dict[str, Any]] = []
+    for dimension in dimensions:
+        resolved_name = _resolve_known_llm_table_name(
+            base_model,
+            str(dimension.get("name", "") or dimension.get("physical_table", "")).strip(),
+            known_table_keys,
+        ) or _resolve_known_llm_table_name(
+            base_model,
+            str(dimension.get("physical_table", "") or "").strip(),
+            known_table_keys,
+        )
+        if not resolved_name:
+            continue
+
+        existing = _find_existing_dimension(base_model, resolved_name)
+        source = existing or dimension
+        known_dimensions.append(
+            {
+                "name": str(source.get("name", "") or resolved_name).strip(),
+                "physical_table": str(source.get("physical_table", "") or dimension.get("physical_table", "") or resolved_name).strip(),
+                "alias": str(source.get("alias", "") or dimension.get("alias", "")).strip(),
+                "semantic_role": str(
+                    dimension.get("semantic_role", "") or source.get("semantic_role", "")
+                ).strip(),
+                "attributes": _unique(
+                    _as_string_list(source.get("attributes", []))
+                    + _as_string_list(dimension.get("attributes", []))
+                ),
+                "natural_key": str(
+                    dimension.get("natural_key", "") or source.get("natural_key", "")
+                ).strip(),
+            }
+        )
+    return _merge_dimensions(known_dimensions)
+
+
+def _find_existing_dimension(base_model: dict[str, Any], table_name: str) -> dict[str, Any]:
+    for dimension in _normalize_dimension_list(base_model.get("direct_dimensions", [])) + _normalize_dimension_list(
+        base_model.get("snowflake_dimensions", [])
+    ):
+        if _same_name(str(dimension.get("name", "")), table_name) or _same_name(
+            str(dimension.get("physical_table", "")),
+            table_name,
+        ):
+            return dimension
+    return {}
+
+
+def _resolve_known_llm_table_name(
+    base_model: dict[str, Any],
+    table_name: str,
+    known_table_keys: set[str],
+) -> str:
+    if not table_name:
+        return ""
+    resolved = _resolve_table_name(base_model, table_name)
+    if resolved and _name_key(resolved) in known_table_keys:
+        return resolved
+    if _name_key(table_name) in known_table_keys:
+        return _clean_name(table_name)
+    parsed_physical, _parsed_role = _split_dimension_name_role(table_name)
+    if parsed_physical and _name_key(parsed_physical) in known_table_keys:
+        return _clean_name(parsed_physical)
+    return ""
 
 
 def _enrich_dimension_attributes(
@@ -14815,13 +15026,23 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
 
     for relation_remove_match in re.finditer(
         fr"\b(?:remove|delete|drop|supprime(?:r)?|enleve(?:r)?)\b[^\n]{{0,80}}?"
-        fr"\b(?:relationship|relation|lien)\b[^\n]{{0,120}}?\b(?:between|entre)\s+"
-        fr"(?P<left>{identifier_token})\s+(?:and|et)\s+(?P<right>{identifier_token})",
+        fr"\b(?:relationship|relation|lien)\b[^\n]{{0,120}}?"
+        fr"(?:"
+        fr"\b(?:between|entre)\s+(?P<between_left>{identifier_token})\s+"
+        fr"(?:and|et)\s+(?P<between_right>{identifier_token})"
+        fr"|"
+        fr"\b(?:from|de)\s+(?P<from_left>{identifier_token})\s+"
+        fr"(?:to|vers|a)\s+(?P<from_right>{identifier_token})"
+        fr")",
         folded,
         flags=re.IGNORECASE,
     ):
-        left_name = relation_remove_match.group("left")
-        right_name = relation_remove_match.group("right")
+        left_name = _clean_correction_identifier(
+            relation_remove_match.group("between_left") or relation_remove_match.group("from_left")
+        )
+        right_name = _clean_correction_identifier(
+            relation_remove_match.group("between_right") or relation_remove_match.group("from_right")
+        )
         if _remove_relationship_correction(model, left_name, right_name):
             handled_relationship_pairs.add(_relationship_pair_key(left_name, right_name))
             applied_notes.append(f"User correction applied: removed relationship between {left_name} and {right_name}.")
@@ -15032,8 +15253,12 @@ def _apply_follow_up_corrections(model: dict[str, Any], conversation: list[dict[
     _refresh_model_output(model, forced_model_type=forced_model_type)
 
 
+def _clean_correction_identifier(value: str) -> str:
+    return _clean_name(str(value or "")).strip().strip(".,;:")
+
+
 def _resolve_table_name(model: dict[str, Any], candidate: str) -> str:
-    lookup_name = candidate.strip()
+    lookup_name = _clean_correction_identifier(candidate)
     if not lookup_name:
         return ""
     known_names: list[str] = []
@@ -15082,6 +15307,8 @@ def _apply_relationship_correction(
     left_column: str = "",
     right_column: str = "",
 ) -> None:
+    left_name = _clean_correction_identifier(left_name)
+    right_name = _clean_correction_identifier(right_name)
     if _invalid_relationship_endpoint_name(left_name) or _invalid_relationship_endpoint_name(right_name):
         return
 
@@ -15155,12 +15382,14 @@ def _apply_relationship_correction(
 
 
 def _relationship_pair_key(left_name: str, right_name: str) -> tuple[str, str]:
-    left_key = _name_key(left_name)
-    right_key = _name_key(right_name)
+    left_key = _name_key(_clean_correction_identifier(left_name))
+    right_key = _name_key(_clean_correction_identifier(right_name))
     return tuple(sorted([left_key, right_key]))
 
 
 def _remove_relationship_correction(model: dict[str, Any], left_name: str, right_name: str) -> bool:
+    left_name = _clean_correction_identifier(left_name)
+    right_name = _clean_correction_identifier(right_name)
     relationships = model.get("relationships", [])
     if not isinstance(relationships, list):
         return False
@@ -15188,7 +15417,7 @@ def _remove_relationship_correction(model: dict[str, Any], left_name: str, right
 
 
 def _invalid_relationship_endpoint_name(value: str) -> bool:
-    token = _fold_correction_text(value).strip().lower()
+    token = _fold_correction_text(_clean_correction_identifier(value)).strip().lower()
     if not token:
         return True
     return token in {

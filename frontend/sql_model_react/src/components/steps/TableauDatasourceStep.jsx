@@ -14,7 +14,7 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
   const secretPlaceholder = datasourceConfig.credentialsReady ? "Already loaded from backend config" : "Required for publish";
 
   return (
-    <Card title="8. Tableau datasource" eyebrow="Publish settings" className="tableau-datasource-card">
+    <Card title="9. Tableau datasource" eyebrow="Publish settings" className="tableau-datasource-card">
       <div className="publish-minimal-strip">
         <div>
           <span>Source</span>

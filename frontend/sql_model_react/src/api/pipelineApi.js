@@ -40,6 +40,11 @@ export const pipelineDefinitions = [
     description: "Approve model changes before generation.",
   },
   {
+    id: "visual-mapping",
+    title: "Visual mapping",
+    description: "Map validated report visuals before final TWB generation.",
+  },
+  {
     id: "twb-generation",
     title: "Generate TWB",
     description: "Generate Tableau workbook XML from the model.",
@@ -170,7 +175,14 @@ export function validateSchema() {
   return requestJson("/api/schema/validate", { method: "POST", body: "{}" });
 }
 
-export function generateTwb({ outputName = "validated_semantic_model.twb", templatePath = "" } = {}) {
+export function mapVisualContent({ configPath = "" } = {}) {
+  return requestJson("/api/visual/map", {
+    method: "POST",
+    body: JSON.stringify({ config_path: configPath }),
+  });
+}
+
+export function generateTwb({ outputName = "data_model_to_publish.twb", templatePath = "" } = {}) {
   return requestJson("/api/twb/generate", {
     method: "POST",
     body: JSON.stringify({ output_name: outputName, template_path: templatePath }),
@@ -207,6 +219,33 @@ export function runRdlConversion({
   });
 }
 
+export function runQlikMetadataJob({
+  fileName,
+  contentBase64,
+  jobsRoot = "",
+  qlikEndpoint = "ws://localhost:4848/app",
+  qlikAppsDir = "",
+  qlikUserDirectory = "",
+  qlikUserId = "",
+  qlikSessionCookie = "",
+  jobId = "",
+}) {
+  return requestJson("/api/qlik/metadata/run", {
+    method: "POST",
+    body: JSON.stringify({
+      file_name: fileName,
+      content_base64: contentBase64,
+      jobs_root: jobsRoot,
+      job_id: jobId,
+      qlik_endpoint: qlikEndpoint,
+      qlik_apps_dir: qlikAppsDir,
+      qlik_user_directory: qlikUserDirectory,
+      qlik_user_id: qlikUserId,
+      qlik_session_cookie: qlikSessionCookie,
+    }),
+  });
+}
+
 export function applyRdlAiEdit({
   fileName,
   content,
@@ -232,6 +271,18 @@ export function readFileAsText(file) {
     reader.onload = () => resolve(String(reader.result || ""));
     reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
     reader.readAsText(file);
+  });
+}
+
+export function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      resolve(value.includes(",") ? value.split(",", 2)[1] : value);
+    };
+    reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -495,6 +546,11 @@ export function consumerWorkbookFromState(state) {
 
 export function twbStateFromState(state) {
   const twb = state?.generated_twb || {};
+  const visualConversion = state?.visual_conversion || {};
+  const visualModelTwb = state?.visual_model_twb || {};
+  const artifactWorkspace = state?.artifact_workspace || {};
+  const artifactRoot = artifactWorkspace.root || {};
+  const artifactManifest = artifactWorkspace.manifest || {};
   return {
     generated: Boolean(twb.exists),
     progress: twb.exists ? 100 : 0,
@@ -502,6 +558,30 @@ export function twbStateFromState(state) {
     downloadUrl: twb.download_url || "",
     path: twb.path || "",
     sizeBytes: twb.size_bytes || 0,
+    artifactWorkspace: {
+      path: artifactRoot.path || "",
+      exists: Boolean(artifactRoot.exists),
+      manifestPath: artifactManifest.path || "",
+      manifestDownloadUrl: artifactManifest.download_url || "",
+    },
+    visualConversion: {
+      exists: Boolean(visualConversion.exists),
+      status: visualConversion.status || "not_started",
+      name: visualConversion.name || "",
+      path: visualConversion.path || "",
+      outputDir: visualConversion.output_dir || "",
+      downloadUrl: visualConversion.download_url || "",
+      error: visualConversion.error || "",
+    },
+    visualModel: {
+      generated: Boolean(visualModelTwb.exists),
+      exists: Boolean(visualModelTwb.exists),
+      status: visualModelTwb.status || "not_started",
+      name: visualModelTwb.name || "",
+      path: visualModelTwb.path || "",
+      downloadUrl: visualModelTwb.download_url || "",
+      error: visualModelTwb.error || "",
+    },
   };
 }
 

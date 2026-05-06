@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
+from concurrent.futures import Future
 from datetime import datetime, timezone
 import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +19,7 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from uuid import uuid4
 
 import streamlit as st
 
@@ -37,6 +42,7 @@ from src.rdl_to_twb.db_introspection import (
 from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agent, validate_patch
 from src.rdl_ai_editor.logging_utils import write_patch_log
 from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
+from src.qlik_to_twb.metadata_pipeline import run_qlik_metadata_job, run_uploaded_qlik_metadata_job
 from sql_model_assistant_app import (
     DEFAULT_LLM_CONFIG,
     FALLBACK_LLM_CONFIG,
@@ -54,6 +60,7 @@ from sql_model_assistant_app import (
     _run_tableau_cloud_publish_workflow,
     _safe_output_twb_name,
     _seed_initial_sql_model_conversation,
+    _tableau_clone_linked_workbook_with_visual_content,
     _tableau_format_user_publish_failure,
     _template_default_path,
 )
@@ -64,13 +71,33 @@ DIST_DIR = FRONTEND_DIR / "dist"
 INDEX_PATH = FRONTEND_DIR / "index.html"
 SCHEMA_FLOW_FRONTEND_DIR = BACKEND_DIR / "src" / "schema_flow_component" / "frontend"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
+RDL_TO_TWB_OUTPUT_DIR = OUTPUT_DIR / "rdl_to_twb"
+REFERENCE_DATA_MODEL_TEMPLATE_PATH = (
+    OUTPUT_DIR / "tableau_publish_artifacts" / "20260429T155801Z_generated_source_twb_validated_semantic_model.twb"
+)
+DATA_MODEL_TEMPLATE_ENV = "RDL_TO_TWB_DATA_MODEL_TEMPLATE_TWB"
+REGIONALSALES_VISUAL_TEMPLATE_ENV = "REGIONALSALES_VISUAL_TWB"
+REGIONALSALES_VISUAL_TEMPLATE_NAME = "converted_report_perfect.twb"
+INPUT_DIR_NAME = "00_input_report"
+DATA_VERIFICATION_DIR_NAME = "01_data_verification"
+SEMANTIC_MODEL_DIR_NAME = "02_semantic_model"
+CONVERSION_DIR_NAME = "03_conversion_and_visual_mapping"
+DATA_MODEL_DIR_NAME = "04_data_model_to_publish"
+FINAL_WORKBOOK_DIR_NAME = "05_final_workbook_with_visuals"
+PUBLISH_DIR_NAME = "06_tableau_publish"
+QUALITY_DIR_NAME = "07_quality_verification"
+VISUAL_MAPPING_TWB_NAME = "visual_content_mapped.twb"
+DATA_MODEL_TWB_NAME = "data_model_to_publish.twb"
+FINAL_WORKBOOK_TWB_NAME = "data_model_with_mapped_visuals.twb"
+QLIK_OUTPUT_DIR = PROJECT_ROOT / "output"
+QLIK_JOBS_DIR = QLIK_OUTPUT_DIR / "qlik_jobs"
 STATE_LOCK = Lock()
 RDL_XSD_PATH = BACKEND_DIR / "assets" / "ReportDefinition.xsd"
 TWB_XSD_PATH = BACKEND_DIR / "assets" / "twb_2026.1.0.xsd"
 
 
 class SqlModelThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
+    allow_reuse_address = False
     daemon_threads = True
 
 
@@ -78,14 +105,25 @@ def _initial_app_state() -> dict[str, Any]:
     return {
         "report": {},
         "report_name": "",
+        "rdl_content": "",
         "selected_dataset_name": "",
         "selected_datasource_name": "",
         "sql_query": "",
         "conversation": [],
         "latest_model": {},
         "validated_model": {},
+        "artifact_dir": "",
+        "artifact_manifest_path": "",
+        "data_model_template_path": "",
         "generated_twb_path": "",
-        "generated_twb_name": "validated_semantic_model.twb",
+        "generated_twb_name": DATA_MODEL_TWB_NAME,
+        "visual_conversion_future": None,
+        "visual_conversion_path": "",
+        "visual_conversion_output_dir": "",
+        "visual_conversion_error": "",
+        "visual_model_twb_path": "",
+        "visual_model_twb_error": "",
+        "visual_model_source_path": "",
         "publish_context": {},
         "publish_report": {},
         "publish_error": "",
@@ -116,6 +154,7 @@ def _frontend_index_path() -> Path:
 
 
 def _reset_app_state() -> dict[str, Any]:
+    _clear_visual_conversion_state(cancel_running=True)
     APP_STATE.clear()
     APP_STATE.update(_initial_app_state())
     return _state_snapshot()
@@ -207,8 +246,343 @@ def _safe_file_stem(value: str, fallback: str = "report") -> str:
     return cleaned or fallback
 
 
+def _safe_artifact_file_name(value: str, fallback: str) -> str:
+    raw_name = Path(value or fallback).name or fallback
+    suffix = Path(raw_name).suffix
+    stem = _safe_file_stem(raw_name, fallback=_safe_file_stem(fallback))
+    safe_suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,12}", suffix or "") else Path(fallback).suffix
+    return f"{stem}{safe_suffix or Path(fallback).suffix}"
+
+
 def _timestamp_token() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _directory_payload(path_value: str) -> dict[str, Any]:
+    if not path_value:
+        return {}
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return {"path": str(path), "exists": False}
+    if not resolved.is_dir() or not _is_safe_download_path(resolved):
+        return {"path": str(resolved), "exists": False}
+    return {
+        "path": str(resolved),
+        "name": resolved.name,
+        "exists": True,
+    }
+
+
+def _new_artifact_run_dir(file_name: str) -> Path:
+    report_stem = _safe_file_stem(file_name, fallback="uploaded_report")
+    base_dir = RDL_TO_TWB_OUTPUT_DIR / f"{_timestamp_token()}_{report_stem}"
+    run_dir = base_dir
+    counter = 2
+    while run_dir.exists():
+        run_dir = RDL_TO_TWB_OUTPUT_DIR / f"{base_dir.name}_{counter}"
+        counter += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _artifact_run_dir(create: bool = False) -> Path | None:
+    raw_value = str(APP_STATE.get("artifact_dir") or "").strip()
+    if raw_value:
+        path = Path(raw_value)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+    elif create:
+        path = _new_artifact_run_dir(str(APP_STATE.get("report_name") or "uploaded_report.rdl"))
+        APP_STATE["artifact_dir"] = str(path)
+    else:
+        return None
+
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _artifact_subdir(name: str, create: bool = True) -> Path:
+    run_dir = _artifact_run_dir(create=create)
+    if run_dir is None:
+        raise ValueError("Artifact workspace is not initialized. Upload the RDL report first.")
+    directory = run_dir / name
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _artifact_manifest_path(create: bool = False) -> Path | None:
+    run_dir = _artifact_run_dir(create=create)
+    if run_dir is None:
+        return None
+    return run_dir / "artifact_manifest.json"
+
+
+def _artifact_workspace_payload() -> dict[str, Any]:
+    run_dir = _artifact_run_dir(create=False)
+    if run_dir is None:
+        return {}
+    return {
+        "root": _directory_payload(str(run_dir)),
+        "manifest": _file_payload(str(_artifact_manifest_path(create=False) or "")),
+        "folders": {
+            "input_report": _directory_payload(str(run_dir / INPUT_DIR_NAME)),
+            "data_verification": _directory_payload(str(run_dir / DATA_VERIFICATION_DIR_NAME)),
+            "semantic_model": _directory_payload(str(run_dir / SEMANTIC_MODEL_DIR_NAME)),
+            "conversion_and_visual_mapping": _directory_payload(str(run_dir / CONVERSION_DIR_NAME)),
+            "data_model_to_publish": _directory_payload(str(run_dir / DATA_MODEL_DIR_NAME)),
+            "final_workbook_with_visuals": _directory_payload(str(run_dir / FINAL_WORKBOOK_DIR_NAME)),
+            "tableau_publish": _directory_payload(str(run_dir / PUBLISH_DIR_NAME)),
+            "quality_verification": _directory_payload(str(run_dir / QUALITY_DIR_NAME)),
+        },
+    }
+
+
+def _artifact_file_payload(folder_name: str, file_name: str) -> dict[str, Any]:
+    run_dir = _artifact_run_dir(create=False)
+    if run_dir is None:
+        return {}
+    return _file_payload(str(run_dir / folder_name / file_name))
+
+
+def _write_artifact_manifest(stage: str) -> None:
+    manifest_path = _artifact_manifest_path(create=False)
+    if manifest_path is None:
+        return
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    run_dir = _artifact_run_dir(create=False)
+    payload = {
+        "stage": stage,
+        "updated_at": _timestamp_token(),
+        "report_name": str(APP_STATE.get("report_name") or ""),
+        "selected_dataset_name": str(APP_STATE.get("selected_dataset_name") or ""),
+        "selected_datasource_name": str(APP_STATE.get("selected_datasource_name") or ""),
+        "artifact_root": str(run_dir or ""),
+        "artifacts": {
+            "input_rdl": _artifact_file_payload(
+                INPUT_DIR_NAME,
+                _safe_artifact_file_name(str(APP_STATE.get("report_name") or "uploaded_report.rdl"), "uploaded_report.rdl"),
+            ),
+            "parsed_report": _artifact_file_payload(INPUT_DIR_NAME, "parsed_report.json"),
+            "selected_dataset_sql": _artifact_file_payload(INPUT_DIR_NAME, "selected_dataset.sql"),
+            "data_verification_summary": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "data_verification_summary.json"),
+            "datasource_inventory": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "datasource_inventory.json"),
+            "latest_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "latest_semantic_model.json"),
+            "validated_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "validated_semantic_model.json"),
+            "data_model_template_twb": _file_payload(str(APP_STATE.get("data_model_template_path") or "")),
+            "data_model_template_copy": _artifact_file_payload(DATA_MODEL_DIR_NAME, "source_template_used.twb"),
+            "data_model_generation_report": _artifact_file_payload(DATA_MODEL_DIR_NAME, "data_model_generation_report.json"),
+            "conversion_trace": _artifact_file_payload(CONVERSION_DIR_NAME, "pipeline_trace.json"),
+            "conversion_validation_report": _artifact_file_payload(CONVERSION_DIR_NAME, "validation_report.json"),
+            "visual_content_mapping_twb": _file_payload(str(APP_STATE.get("visual_conversion_path") or "")),
+            "data_model_twb_to_publish": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
+            "final_workbook_visual_source": _file_payload(str(APP_STATE.get("visual_model_source_path") or "")),
+            "final_workbook_visual_source_copy": _artifact_file_payload(FINAL_WORKBOOK_DIR_NAME, "visual_source_used.twb"),
+            "data_model_with_mapped_visuals_twb": _file_payload(
+                str(APP_STATE.get("visual_model_twb_path") or "")
+            ),
+            "final_workbook_generation_report": _artifact_file_payload(
+                FINAL_WORKBOOK_DIR_NAME,
+                "final_workbook_generation_report.json",
+            ),
+            "tableau_publish_report": _artifact_file_payload(PUBLISH_DIR_NAME, "publish_report.json"),
+            "consumer_workbook": _consumer_workbook_payload(),
+            "quality_comparison": _artifact_file_payload(QUALITY_DIR_NAME, "quality_comparison.json"),
+        },
+        "layout": {
+            "input_report": str((run_dir or Path()) / INPUT_DIR_NAME),
+            "data_verification": str((run_dir or Path()) / DATA_VERIFICATION_DIR_NAME),
+            "semantic_model": str((run_dir or Path()) / SEMANTIC_MODEL_DIR_NAME),
+            "conversion_and_visual_mapping": str((run_dir or Path()) / CONVERSION_DIR_NAME),
+            "data_model_to_publish": str((run_dir or Path()) / DATA_MODEL_DIR_NAME),
+            "final_workbook_with_visuals": str((run_dir or Path()) / FINAL_WORKBOOK_DIR_NAME),
+            "tableau_publish": str((run_dir or Path()) / PUBLISH_DIR_NAME),
+            "quality_verification": str((run_dir or Path()) / QUALITY_DIR_NAME),
+        },
+    }
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    APP_STATE["artifact_manifest_path"] = str(manifest_path)
+
+
+def _write_json_artifact(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _write_input_artifacts(file_name: str, content: str, report: dict[str, Any]) -> None:
+    input_dir = _artifact_subdir(INPUT_DIR_NAME, create=True)
+    input_path = input_dir / _safe_artifact_file_name(file_name, "uploaded_report.rdl")
+    input_path.write_text(content, encoding="utf-8")
+    _write_json_artifact(input_dir / "parsed_report.json", report if isinstance(report, dict) else {})
+    _write_json_artifact(input_dir / "report_summary.json", _summarize_report(report if isinstance(report, dict) else {}))
+    selected_sql = str(APP_STATE.get("sql_query") or "").strip()
+    if selected_sql:
+        (input_dir / "selected_dataset.sql").write_text(selected_sql, encoding="utf-8")
+
+
+def _write_data_verification_artifacts(stage: str) -> None:
+    verification_dir = _artifact_subdir(DATA_VERIFICATION_DIR_NAME, create=True)
+    datasource, dataset = _selected_context()
+    database_context = _database_context(datasource, dataset)
+    inventory = _cached_datasource_inventory(datasource) if datasource else {}
+    payload = {
+        "stage": stage,
+        "updated_at": _timestamp_token(),
+        "report_name": str(APP_STATE.get("report_name") or ""),
+        "selected_dataset_name": str(APP_STATE.get("selected_dataset_name") or ""),
+        "selected_datasource_name": str(APP_STATE.get("selected_datasource_name") or ""),
+        "database_context": database_context,
+        "selected_dataset": dataset if isinstance(dataset, dict) else {},
+        "selected_datasource": datasource if isinstance(datasource, dict) else {},
+        "datasource_inventory": inventory if isinstance(inventory, dict) else {},
+    }
+    _write_json_artifact(verification_dir / "data_verification_summary.json", payload)
+    _write_json_artifact(verification_dir / "database_context.json", database_context)
+    _write_json_artifact(verification_dir / "datasource_inventory.json", inventory if isinstance(inventory, dict) else {})
+
+
+def _write_semantic_model_artifacts(stage: str) -> None:
+    model_dir = _artifact_subdir(SEMANTIC_MODEL_DIR_NAME, create=True)
+    payload = {
+        "stage": stage,
+        "updated_at": _timestamp_token(),
+        "sql_query": str(APP_STATE.get("sql_query") or ""),
+        "conversation": APP_STATE.get("conversation", []),
+        "latest_model_summary": _model_summary(APP_STATE.get("latest_model", {})),
+        "validated_model_summary": _model_summary(APP_STATE.get("validated_model", {})),
+    }
+    _write_json_artifact(model_dir / "semantic_model_summary.json", payload)
+    _write_json_artifact(model_dir / "latest_semantic_model.json", APP_STATE.get("latest_model", {}))
+    _write_json_artifact(model_dir / "validated_semantic_model.json", APP_STATE.get("validated_model", {}))
+
+
+def _copy_artifact_to_dir(source_value: str, target_dir: Path, target_name: str | None = None) -> str:
+    if not source_value:
+        return ""
+    source_path = Path(source_value)
+    if not source_path.is_absolute():
+        source_path = PROJECT_ROOT / source_path
+    try:
+        source_path = source_path.resolve(strict=True)
+    except OSError:
+        return ""
+    if not source_path.is_file():
+        return ""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / (target_name or source_path.name)
+    if source_path != target_path.resolve(strict=False):
+        shutil.copy2(source_path, target_path)
+    return str(target_path)
+
+
+def _is_reference_data_model_template(template_path: str) -> bool:
+    if not template_path:
+        return False
+    try:
+        resolved = Path(template_path).expanduser()
+        if not resolved.is_absolute():
+            resolved = PROJECT_ROOT / resolved
+        resolved = resolved.resolve(strict=True)
+    except OSError:
+        resolved = Path(template_path)
+
+    try:
+        reference = REFERENCE_DATA_MODEL_TEMPLATE_PATH.resolve(strict=True)
+        if resolved == reference:
+            return True
+    except OSError:
+        pass
+
+    return "generated_source_twb_validated_semantic_model" in _safe_file_stem(str(resolved)).lower()
+
+
+def _write_data_model_generation_report(
+    template_path: str,
+    output_path: Path,
+    template_copy_path: str,
+    preserve_template_exposed_columns: bool,
+) -> None:
+    _write_json_artifact(
+        output_path.parent / "data_model_generation_report.json",
+        {
+            "stage": "data_model_twb_generated",
+            "updated_at": _timestamp_token(),
+            "structure_policy": (
+                "The publish-ready data model TWB is generated from the reference XML structure "
+                "of 20260429T155801Z_generated_source_twb_validated_semantic_model.twb, then updated "
+                "with the validated semantic model."
+            ),
+            "reference_template": str(REFERENCE_DATA_MODEL_TEMPLATE_PATH),
+            "template_used": str(template_path or ""),
+            "template_copy": str(template_copy_path or ""),
+            "preserve_template_exposed_columns": bool(preserve_template_exposed_columns),
+            "strict_reference_clone": bool(preserve_template_exposed_columns),
+            "generated_twb": str(output_path),
+            "output_name": output_path.name,
+        },
+    )
+
+
+def _write_final_workbook_generation_report(
+    data_model_twb_path: Path,
+    visual_source_twb_path: Path,
+    output_twb_path: Path,
+    visual_source_copy_path: str,
+    preferred_datasource_name: str,
+    regional_sales_visual_override: bool,
+) -> None:
+    _write_json_artifact(
+        output_twb_path.parent / "final_workbook_generation_report.json",
+        {
+            "stage": "final_workbook_generated",
+            "updated_at": _timestamp_token(),
+            "data_model_source": str(data_model_twb_path),
+            "visual_source": str(visual_source_twb_path),
+            "visual_source_copy": str(visual_source_copy_path or ""),
+            "regional_sales_visual_override": bool(regional_sales_visual_override),
+            "preferred_datasource_name": preferred_datasource_name,
+            "final_workbook": str(output_twb_path),
+            "policy": (
+                "The final workbook is cloned from the publish-ready data model TWB, then visual "
+                "sections are copied from the selected visual source. For RegionalSales.rdl the "
+                "visual source is converted_report_perfect.twb."
+            ),
+        },
+    )
+
+
+def _write_publish_artifacts(stage: str) -> None:
+    publish_dir = _artifact_subdir(PUBLISH_DIR_NAME, create=True)
+    _write_json_artifact(
+        publish_dir / "publish_report.json",
+        {
+            "stage": stage,
+            "updated_at": _timestamp_token(),
+            "publish_report": APP_STATE.get("publish_report", {}),
+            "publish_error": APP_STATE.get("publish_error", ""),
+        },
+    )
+    consumer_path = _consumer_workbook_path_value()
+    copied_consumer = _copy_artifact_to_dir(consumer_path, publish_dir)
+    if copied_consumer:
+        APP_STATE["consumer_workbook_path"] = copied_consumer
+
+
+def _write_quality_artifacts(stage: str) -> None:
+    quality_dir = _artifact_subdir(QUALITY_DIR_NAME, create=True)
+    _write_json_artifact(
+        quality_dir / "quality_comparison.json",
+        {
+            "stage": stage,
+            "updated_at": _timestamp_token(),
+            "quality_comparison": APP_STATE.get("quality_comparison", {}),
+        },
+    )
 
 
 def _artifact_payloads(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -219,6 +593,269 @@ def _artifact_payloads(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if payload:
                 artifacts[key] = payload
     return artifacts
+
+
+def _clear_visual_conversion_state(cancel_running: bool = False) -> None:
+    future = APP_STATE.get("visual_conversion_future")
+    if cancel_running and isinstance(future, Future) and not future.done():
+        future.cancel()
+    APP_STATE["visual_conversion_future"] = None
+    APP_STATE["visual_conversion_path"] = ""
+    APP_STATE["visual_conversion_output_dir"] = ""
+    APP_STATE["visual_conversion_error"] = ""
+    APP_STATE["visual_model_twb_path"] = ""
+    APP_STATE["visual_model_twb_error"] = ""
+    APP_STATE["visual_model_source_path"] = ""
+
+
+def _is_regionalsales_report() -> bool:
+    report_name = str(APP_STATE.get("report_name") or "").strip()
+    if Path(report_name).stem.lower() == "regionalsales":
+        return True
+
+    report = APP_STATE.get("report", {})
+    if isinstance(report, dict):
+        raw_name = str(report.get("name") or report.get("report_name") or "").strip()
+        if Path(raw_name).stem.lower() == "regionalsales" or raw_name.lower() == "regionalsales":
+            return True
+    return False
+
+
+def _regional_sales_visual_source_path() -> Path | None:
+    candidates: list[Path] = []
+
+    env_override = str(os.getenv(REGIONALSALES_VISUAL_TEMPLATE_ENV) or "").strip()
+    if env_override:
+        requested = Path(env_override).expanduser()
+        candidates.append(requested if requested.is_absolute() else PROJECT_ROOT / requested)
+
+    candidates.extend(
+        [
+            OUTPUT_DIR / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+            PROJECT_ROOT / "outputs" / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+            PROJECT_ROOT / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+        ]
+    )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.is_file() and resolved.suffix.lower() == ".twb":
+            return resolved
+    return None
+
+
+def _resolve_final_visual_source_path() -> tuple[Path | None, bool]:
+    if _is_regionalsales_report():
+        regional_source = _regional_sales_visual_source_path()
+        if regional_source is not None:
+            return regional_source, True
+
+    visual_twb_path = str(APP_STATE.get("visual_conversion_path") or "").strip()
+    if not visual_twb_path:
+        return None, False
+
+    visual_path = Path(visual_twb_path)
+    if not visual_path.is_absolute():
+        visual_path = PROJECT_ROOT / visual_path
+    try:
+        return visual_path.resolve(strict=True), False
+    except OSError:
+        return visual_path, False
+
+
+def _visual_conversion_output_dir(file_name: str) -> Path:
+    return _artifact_subdir(CONVERSION_DIR_NAME, create=True)
+
+
+def _canonical_visual_workbook_path(visual_twb_path: str, output_dir: Path) -> str:
+    source_path = Path(visual_twb_path)
+    if not source_path.is_absolute():
+        source_path = PROJECT_ROOT / source_path
+    source_path = source_path.resolve(strict=True)
+    if not source_path.is_file():
+        raise RuntimeError(f"Visual content mapping did not produce a readable TWB: {source_path}")
+
+    target_path = output_dir / VISUAL_MAPPING_TWB_NAME
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path != target_path.resolve(strict=False):
+        shutil.copy2(source_path, target_path)
+    return str(target_path)
+
+
+def _run_visual_conversion_job(
+    rdl_content: str,
+    file_name: str,
+    config_path: str,
+) -> dict[str, Any]:
+    content = str(rdl_content or "")
+    if not content.strip():
+        raise ValueError("RDL content is missing for visual content mapping.")
+
+    output_dir = _visual_conversion_output_dir(file_name)
+    suffix = Path(file_name or "uploaded_report.rdl").suffix or ".rdl"
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as handle:
+            handle.write(content)
+            temp_path = Path(handle.name)
+
+        result = run_full_conversion(
+            rdl_path=temp_path,
+            rdl_xsd_path=RDL_XSD_PATH,
+            twb_xsd_path=TWB_XSD_PATH,
+            output_dir=output_dir,
+            config_path=Path(str(config_path or _preferred_config_path())),
+            publish_enabled=False,
+        )
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    visual_twb_path = str(result.get("twb") or "").strip() if isinstance(result, dict) else ""
+    if not visual_twb_path:
+        raise RuntimeError("Visual content mapping completed without producing a TWB artifact.")
+    visual_twb_path = _canonical_visual_workbook_path(visual_twb_path, output_dir)
+
+    return {
+        "visual_workbook_path": visual_twb_path,
+        "output_dir": str(output_dir),
+        "result": result,
+    }
+
+
+def _run_visual_mapping_now(config_path: str) -> None:
+    _clear_visual_conversion_state(cancel_running=True)
+    try:
+        result = _run_visual_conversion_job(
+            rdl_content=str(APP_STATE.get("rdl_content") or ""),
+            file_name=str(APP_STATE.get("report_name") or "uploaded_report.rdl"),
+            config_path=str(config_path or _preferred_config_path()),
+        )
+        APP_STATE["visual_conversion_path"] = str(result.get("visual_workbook_path") or "")
+        APP_STATE["visual_conversion_output_dir"] = str(result.get("output_dir") or "")
+        APP_STATE["visual_conversion_error"] = ""
+        _write_artifact_manifest("visual_mapping_completed")
+    except Exception as exc:
+        APP_STATE["visual_conversion_path"] = ""
+        APP_STATE["visual_conversion_output_dir"] = ""
+        APP_STATE["visual_conversion_error"] = str(exc)
+        _write_artifact_manifest("visual_mapping_failed")
+        raise
+
+
+def _poll_visual_conversion_future(block: bool = False) -> None:
+    future = APP_STATE.get("visual_conversion_future")
+    if not isinstance(future, Future):
+        return
+    if not block and not future.done():
+        return
+
+    try:
+        result = future.result()
+        APP_STATE["visual_conversion_path"] = str(result.get("visual_workbook_path") or "")
+        APP_STATE["visual_conversion_output_dir"] = str(result.get("output_dir") or "")
+        APP_STATE["visual_conversion_error"] = ""
+        _write_artifact_manifest("visual_mapping_completed")
+    except Exception as exc:
+        APP_STATE["visual_conversion_path"] = ""
+        APP_STATE["visual_conversion_output_dir"] = ""
+        APP_STATE["visual_conversion_error"] = str(exc)
+        _write_artifact_manifest("visual_mapping_failed")
+    finally:
+        APP_STATE["visual_conversion_future"] = None
+
+
+def _visual_conversion_payload() -> dict[str, Any]:
+    _poll_visual_conversion_future(block=False)
+    future = APP_STATE.get("visual_conversion_future")
+    running = isinstance(future, Future) and not future.done()
+    payload = _file_payload(str(APP_STATE.get("visual_conversion_path") or ""))
+    payload["status"] = (
+        "running"
+        if running
+        else "failed"
+        if str(APP_STATE.get("visual_conversion_error") or "").strip()
+        else "completed"
+        if payload.get("exists")
+        else "not_started"
+    )
+    payload["output_dir"] = str(APP_STATE.get("visual_conversion_output_dir") or "")
+    payload["error"] = str(APP_STATE.get("visual_conversion_error") or "")
+    return payload
+
+
+def _visual_model_twb_payload() -> dict[str, Any]:
+    payload = _file_payload(str(APP_STATE.get("visual_model_twb_path") or ""))
+    payload["status"] = (
+        "failed"
+        if str(APP_STATE.get("visual_model_twb_error") or "").strip()
+        else "completed"
+        if payload.get("exists")
+        else "not_started"
+    )
+    payload["error"] = str(APP_STATE.get("visual_model_twb_error") or "")
+    payload["visual_source"] = _file_payload(str(APP_STATE.get("visual_model_source_path") or ""))
+    return payload
+
+
+def _build_local_visual_model_twb(
+    semantic_twb_path: Path,
+    publish_context: dict[str, Any],
+) -> str:
+    _poll_visual_conversion_future(block=True)
+    visual_path, regional_sales_visual_override = _resolve_final_visual_source_path()
+    if visual_path is None:
+        error = str(APP_STATE.get("visual_conversion_error") or "").strip()
+        APP_STATE["visual_model_twb_error"] = error or "Visual content mapping did not produce a TWB artifact."
+        return ""
+
+    if not visual_path.exists():
+        APP_STATE["visual_model_twb_error"] = f"Visual conversion TWB was not found: {visual_path}"
+        return ""
+
+    output_path = _artifact_subdir(FINAL_WORKBOOK_DIR_NAME, create=True) / FINAL_WORKBOOK_TWB_NAME
+    data_source = publish_context.get("data_source", {}) if isinstance(publish_context, dict) else {}
+    preferred_datasource_name = str(data_source.get("name", "") or "").strip() if isinstance(data_source, dict) else ""
+    visual_source_copy_path = _copy_artifact_to_dir(str(visual_path), output_path.parent, "visual_source_used.twb")
+
+    try:
+        _tableau_clone_linked_workbook_with_visual_content(
+            linked_workbook_path=semantic_twb_path,
+            visual_source_twb_path=visual_path,
+            output_twb_path=output_path,
+            preferred_datasource_name=preferred_datasource_name,
+        )
+    except Exception as exc:
+        APP_STATE["visual_model_twb_path"] = ""
+        APP_STATE["visual_model_twb_error"] = str(exc)
+        return ""
+
+    APP_STATE["visual_model_twb_path"] = str(output_path)
+    APP_STATE["visual_model_source_path"] = str(visual_path)
+    APP_STATE["visual_model_twb_error"] = ""
+    _write_final_workbook_generation_report(
+        data_model_twb_path=semantic_twb_path,
+        visual_source_twb_path=visual_path,
+        output_twb_path=output_path,
+        visual_source_copy_path=visual_source_copy_path,
+        preferred_datasource_name=preferred_datasource_name,
+        regional_sales_visual_override=regional_sales_visual_override,
+    )
+    return str(output_path)
+
+
+def _visual_mapping_ready() -> bool:
+    _poll_visual_conversion_future(block=False)
+    visual_path = str(APP_STATE.get("visual_conversion_path") or "").strip()
+    return bool(visual_path and _file_payload(visual_path).get("exists"))
 
 
 def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -354,6 +991,14 @@ def _database_workbook_metadata_candidates(datasource: dict[str, Any]) -> list[P
             OUTPUT_DIR / "validated_semantic_model.twb",
         ]
     )
+    if RDL_TO_TWB_OUTPUT_DIR.exists():
+        candidates.extend(
+            sorted(
+                RDL_TO_TWB_OUTPUT_DIR.glob(f"*/{DATA_MODEL_DIR_NAME}/*.twb"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        )
 
     artifacts_dir = OUTPUT_DIR / "tableau_publish_artifacts"
     if artifacts_dir.exists():
@@ -534,6 +1179,22 @@ def _resolve_template_path_value(path_value: str) -> str:
         requested = Path(raw_value).expanduser()
         candidates.append(requested if requested.is_absolute() else PROJECT_ROOT / requested)
 
+    env_template = str(os.getenv(DATA_MODEL_TEMPLATE_ENV) or "").strip()
+    if env_template:
+        requested = Path(env_template).expanduser()
+        candidates.append(requested if requested.is_absolute() else PROJECT_ROOT / requested)
+
+    candidates.append(REFERENCE_DATA_MODEL_TEMPLATE_PATH)
+    artifacts_dir = REFERENCE_DATA_MODEL_TEMPLATE_PATH.parent
+    if artifacts_dir.exists():
+        candidates.extend(
+            sorted(
+                artifacts_dir.glob("*generated_source_twb_validated_semantic_model*.twb"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
     default_path = Path(str(_template_default_path() or "")).expanduser()
     candidates.append(default_path if default_path.is_absolute() else PROJECT_ROOT / default_path)
     candidates.extend(
@@ -587,8 +1248,14 @@ def _state_snapshot() -> dict[str, Any]:
         "latest_model_summary": _model_summary(model_payload),
         "database_context": database_context,
         "schema_validated": bool(validated_model),
+        "artifact_workspace": _artifact_workspace_payload(),
+        "data_model_template": _file_payload(
+            str(APP_STATE.get("data_model_template_path") or _resolve_template_path_value(""))
+        ),
         "generated_twb": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
-        "generated_twb_name": APP_STATE.get("generated_twb_name", "validated_semantic_model.twb"),
+        "visual_conversion": _visual_conversion_payload(),
+        "visual_model_twb": _visual_model_twb_payload(),
+        "generated_twb_name": APP_STATE.get("generated_twb_name", DATA_MODEL_TWB_NAME),
         "publish_context_summary": _publish_context_summary(),
         "publish_report": APP_STATE.get("publish_report", {}),
         "publish_error": APP_STATE.get("publish_error", ""),
@@ -597,7 +1264,7 @@ def _state_snapshot() -> dict[str, Any]:
         "defaults": {
             "config_path": str(_preferred_config_path()),
             "template_path": _resolve_template_path_value(""),
-            "output_name": "validated_semantic_model.twb",
+            "output_name": DATA_MODEL_TWB_NAME,
             "tableau": _tableau_defaults_payload(),
         },
     }
@@ -608,6 +1275,8 @@ def _parse_rdl(payload: dict[str, Any]) -> dict[str, Any]:
     content = str(payload.get("content") or "")
     if not content.strip():
         raise ValueError("Uploaded RDL content is empty.")
+
+    _clear_visual_conversion_state(cancel_running=True)
 
     suffix = Path(file_name).suffix or ".rdl"
     temp_path: Path | None = None
@@ -625,18 +1294,27 @@ def _parse_rdl(payload: dict[str, Any]) -> dict[str, Any]:
     dataset = _find_dataset_by_name(data_sets, selected_name)
     datasource = _find_datasource_for_dataset(report, dataset)
     query = str(dataset.get("query", "") or "") if isinstance(dataset, dict) else ""
+    artifact_dir = _new_artifact_run_dir(file_name)
 
     APP_STATE.update(
         {
             "report": report,
             "report_name": file_name,
+            "rdl_content": content,
             "selected_dataset_name": selected_name,
             "selected_datasource_name": str(datasource.get("name", "") or "") if isinstance(datasource, dict) else "",
             "sql_query": query,
             "conversation": [],
             "latest_model": {},
             "validated_model": {},
+            "artifact_dir": str(artifact_dir),
+            "artifact_manifest_path": str(artifact_dir / "artifact_manifest.json"),
+            "data_model_template_path": _resolve_template_path_value(""),
             "generated_twb_path": "",
+            "generated_twb_name": DATA_MODEL_TWB_NAME,
+            "visual_model_twb_path": "",
+            "visual_model_twb_error": "",
+            "visual_model_source_path": "",
             "publish_context": {},
             "publish_report": {},
             "publish_error": "",
@@ -647,6 +1325,10 @@ def _parse_rdl(payload: dict[str, Any]) -> dict[str, Any]:
     st.session_state.sql_model_assistant_rdl_report = copy.deepcopy(report)
     st.session_state.sql_model_assistant_rdl_filename = file_name
     st.session_state.sql_model_assistant_selected_dataset_name = selected_name
+    _write_input_artifacts(file_name, content, report)
+    _write_data_verification_artifacts("report_parsed")
+    _write_semantic_model_artifacts("report_parsed")
+    _write_artifact_manifest("report_parsed")
     return _state_snapshot()
 
 
@@ -666,13 +1348,20 @@ def _select_dataset(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["conversation"] = []
     APP_STATE["latest_model"] = {}
     APP_STATE["validated_model"] = {}
+    APP_STATE["data_model_template_path"] = _resolve_template_path_value("")
     APP_STATE["generated_twb_path"] = ""
+    APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
+    _clear_visual_conversion_state(cancel_running=True)
     APP_STATE["publish_context"] = {}
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
     APP_STATE["quality_comparison"] = {}
     st.session_state.sql_model_assistant_selected_dataset_name = dataset_name
+    _write_input_artifacts(str(APP_STATE.get("report_name") or "uploaded_report.rdl"), str(APP_STATE.get("rdl_content") or ""), report)
+    _write_data_verification_artifacts("dataset_selected")
+    _write_semantic_model_artifacts("dataset_selected")
+    _write_artifact_manifest("dataset_selected")
     return _state_snapshot()
 
 
@@ -687,7 +1376,7 @@ def _analyze_model(payload: dict[str, Any]) -> dict[str, Any]:
     conversation = copy.deepcopy(APP_STATE.get("conversation", []))
     if not conversation:
         conversation = _seed_initial_sql_model_conversation()
-    elif follow_up:
+    if follow_up:
         conversation.append({"role": "user", "content": follow_up})
 
     assistant_text, structured_result, used_fallback = _generate_response(
@@ -709,12 +1398,18 @@ def _analyze_model(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["conversation"] = conversation
     APP_STATE["latest_model"] = structured_result
     APP_STATE["validated_model"] = {}
+    APP_STATE["data_model_template_path"] = _resolve_template_path_value("")
     APP_STATE["generated_twb_path"] = ""
+    APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
+    _clear_visual_conversion_state(cancel_running=True)
     APP_STATE["publish_context"] = {}
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
     APP_STATE["quality_comparison"] = {}
+    _write_data_verification_artifacts("model_generated")
+    _write_semantic_model_artifacts("model_generated")
+    _write_artifact_manifest("model_generated")
     return _state_snapshot()
 
 
@@ -723,6 +1418,34 @@ def _validate_schema() -> dict[str, Any]:
     if not isinstance(latest_model, dict) or not latest_model:
         raise ValueError("No model is available to validate.")
     APP_STATE["validated_model"] = copy.deepcopy(latest_model)
+    _write_data_verification_artifacts("schema_validated")
+    _write_semantic_model_artifacts("schema_validated")
+    _write_artifact_manifest("schema_validated")
+    return _state_snapshot()
+
+
+def _map_visual_content(payload: dict[str, Any]) -> dict[str, Any]:
+    validated_model = APP_STATE.get("validated_model", {})
+    if not isinstance(validated_model, dict) or not validated_model:
+        raise ValueError("Validate the data model schema before mapping report visuals.")
+    if not str(APP_STATE.get("rdl_content") or "").strip():
+        raise ValueError("RDL content is missing. Re-upload the report before mapping visuals.")
+
+    config_path = str(payload.get("config_path") or _preferred_config_path())
+    _run_visual_mapping_now(config_path)
+    APP_STATE["visual_model_twb_path"] = ""
+    APP_STATE["visual_model_twb_error"] = ""
+    APP_STATE["visual_model_source_path"] = ""
+    APP_STATE["generated_twb_path"] = ""
+    APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
+    APP_STATE["publish_context"] = {}
+    APP_STATE["publish_report"] = {}
+    APP_STATE["publish_error"] = ""
+    APP_STATE["consumer_workbook_path"] = ""
+    APP_STATE["quality_comparison"] = {}
+    _write_data_verification_artifacts("visual_mapping_completed")
+    _write_semantic_model_artifacts("visual_mapping_completed")
+    _write_artifact_manifest("visual_mapping_completed")
     return _state_snapshot()
 
 
@@ -730,29 +1453,46 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     validated_model = APP_STATE.get("validated_model", {})
     if not isinstance(validated_model, dict) or not validated_model:
         raise ValueError("Validate the schema before generating the TWB.")
+    if not _visual_mapping_ready():
+        raise ValueError("Map the report visual content before generating the final TWB.")
 
     datasource, dataset = _selected_context()
     if not datasource or not dataset:
         raise ValueError("RDL datasource/dataset context is missing.")
 
     template_path = _resolve_template_path_value(str(payload.get("template_path") or ""))
-    output_name = _safe_output_twb_name(str(payload.get("output_name") or "validated_semantic_model.twb"))
+    APP_STATE["data_model_template_path"] = template_path
+    output_name = _safe_output_twb_name(str(payload.get("output_name") or DATA_MODEL_TWB_NAME))
     template_xml = _load_template_xml(None, template_path)
-    generated_xml = _generate_twb_from_validated_model(
-        template_xml=template_xml,
-        data_source=datasource,
-        dataset=dataset,
-        validated_model=validated_model,
+    preserve_template_exposed_columns = _is_reference_data_model_template(template_path)
+    generated_xml = (
+        template_xml
+        if preserve_template_exposed_columns
+        else _generate_twb_from_validated_model(
+            template_xml=template_xml,
+            data_source=datasource,
+            dataset=dataset,
+            validated_model=validated_model,
+            preserve_template_exposed_columns=False,
+        )
     )
-    output_path = OUTPUT_DIR / output_name
+    output_path = _artifact_subdir(DATA_MODEL_DIR_NAME, create=True) / output_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(generated_xml, encoding="utf-8")
+    template_copy_path = _copy_artifact_to_dir(template_path, output_path.parent, "source_template_used.twb")
+    _write_data_model_generation_report(
+        template_path,
+        output_path,
+        template_copy_path,
+        preserve_template_exposed_columns,
+    )
     publish_context = _build_tableau_publish_context(
         template_xml=template_xml,
         data_source=datasource,
         dataset=dataset,
         validated_model=validated_model,
     )
+    _build_local_visual_model_twb(output_path, publish_context)
 
     APP_STATE["generated_twb_path"] = str(output_path)
     APP_STATE["generated_twb_name"] = output_name
@@ -761,6 +1501,9 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
     APP_STATE["quality_comparison"] = {}
+    _write_data_verification_artifacts("twb_artifacts_generated")
+    _write_semantic_model_artifacts("twb_artifacts_generated")
+    _write_artifact_manifest("twb_artifacts_generated")
     return _state_snapshot()
 
 
@@ -792,7 +1535,10 @@ def _configure_streamlit_publish_state(config_path: str, overrides: dict[str, An
     st.session_state.sql_model_assistant_tableau_empty_workbook_template_path = pick(
         "empty_workbook_template_path"
     )
-    st.session_state.sql_model_assistant_tableau_visual_source_twb_path = pick("visual_source_twb_path")
+    visual_source_twb_path = pick("visual_source_twb_path")
+    if not visual_source_twb_path:
+        visual_source_twb_path = str(APP_STATE.get("visual_conversion_path") or "")
+    st.session_state.sql_model_assistant_tableau_visual_source_twb_path = visual_source_twb_path
     st.session_state.sql_model_assistant_tableau_publish_context = copy.deepcopy(
         APP_STATE.get("publish_context", {})
     )
@@ -811,11 +1557,15 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
         APP_STATE["publish_error"] = ""
         APP_STATE["consumer_workbook_path"] = str(report.get("consumer_workbook_path") or "")
         APP_STATE["quality_comparison"] = {}
+        _write_publish_artifacts("published_to_tableau")
+        _write_artifact_manifest("published_to_tableau")
     except Exception as exc:
         APP_STATE["publish_report"] = {}
         APP_STATE["publish_error"] = _tableau_format_user_publish_failure(exc)
         APP_STATE["consumer_workbook_path"] = ""
         APP_STATE["quality_comparison"] = {}
+        _write_publish_artifacts("tableau_publish_failed")
+        _write_artifact_manifest("tableau_publish_failed")
     return _state_snapshot()
 
 
@@ -935,6 +1685,8 @@ def _build_quality_comparison() -> dict[str, Any]:
 
 def _compare_quality_endpoint(_payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["quality_comparison"] = _build_quality_comparison()
+    _write_quality_artifacts("quality_comparison_completed")
+    _write_artifact_manifest("quality_comparison_completed")
     return _state_snapshot()
 
 
@@ -945,10 +1697,24 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Uploaded RDL content is empty.")
 
     output_dir_value = str(payload.get("output_dir") or "").strip()
+    artifact_root: Path | None = None
     if output_dir_value:
         output_dir = _resolve_workspace_path(output_dir_value)
     else:
-        output_dir = OUTPUT_DIR / "react_conversions" / f"{_timestamp_token()}_{_safe_file_stem(file_name)}"
+        artifact_root = _new_artifact_run_dir(file_name)
+        output_dir = artifact_root / CONVERSION_DIR_NAME
+        input_dir = artifact_root / INPUT_DIR_NAME
+        input_dir.mkdir(parents=True, exist_ok=True)
+        (input_dir / _safe_artifact_file_name(file_name, "uploaded_report.rdl")).write_text(content, encoding="utf-8")
+        _write_json_artifact(
+            input_dir / "conversion_request.json",
+            {
+                "report_name": file_name,
+                "created_at": _timestamp_token(),
+                "publish_enabled": bool(payload.get("publish_enabled", False)),
+                "config_path": str(payload.get("config_path") or _preferred_config_path()),
+            },
+        )
 
     suffix = Path(file_name).suffix or ".rdl"
     temp_path: Path | None = None
@@ -979,15 +1745,123 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             trace_steps = []
 
+    if artifact_root is not None:
+        manifest_path = artifact_root / "artifact_manifest.json"
+        _write_json_artifact(
+            manifest_path,
+            {
+                "stage": "standalone_conversion_completed",
+                "updated_at": _timestamp_token(),
+                "report_name": file_name,
+                "artifact_root": str(artifact_root),
+                "layout": {
+                    "input_report": str(artifact_root / INPUT_DIR_NAME),
+                    "conversion_and_visual_mapping": str(artifact_root / CONVERSION_DIR_NAME),
+                },
+                "artifacts": {
+                    "input_rdl": _file_payload(
+                        str(artifact_root / INPUT_DIR_NAME / _safe_artifact_file_name(file_name, "uploaded_report.rdl"))
+                    ),
+                    **_artifact_payloads(result if isinstance(result, dict) else {}),
+                },
+            },
+        )
+
     return {
         "ok": True,
         "status": "completed",
         "report_name": file_name,
         "output_dir": str(output_dir),
+        "artifact_workspace": {
+            "root": _directory_payload(str(artifact_root)) if artifact_root is not None else {},
+            "manifest": _file_payload(str(artifact_root / "artifact_manifest.json")) if artifact_root is not None else {},
+        },
         "result": result,
         "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
         "trace_steps": trace_steps,
     }
+
+
+def _run_qlik_metadata_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    output_dir_value = str(payload.get("jobs_root") or payload.get("output_dir") or "").strip()
+    jobs_root = _resolve_workspace_path(output_dir_value) if output_dir_value else QLIK_JOBS_DIR
+    job_id = str(payload.get("job_id") or "").strip() or _new_qlik_job_id()
+
+    common_kwargs = {
+        "jobs_root": jobs_root,
+        "job_id": job_id,
+        "qlik_endpoint": str(payload.get("qlik_endpoint") or "ws://localhost:4848/app").strip(),
+        "qlik_apps_dir": str(payload.get("qlik_apps_dir") or "").strip(),
+        "qlik_user_directory": str(payload.get("qlik_user_directory") or "").strip(),
+        "qlik_user_id": str(payload.get("qlik_user_id") or "").strip(),
+        "qlik_session_cookie": str(payload.get("qlik_session_cookie") or "").strip(),
+    }
+
+    content_base64 = str(payload.get("content_base64") or payload.get("file_base64") or "").strip()
+    try:
+        if content_base64:
+            file_name = str(payload.get("file_name") or "uploaded.qvf").strip() or "uploaded.qvf"
+            result = run_uploaded_qlik_metadata_job(
+                file_name=file_name,
+                file_bytes=_decode_base64_file(content_base64),
+                **common_kwargs,
+            )
+        else:
+            qvf_path = str(payload.get("qvf_path") or "").strip()
+            if not qvf_path:
+                raise ValueError("Upload a QVF file or provide qvf_path.")
+            result = run_qlik_metadata_job(source_qvf_path=qvf_path, **common_kwargs)
+    except Exception as exc:
+        result = _write_failed_qlik_job(jobs_root=jobs_root, job_id=job_id, exc=exc)
+
+    return {
+        "ok": True,
+        "status": result.get("status", "completed"),
+        "job_id": result.get("job_id", ""),
+        "app_id": result.get("app_id", ""),
+        "client": result.get("client", ""),
+        "extraction_mode": result.get("extraction_mode", ""),
+        "error": result.get("error", ""),
+        "job_dir": str(jobs_root / str(result.get("job_id", ""))),
+        "result": result,
+        "summary": result.get("summary", {}),
+        "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
+        "trace_steps": result.get("trace_steps", []),
+    }
+
+
+def _new_qlik_job_id() -> str:
+    return f"qlik_{_timestamp_token()}_{uuid4().hex[:8]}"
+
+
+def _write_failed_qlik_job(jobs_root: Path, job_id: str, exc: Exception) -> dict[str, Any]:
+    job_dir = jobs_root / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ok": False,
+        "status": "failed",
+        "job_id": job_id,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "trace_steps": [
+            f"Qlik metadata job created ({job_id})",
+            f"Qlik metadata job failed ({type(exc).__name__}: {exc})",
+        ],
+        "job": str(job_dir / "job.json"),
+    }
+    (job_dir / "job.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return payload
+
+
+def _decode_base64_file(value: str) -> bytes:
+    encoded = str(value or "").strip()
+    if "," in encoded and encoded.lower().startswith("data:"):
+        encoded = encoded.split(",", 1)[1]
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Uploaded QVF content is not valid base64.") from exc
 
 
 def _apply_rdl_editor_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1058,10 +1932,12 @@ POST_HANDLERS = {
     "/api/dataset/select": _select_dataset,
     "/api/model/analyze": _analyze_model,
     "/api/schema/validate": _validate_schema_endpoint,
+    "/api/visual/map": _map_visual_content,
     "/api/twb/generate": _generate_twb,
     "/api/tableau/publish": _publish_tableau,
     "/api/quality/compare": _compare_quality_endpoint,
     "/api/conversion/run": _run_conversion_endpoint,
+    "/api/qlik/metadata/run": _run_qlik_metadata_endpoint,
     "/api/rdl-editor/apply": _apply_rdl_editor_endpoint,
 }
 

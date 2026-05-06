@@ -20,9 +20,11 @@ POST_ENDPOINTS = {
     "/api/dataset/select",
     "/api/model/analyze",
     "/api/schema/validate",
+    "/api/visual/map",
     "/api/twb/generate",
     "/api/tableau/publish",
     "/api/conversion/run",
+    "/api/qlik/metadata/run",
     "/api/rdl-editor/apply",
 }
 

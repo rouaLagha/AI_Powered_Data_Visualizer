@@ -23,14 +23,13 @@ class LLMClient:
         self.config = config
 
     def chat(self, system_prompt: str, user_prompt: str) -> str:
-        payload = {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
+        payload = _build_payload(
+            api_url=self.config.api_url,
+            model=self.config.model,
+            temperature=self.config.temperature,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
 
         headers = {
             "Content-Type": "application/json",
@@ -96,18 +95,80 @@ class LLMClient:
                 "LLM endpoint response is not valid JSON. "
                 f"URL: {self.config.api_url}. Response preview: {preview}"
             ) from exc
-        return _extract_message_content(data)
+        content = _extract_message_content(data)
+        _log_llm_response(model=self.config.model, api_url=self.config.api_url, content=content)
+        return content
+
+
+def _log_llm_response(model: str, api_url: str, content: str) -> None:
+    print("\n" + "=" * 60, flush=True)
+    print(f"[LLM RESPONSE] model={model}", flush=True)
+    print(f"[LLM RESPONSE] endpoint={api_url}", flush=True)
+    print("-" * 60, flush=True)
+    print(content, flush=True)
+    print("=" * 60 + "\n", flush=True)
 
 
 def _extract_message_content(response_payload: dict[str, Any]) -> str:
+    output_text = response_payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return _sanitize_message_content(output_text)
+
+    output = response_payload.get("output", [])
+    if isinstance(output, list):
+        chunks: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content_items = item.get("content", [])
+            if not isinstance(content_items, list):
+                continue
+            for content_item in content_items:
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") in {"output_text", "text"}:
+                    text = content_item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        chunks.append(text)
+        if chunks:
+            return _sanitize_message_content("\n".join(chunks))
+
     choices = response_payload.get("choices", [])
     if not choices:
-        raise ValueError("No choices returned by LLM API")
+        raise ValueError("No content returned by LLM API")
 
     content = choices[0].get("message", {}).get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("LLM response content is empty")
     return _sanitize_message_content(content)
+
+
+def _build_payload(
+    api_url: str,
+    model: str,
+    temperature: float,
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, Any]:
+    base = {
+        "model": model,
+        "temperature": temperature,
+    }
+
+    # Azure/OpenAI Responses API expects `input` instead of `messages`.
+    if "/responses" in api_url:
+        base["input"] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        return base
+
+    # Backward compatibility for chat-completions style endpoints.
+    base["messages"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return base
 
 
 def _sanitize_message_content(content: str) -> str:

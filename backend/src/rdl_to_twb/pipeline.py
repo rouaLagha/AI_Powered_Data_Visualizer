@@ -418,6 +418,7 @@ def run_conversion(
         "data_model": str(output_dir / "data_model.json"),
         "visual_model": str(output_dir / "visual_model.json"),
         "mapping": str(output_dir / "mapping.json"),
+        "mapping_model": str(output_dir / "mapping_model.json"),
         "semantic_generation_report": str(output_dir / "semantic_generation_report.json"),
         "agent1_raw_response": str(output_dir / "agent1_raw_response.txt"),
         "db_catalog": str(output_dir / "db_catalog.json"),
@@ -757,6 +758,7 @@ def _validate_and_repair_loop(
     xml_content: str,
     twb_xsd_summary: dict,
     llm: LLMClient | None,
+    max_repair_rounds: int = 3,
 ) -> tuple[str, list[str]]:
     current = normalize_generated_twb(xml_content)
     issues = validate_twb_structure(current)
@@ -766,15 +768,26 @@ def _validate_and_repair_loop(
     if llm is None:
         return current, issues
 
-    repaired = repair_twb_xml(
-        llm=llm,
-        invalid_xml=current,
-        issues=issues,
-        twb_xsd_summary=_compact_schema_summary(twb_xsd_summary),
-    )
-    repaired = normalize_generated_twb(repaired)
-    repaired_issues = validate_twb_structure(repaired)
-    return repaired, repaired_issues
+    max_rounds = max(1, int(max_repair_rounds))
+    compact_summary = _compact_schema_summary(twb_xsd_summary)
+
+    for attempt in range(1, max_rounds + 1):
+        repair_issues = list(issues)
+        if attempt > 1:
+            repair_issues.insert(0, f"Remaining issues after repair attempt {attempt - 1}")
+
+        repaired = repair_twb_xml(
+            llm=llm,
+            invalid_xml=current,
+            issues=repair_issues,
+            twb_xsd_summary=compact_summary,
+        )
+        current = normalize_generated_twb(repaired)
+        issues = validate_twb_structure(current)
+        if not issues:
+            return current, []
+
+    return current, issues
 
 
 def _compact_schema_summary(summary: dict, max_element_names: int = 200) -> dict:

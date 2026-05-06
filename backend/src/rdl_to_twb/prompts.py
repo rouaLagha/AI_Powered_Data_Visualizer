@@ -56,13 +56,22 @@ REFERENCE TARGET PROFILE (inspired by known-working TWB files):
             <cols><map key="[Field]" value="[Table].[Field]" /></cols>
         </connection>
     - Include datasource columns: <column name="[...]" role="dimension|measure" datatype="string|real|date" type="nominal|quantitative|ordinal" caption="..." />
-    - Include datasource layout and style nodes
+    - Include datasource layout/style nodes only when needed, but NEVER emit <layout-options> under <datasource>
 - Worksheet profile:
     - <worksheet name="..."> with <layout-options /> and <table>
     - Table must contain: view, style, panes, rows, cols
     - View should contain: datasources, datasource-dependencies, perspectives, aggregation
     - datasource-dependencies should include both <column> and matching <column-instance>
     - Rows/cols should reference valid generated instances like [DataSource].[sum:Measure:qk] and [DataSource].[none:Dimension:nk]
+    - KPI/text-card worksheets MUST use <mark class="Text" />, keep <rows /> and <cols /> empty, and put the KPI value on the Text mark encoding:
+        <encodings><text column="[DataSource].[sum:Measure:qk]" /></encodings>
+    - Never place a KPI measure on Rows or Columns; that creates an unwanted axis instead of a KPI card
+    - RDL filters/report parameters are NOT worksheets. Do not create sheets named "Filter - ..."; apply them as filters/parameter controls on the relevant worksheet views.
+- Dashboard composition rules:
+    - Create exactly one worksheet per visual element from VISUAL_MODEL.sheets
+    - Create at least one dashboard
+    - Place every generated worksheet into dashboard zones (no orphan worksheet)
+    - Dashboard windows/viewpoints must reference all worksheet names
 
     IMPORTANT GROUNDING OVERRIDE:
     - The reference profile is a STRUCTURAL STYLE only
@@ -78,13 +87,18 @@ COHERENCE RULES:
 DO:
 - Keep output grounded to DATA_MODEL, VISUAL_MODEL, and MAPPING
 - Keep worksheet list aligned with VISUAL_MODEL.sheets
+- Keep a strict 1:1 mapping between visual elements and worksheets
+- Ensure all worksheets are placed into a dashboard layout
 - Keep datasource fields aligned with DATA_MODEL.fields
 - If SQL projections define aliases, prefer physical source column names for TWB field names and keep aliases as captions when appropriate
+- Keep <layout-options> only as a direct child of <worksheet>
 
 DON'T:
 - Don't invent extra worksheets
 - Don't invent extra fields or rename aliases unless semantic inputs explicitly provide this mapping
 - Don't copy literal names from examples that are absent from current inputs
+- Don't put worksheet-only nodes (<layout-options>, <table>, <view>, <rows>, <cols>, <panes>) inside <datasource>
+- Don't leave any worksheet outside dashboards
 
 CRITICAL:
 - Prefer minimal valid XML over complex invalid XML
@@ -108,6 +122,7 @@ XML_FEW_SHOT_GUIDANCE = {
         "<column name=\"[Country]\" role=\"dimension\" ... />",
         "<column name=\"[TotalSales]\" role=\"measure\" ... />",
         "<worksheet name=\"ReportTitle\"> ... <mark class=\"Text\" /> ... <rows /> <cols /> ... </worksheet>",
+        "<worksheet name=\"TotalSalesKPI\"> ... <mark class=\"Text\" /> <encodings><text column=\"[AdventureWorksDW2022].[sum:TotalSales:qk]\" /></encodings> ... <rows /> <cols /> ... </worksheet>",
         "<worksheet name=\"Chart3\"> ... <mark class=\"Bar\" /> ... <rows>[AdventureWorksDW2022].[sum:TotalSales:qk]</rows> <cols>[AdventureWorksDW2022].[none:Country:nk]</cols> ... </worksheet>",
     ],
     "do_rules": [
@@ -116,14 +131,20 @@ XML_FEW_SHOT_GUIDANCE = {
         "Keep datasource names from DATA_MODEL.datasources",
         "When dataset SQL has alias projections (e.g. source AS Alias), prefer source column name in TWB field name and alias as caption",
         "When visual type is Textbox/title-like, keep shelves empty (rows/cols)",
+        "When a Textbox represents a numeric KPI, put the measure in the Text mark encoding and keep rows/cols empty",
         "For chart-like visuals, place measure on rows and dimension on cols",
+        "Represent report filters as worksheet view filters/cards, not as separate worksheets",
+        "Use <layout-options> only inside <worksheet>, never inside <datasource>",
     ],
     "dont_rules": [
         "Do not emit fields absent from DATA_MODEL.fields",
+        "Do not put KPI measures on rows or columns",
+        "Do not create dedicated filter worksheets or dashboard zones for filters",
         "Do not rename aliases (example: Country -> SalesTerritoryCountry) unless explicitly present in semantic inputs",
         "Do not add worksheets that are not present in VISUAL_MODEL.sheets",
         "Do not invent joins/tables unrelated to dataset SQL",
         "Do not copy literal table/field/worksheet names from reference examples unless they are present in current inputs",
+        "Do not place worksheet-only tags (layout-options, table, view, panes, rows, cols) under datasource",
     ],
 }
 
@@ -218,9 +239,15 @@ def build_xml_user_prompt(
     xml_contract = {
         "root": "workbook",
         "required_top_level": ["datasources", "worksheets", "windows"],
+        "dashboard_requirements": [
+            "at least one dashboard when worksheets exist",
+            "every worksheet name must appear in dashboard zones",
+            "dashboard window viewpoints should reference all worksheets"
+        ],
         "required_workbook_attributes": ["version", "source-build", "source-platform"],
         "recommended_top_level": ["preferences", "style"],
         "datasource_required_attributes": ["name", "caption", "inline", "hasconnection"],
+        "datasource_forbidden_children": ["layout-options", "table", "view", "rows", "cols", "panes"],
         "worksheet_structure": ["layout-options", "table"],
         "table_structure": ["view", "style", "panes", "rows", "cols"],
         "view_structure": ["datasources", "datasource-dependencies", "aggregation"],
@@ -260,6 +287,21 @@ def build_xml_user_prompt(
             "Ensure rows/cols references point to existing instances",
             "Use only fields present in DATA_MODEL.fields and mappings",
             "Use worksheet names from VISUAL_MODEL.sheets (or mapped visual names)",
+        ],
+        "dashboard_strategy": [
+            "Create at least one dashboard",
+            "Place all generated worksheets into dashboard zones",
+            "Ensure dashboard windows/viewpoints cover all worksheets",
+        ],
+        "kpi_strategy": [
+            "For numeric KPI cards, use a Text mark with a text encoding bound to the aggregate measure",
+            "Keep KPI rows and cols empty so Tableau renders a single value instead of an axis",
+            "Do not place KPI measures on Columns or Rows",
+        ],
+        "filter_strategy": [
+            "Do not generate filter worksheets",
+            "Use existing worksheet views for report filters by adding filter nodes and exposing filter cards",
+            "Apply a report parameter/filter to every worksheet whose datasource contains the filtered field",
         ],
         "sql_rules": [
             "For SQL Server: ORDER BY only allowed with TOP/OFFSET/FOR XML",
@@ -310,6 +352,9 @@ def build_xml_repair_user_prompt(
             "Missing required nodes",
             "Forbidden elements",
             "Malformed structures",
+            "Illegal parent-child placement (example: layout-options under datasource)",
+            "Missing dashboard when worksheets exist",
+            "Worksheets not placed in dashboard zones",
         ],
         "must_preserve": [
             "datasource names",
@@ -327,7 +372,7 @@ def build_xml_repair_user_prompt(
         "REPAIR STEPS:\n"
         "1) Keep workbook root\n"
         "2) Fix structure and order\n"
-        "3) Remove forbidden elements\n"
+        "3) Remove or relocate forbidden elements to valid parent nodes\n"
         "4) Fix invalid attributes\n"
         "5) Ensure required sections exist\n"
         "6) Return XML only\n"

@@ -89,7 +89,7 @@ export default function RdlConversionPage({ defaultConfigPath = "" }) {
           </label>
           <label>
             Output folder
-            <input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} placeholder="Auto-generated under outputs/react_conversions" />
+            <input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} placeholder="Auto-generated under outputs/rdl_to_twb" />
           </label>
           <label className="check-row">
             <input type="checkbox" checked={publishEnabled} onChange={(event) => setPublishEnabled(event.target.checked)} />

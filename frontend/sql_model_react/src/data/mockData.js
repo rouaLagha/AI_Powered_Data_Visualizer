@@ -38,6 +38,11 @@ export const pipelineDefinitions = [
     description: "Approve model changes before generation.",
   },
   {
+    id: "visual-mapping",
+    title: "Visual Mapping",
+    description: "Map report visuals after the data model is validated.",
+  },
+  {
     id: "twb-generation",
     title: "TWB Generation",
     description: "Generate Tableau workbook XML from the model.",

@@ -30,6 +30,27 @@ SQL_JOIN_CLAUSE_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 FIELD_EXPR_REF_RE = re.compile(r"Fields!([A-Za-z0-9_]+)\.Value", flags=re.IGNORECASE)
+PARAM_EXPR_REF_RE = re.compile(r"Parameters!([A-Za-z0-9_]+)\.Value", flags=re.IGNORECASE)
+SUM_FIELD_CALL_RE = re.compile(
+    r"sum\s*\(\s*Fields!(?P<field>[A-Za-z0-9_]+)\.Value\s*\)",
+    flags=re.IGNORECASE,
+)
+SUM_DIFF_EXPR_RE = re.compile(
+    r"sum\s*\(\s*Fields!(?P<left>[A-Za-z0-9_]+)\.Value\s*\)\s*"
+    r"-\s*sum\s*\(\s*Fields!(?P<right>[A-Za-z0-9_]+)\.Value\s*\)",
+    flags=re.IGNORECASE,
+)
+SUM_DIFF_RATIO_EXPR_RE = re.compile(
+    r"\(\s*sum\s*\(\s*Fields!(?P<left>[A-Za-z0-9_]+)\.Value\s*\)\s*"
+    r"-\s*sum\s*\(\s*Fields!(?P<right>[A-Za-z0-9_]+)\.Value\s*\)\s*\)\s*"
+    r"/\s*sum\s*\(\s*Fields!(?P<denominator>[A-Za-z0-9_]+)\.Value\s*\)",
+    flags=re.IGNORECASE,
+)
+SUM_RATIO_EXPR_RE = re.compile(
+    r"sum\s*\(\s*Fields!(?P<left>[A-Za-z0-9_]+)\.Value\s*\)\s*"
+    r"/\s*sum\s*\(\s*Fields!(?P<right>[A-Za-z0-9_]+)\.Value\s*\)",
+    flags=re.IGNORECASE,
+)
 AGGREGATE_EXPR_HINT_RE = re.compile(r"\b(sum|avg|average|count|min|max|format|iif)\s*\(", flags=re.IGNORECASE)
 SHELF_FIELD_REF_RE = re.compile(
     r"\[[^\]]+\]\.\[(?P<derivation>[^:\]]+):(?P<field>[^:\]]+):[^\]]+\]",
@@ -1989,10 +2010,24 @@ def inject_semantic_bindings(
     normalized_report_parameters = report_parameters if isinstance(report_parameters, list) else []
     if _is_regionalsales_report(visual_model):
         _inject_regionalsales_calculated_fields(datasource_nodes, normalized_report_parameters)
+    _inject_expression_measure_calculated_fields(
+        datasource_nodes=datasource_nodes,
+        sheet_specs=sheet_specs,
+        dataset_to_datasource=dataset_to_datasource,
+        dataset_alias_to_source=dataset_alias_to_source,
+        default_ds_name=default_ds_name,
+    )
+    _inject_static_text_calculated_fields(datasource_nodes, sheet_specs, default_ds_name)
 
     datasource_field_roles = _build_datasource_field_role_lookup(datasource_nodes)
     datasource_field_tables = _build_datasource_field_table_lookup(datasource_nodes)
     datasource_field_names = _build_datasource_field_names_lookup(datasource_nodes)
+    datasource_field_metadata = _build_datasource_field_metadata_lookup(datasource_nodes)
+    parameter_filter_specs = _build_parameter_filter_specs(
+        datasets=datasets,
+        mapping=mapping,
+        report_parameters=normalized_report_parameters,
+    )
     _rebuild_worksheets_from_sheet_specs(
         root=root,
         sheet_specs=sheet_specs,
@@ -2007,6 +2042,22 @@ def inject_semantic_bindings(
         datasource_field_tables=datasource_field_tables,
         datasource_field_names=datasource_field_names,
     )
+
+    if parameter_filter_specs:
+        worksheet_dataset_by_name = {
+            str(spec.get("name", "")).strip().lower(): str(spec.get("dataset_name", "")).strip()
+            for spec in sheet_specs
+            if isinstance(spec, dict) and isinstance(spec.get("name"), str)
+        }
+        _apply_parameter_filters_to_worksheets(
+            root=root,
+            filter_specs=parameter_filter_specs,
+            datasource_field_roles=datasource_field_roles,
+            datasource_field_metadata=datasource_field_metadata,
+            datasource_field_names=datasource_field_names,
+            worksheet_dataset_by_name=worksheet_dataset_by_name,
+            default_ds_name=default_ds_name,
+        )
 
     required_fields = _collect_fields_used_by_workbook_views(root)
     if required_fields:
@@ -2228,6 +2279,515 @@ def _extract_report_parameter_default(report_parameters: list[dict], parameter_n
         return ""
 
     return ""
+
+
+def _collect_spec_expression_strings(spec: dict) -> list[str]:
+    expressions: list[str] = []
+
+    def _append(raw: object) -> None:
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        clean = raw.strip()
+        if clean not in expressions:
+            expressions.append(clean)
+
+    if not isinstance(spec, dict):
+        return expressions
+
+    for raw in spec.get("expressions") if isinstance(spec.get("expressions"), list) else []:
+        _append(raw)
+
+    for raw in spec.get("static_text_values") if isinstance(spec.get("static_text_values"), list) else []:
+        _append(raw)
+
+    properties = spec.get("properties") if isinstance(spec.get("properties"), dict) else {}
+    for raw in properties.get("text_values") if isinstance(properties.get("text_values"), list) else []:
+        _append(raw)
+
+    gauge = properties.get("gauge") if isinstance(properties.get("gauge"), dict) else {}
+    for raw in gauge.get("value_expressions") if isinstance(gauge.get("value_expressions"), list) else []:
+        _append(raw)
+
+    return expressions
+
+
+def _extract_sum_field_calls(expression: str) -> list[str]:
+    fields: list[str] = []
+    if not isinstance(expression, str):
+        return fields
+
+    for match in SUM_FIELD_CALL_RE.finditer(expression):
+        field_name = match.group("field").strip()
+        if field_name and field_name not in fields:
+            fields.append(field_name)
+
+    return fields
+
+
+def _extract_sum_difference_pair(expressions: list[str]) -> tuple[str, str]:
+    for expr in expressions if isinstance(expressions, list) else []:
+        if not isinstance(expr, str):
+            continue
+        match = SUM_DIFF_EXPR_RE.search(expr)
+        if match is None:
+            continue
+        left = match.group("left").strip()
+        right = match.group("right").strip()
+        if left and right and left.lower() != right.lower():
+            return left, right
+
+    return "", ""
+
+
+def _extract_sum_difference_ratio_pair(expressions: list[str]) -> tuple[str, str]:
+    for expr in expressions if isinstance(expressions, list) else []:
+        if not isinstance(expr, str):
+            continue
+        match = SUM_DIFF_RATIO_EXPR_RE.search(expr)
+        if match is None:
+            continue
+        left = match.group("left").strip()
+        right = match.group("right").strip()
+        denominator = match.group("denominator").strip()
+        if left and right and denominator and right.lower() == denominator.lower():
+            return left, right
+
+    return "", ""
+
+
+def _extract_sum_ratio_pair(expressions: list[str]) -> tuple[str, str]:
+    for expr in expressions if isinstance(expressions, list) else []:
+        if not isinstance(expr, str):
+            continue
+        match = SUM_RATIO_EXPR_RE.search(expr)
+        if match is None:
+            continue
+        left = match.group("left").strip()
+        right = match.group("right").strip()
+        if left and right and left.lower() != right.lower():
+            return left, right
+
+    return "", ""
+
+
+def _extract_gauge_measure_pair(spec: dict) -> tuple[str, str]:
+    properties = spec.get("properties") if isinstance(spec, dict) and isinstance(spec.get("properties"), dict) else {}
+    gauge = properties.get("gauge") if isinstance(properties.get("gauge"), dict) else {}
+    value_expressions = gauge.get("value_expressions") if isinstance(gauge.get("value_expressions"), list) else []
+    measures: list[str] = []
+    for expr in value_expressions:
+        if not isinstance(expr, str):
+            continue
+        refs = _extract_sum_field_calls(expr)
+        if len(refs) == 1 and refs[0] not in measures:
+            measures.append(refs[0])
+    if len(measures) >= 2:
+        return measures[0], measures[1]
+
+    expressions = _collect_spec_expression_strings(spec)
+    left, right = _extract_sum_ratio_pair(expressions)
+    if left and right:
+        return left, right
+
+    return _extract_sum_difference_pair(expressions)
+
+
+def _field_pascal_name(field_name: str) -> str:
+    tokens = _field_name_tokens(field_name)
+    if not tokens:
+        return ""
+    return "".join(token[:1].upper() + token[1:] for token in tokens if token)
+
+
+def _is_target_like_measure_name(field_name: str) -> bool:
+    token = (field_name or "").strip().lower()
+    return any(mark in token for mark in ["quota", "target", "budget", "goal", "plan"])
+
+
+def _derived_variance_field_name(left_field: str, right_field: str) -> str:
+    left_token = _field_pascal_name(left_field) or "Measure"
+    right_token = _field_pascal_name(right_field) or "Reference"
+    if _is_target_like_measure_name(right_field):
+        return f"{left_token}Variance"
+    return f"{left_token}Minus{right_token}"
+
+
+def _derived_variance_pct_field_name(left_field: str, right_field: str) -> str:
+    return f"{_derived_variance_field_name(left_field, right_field)}Pct"
+
+
+def _derived_progress_pct_field_name(left_field: str, right_field: str) -> str:
+    left_token = _field_pascal_name(left_field) or "Measure"
+    right_token = _field_pascal_name(right_field) or "Reference"
+    return f"{left_token}{right_token}Pct"
+
+
+def _resolve_expression_source_field(
+    raw_field: str,
+    alias_to_source: dict[str, str],
+    available_fields: list[str],
+) -> str:
+    clean = (raw_field or "").strip()
+    if not clean:
+        return ""
+
+    canonical = alias_to_source.get(clean.lower(), clean) if isinstance(alias_to_source, dict) else clean
+    available_lookup = {
+        field.strip().lower(): field.strip()
+        for field in available_fields
+        if isinstance(field, str) and field.strip()
+    }
+    if canonical.lower() in available_lookup:
+        return available_lookup[canonical.lower()]
+    if clean.lower() in available_lookup:
+        return available_lookup[clean.lower()]
+
+    fuzzy = _find_best_field_match(canonical, list(available_lookup.values()))
+    return fuzzy or ""
+
+
+def _upsert_measure_pair_calculated_fields(
+    datasource_node: ET.Element,
+    left_raw_field: str,
+    right_raw_field: str,
+    alias_to_source: dict[str, str],
+    create_variance: bool = True,
+    create_variance_pct: bool = True,
+    create_progress_pct: bool = True,
+) -> None:
+    if not isinstance(datasource_node, ET.Element):
+        return
+
+    available_fields = [
+        _clean_bracketed_name(col.attrib.get("name", "")).strip()
+        for col in list(datasource_node)
+        if _local_name(col.tag) == "column"
+    ]
+    left_source = _resolve_expression_source_field(left_raw_field, alias_to_source, available_fields)
+    right_source = _resolve_expression_source_field(right_raw_field, alias_to_source, available_fields)
+    if not left_source or not right_source or left_source.lower() == right_source.lower():
+        return
+
+    left_ref = f"[{left_source}]"
+    right_ref = f"[{right_source}]"
+    variance_name = _derived_variance_field_name(left_raw_field, right_raw_field)
+    variance_pct_name = _derived_variance_pct_field_name(left_raw_field, right_raw_field)
+    progress_pct_name = _derived_progress_pct_field_name(left_raw_field, right_raw_field)
+
+    if create_variance:
+        _upsert_datasource_calculated_column(
+            datasource_node=datasource_node,
+            field_name=variance_name,
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula=f"ZN({left_ref}) - ZN({right_ref})",
+            caption="Variance" if _is_target_like_measure_name(right_raw_field) else f"{left_raw_field} - {right_raw_field}",
+        )
+
+    if create_variance_pct:
+        _upsert_datasource_calculated_column(
+            datasource_node=datasource_node,
+            field_name=variance_pct_name,
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula=(
+                f"IF ZN(SUM({right_ref})) = 0 THEN 0 "
+                f"ELSE (ZN(SUM({left_ref})) - ZN(SUM({right_ref}))) / ZN(SUM({right_ref})) END"
+            ),
+            caption="Variance %" if _is_target_like_measure_name(right_raw_field) else f"{left_raw_field} - {right_raw_field} %",
+        )
+
+    if create_progress_pct:
+        _upsert_datasource_calculated_column(
+            datasource_node=datasource_node,
+            field_name=progress_pct_name,
+            role="measure",
+            datatype="real",
+            type_value="quantitative",
+            formula=(
+                f"IF ZN(SUM({right_ref})) = 0 THEN 0 "
+                f"ELSE ZN(SUM({left_ref})) / ZN(SUM({right_ref})) END"
+            ),
+            caption=f"{left_raw_field} / {right_raw_field}",
+        )
+
+
+def _inject_expression_measure_calculated_fields(
+    datasource_nodes: list[ET.Element],
+    sheet_specs: list[dict],
+    dataset_to_datasource: dict[str, str],
+    dataset_alias_to_source: dict[str, dict[str, str]],
+    default_ds_name: str,
+) -> None:
+    if not isinstance(datasource_nodes, list) or not datasource_nodes:
+        return
+
+    datasource_by_name = {
+        node.attrib.get("name", "").strip().lower(): node
+        for node in datasource_nodes
+        if isinstance(node, ET.Element) and isinstance(node.attrib.get("name"), str)
+    }
+    default_node = datasource_by_name.get((default_ds_name or "").strip().lower()) or datasource_nodes[0]
+    processed: set[tuple[str, str, str]] = set()
+
+    for spec in sheet_specs if isinstance(sheet_specs, list) else []:
+        if not isinstance(spec, dict):
+            continue
+        dataset_name = spec.get("dataset_name") if isinstance(spec.get("dataset_name"), str) else ""
+        datasource_name = dataset_to_datasource.get(dataset_name, "") if dataset_name else ""
+        datasource_node = datasource_by_name.get(datasource_name.strip().lower()) if datasource_name else None
+        if datasource_node is None:
+            datasource_node = default_node
+
+        ds_key = datasource_node.attrib.get("name", "").strip().lower()
+        alias_to_source = dataset_alias_to_source.get(dataset_name, {}) if dataset_name else {}
+        expressions = _collect_spec_expression_strings(spec)
+        pairs: list[tuple[str, str, bool, bool, bool]] = []
+
+        left, right = _extract_sum_difference_pair(expressions)
+        if left and right:
+            pairs.append((left, right, True, True, True))
+
+        gauge_left, gauge_right = _extract_gauge_measure_pair(spec)
+        if gauge_left and gauge_right:
+            pairs.append((gauge_left, gauge_right, False, False, True))
+
+        for left_raw, right_raw, create_variance, create_variance_pct, create_progress_pct in pairs:
+            key = (ds_key, left_raw.strip().lower(), right_raw.strip().lower())
+            if key in processed and not create_variance:
+                continue
+            processed.add(key)
+            _upsert_measure_pair_calculated_fields(
+                datasource_node=datasource_node,
+                left_raw_field=left_raw,
+                right_raw_field=right_raw,
+                alias_to_source=alias_to_source,
+                create_variance=create_variance,
+                create_variance_pct=create_variance_pct,
+                create_progress_pct=create_progress_pct,
+            )
+
+
+def _resolve_expression_measure_field_for_spec(
+    spec: dict,
+    semantic_kind: str,
+    candidate_pool: list[str],
+    field_roles: dict[str, str],
+) -> str:
+    if not isinstance(spec, dict):
+        return ""
+
+    def _available_measure(field_name: str) -> str:
+        clean = (field_name or "").strip()
+        if not clean:
+            return ""
+        if field_roles.get(clean.lower(), "") == "measure":
+            return clean
+        match = _find_best_field_match(clean, candidate_pool)
+        if match and field_roles.get(match.lower(), "") == "measure":
+            return match
+        return ""
+
+    expressions = _collect_spec_expression_strings(spec)
+    kind = (semantic_kind or "").strip().lower()
+
+    if kind == "gauge":
+        left, right = _extract_gauge_measure_pair(spec)
+        if left and right:
+            resolved = _available_measure(_derived_progress_pct_field_name(left, right))
+            if resolved:
+                return resolved
+
+    left, right = _extract_sum_difference_ratio_pair(expressions)
+    if left and right:
+        resolved = _available_measure(_derived_variance_pct_field_name(left, right))
+        if resolved:
+            return resolved
+
+    left, right = _extract_sum_difference_pair(expressions)
+    if left and right:
+        resolved = _available_measure(_derived_variance_field_name(left, right))
+        if resolved:
+            return resolved
+
+    left, right = _extract_sum_ratio_pair(expressions)
+    if left and right:
+        resolved = _available_measure(_derived_progress_pct_field_name(left, right))
+        if resolved:
+            return resolved
+
+    return ""
+
+
+def _select_context_dimension_field(candidate_pool: list[str], field_roles: dict[str, str]) -> str:
+    dimensions = [
+        field_name.strip()
+        for field_name in candidate_pool
+        if isinstance(field_name, str)
+        and field_name.strip()
+        and field_roles.get(field_name.strip().lower(), "") == "dimension"
+        and not _is_key_like_column_name(field_name)
+    ]
+    if not dimensions:
+        dimensions = [
+            field_name.strip()
+            for field_name in candidate_pool
+            if isinstance(field_name, str)
+            and field_name.strip()
+            and field_roles.get(field_name.strip().lower(), "") == "dimension"
+        ]
+
+    for field_name in dimensions:
+        if _looks_geographic_dimension_name(field_name):
+            return field_name
+    for field_name in dimensions:
+        if not _looks_temporal_dimension_name(field_name):
+            return field_name
+    return dimensions[0] if dimensions else ""
+
+
+def _static_text_field_name(worksheet_name: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_]+", "_", (worksheet_name or "").strip()).strip("_")
+    if not clean:
+        clean = "StaticText"
+    return f"__text_{clean}"
+
+
+def _tableau_string_literal(value: str) -> str:
+    text = value if isinstance(value, str) else ""
+    escaped = text.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _datasource_field_metadata(datasource_node: ET.Element, field_name: str) -> dict[str, str]:
+    clean = (field_name or "").strip().lower()
+    if not clean or not isinstance(datasource_node, ET.Element):
+        return {}
+    for col in [c for c in list(datasource_node) if _local_name(c.tag) == "column"]:
+        name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
+        if name != clean:
+            continue
+        return {
+            "datatype": (col.attrib.get("datatype") or "").strip().lower(),
+            "type": (col.attrib.get("type") or "").strip().lower(),
+            "role": (col.attrib.get("role") or "").strip().lower(),
+        }
+    return {}
+
+
+def _field_text_formula_reference(field_name: str, datasource_node: ET.Element) -> str:
+    clean = (field_name or "").strip()
+    if not clean:
+        return '""'
+    metadata = _datasource_field_metadata(datasource_node, clean)
+    datatype = metadata.get("datatype", "")
+    type_value = metadata.get("type", "")
+    if _is_numeric_filter_datatype(datatype) or datatype in {"date", "datetime", "boolean"} or type_value == "quantitative":
+        return f"STR([{clean}])"
+    return f"[{clean}]"
+
+
+def _is_tableau_string_literal_part(part: str) -> bool:
+    return isinstance(part, str) and len(part) >= 2 and part.startswith('"') and part.endswith('"')
+
+
+def _tableau_string_literal_content(part: str) -> str:
+    if not _is_tableau_string_literal_part(part):
+        return ""
+    return part[1:-1].replace('\\"', '"')
+
+
+def _append_text_formula_literal(parts: list[str], text: str) -> None:
+    if not isinstance(text, str) or not text:
+        return
+    if parts and _is_tableau_string_literal_part(parts[-1]):
+        merged = _tableau_string_literal_content(parts[-1]) + text
+        parts[-1] = _tableau_string_literal(merged)
+    else:
+        parts.append(_tableau_string_literal(text))
+
+
+def _append_text_formula_dynamic(parts: list[str], formula: str) -> None:
+    clean_formula = (formula or "").strip()
+    if not clean_formula:
+        return
+    if parts and _is_tableau_string_literal_part(parts[-1]):
+        previous = _tableau_string_literal_content(parts[-1])
+        if previous.endswith(":"):
+            parts[-1] = _tableau_string_literal(f"{previous} ")
+    parts.append(clean_formula)
+
+
+def _build_text_values_tableau_formula(text_values: list, datasource_node: ET.Element) -> str:
+    parts: list[str] = []
+    for raw in text_values if isinstance(text_values, list) else []:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw
+        stripped = text.strip()
+        if stripped.startswith("="):
+            expr = stripped[1:].strip()
+            param_match = PARAM_EXPR_REF_RE.fullmatch(expr)
+            field_match = FIELD_EXPR_REF_RE.fullmatch(expr)
+            global_match = re.fullmatch(r"Globals!([A-Za-z0-9_]+)", expr, flags=re.IGNORECASE)
+            if param_match is not None:
+                _append_text_formula_dynamic(parts, _field_text_formula_reference(param_match.group(1), datasource_node))
+            elif field_match is not None:
+                _append_text_formula_dynamic(parts, _field_text_formula_reference(field_match.group(1), datasource_node))
+            elif global_match is not None:
+                global_name = global_match.group(1).strip().lower()
+                if global_name == "executiontime":
+                    _append_text_formula_dynamic(parts, "STR(NOW())")
+                elif global_name in {"pagenumber", "totalpages"}:
+                    _append_text_formula_literal(parts, "1")
+            continue
+
+        _append_text_formula_literal(parts, text)
+
+    return " + ".join(part for part in parts if part)
+
+
+def _inject_static_text_calculated_fields(
+    datasource_nodes: list[ET.Element],
+    sheet_specs: list[dict],
+    default_ds_name: str,
+) -> None:
+    if not isinstance(datasource_nodes, list) or not datasource_nodes:
+        return
+
+    datasource_by_name = {
+        node.attrib.get("name", "").strip().lower(): node
+        for node in datasource_nodes
+        if isinstance(node, ET.Element) and isinstance(node.attrib.get("name"), str)
+    }
+    default_node = datasource_by_name.get((default_ds_name or "").strip().lower()) or datasource_nodes[0]
+
+    for spec in sheet_specs if isinstance(sheet_specs, list) else []:
+        if not isinstance(spec, dict):
+            continue
+        static_text = spec.get("static_text") if isinstance(spec.get("static_text"), str) else ""
+        name = spec.get("name") if isinstance(spec.get("name"), str) else ""
+        if not static_text.strip() or not name.strip():
+            continue
+
+        ds_name = spec.get("datasource_name") if isinstance(spec.get("datasource_name"), str) else ""
+        datasource_node = datasource_by_name.get(ds_name.strip().lower()) if ds_name.strip() else None
+        if datasource_node is None:
+            datasource_node = default_node
+        text_values = spec.get("static_text_values") if isinstance(spec.get("static_text_values"), list) else []
+        formula = _build_text_values_tableau_formula(text_values, datasource_node) or _tableau_string_literal(static_text)
+
+        _upsert_datasource_calculated_column(
+            datasource_node=datasource_node,
+            field_name=_static_text_field_name(name),
+            role="dimension",
+            datatype="string",
+            type_value="nominal",
+            formula=formula,
+            caption=static_text[:80] or name,
+        )
 
 
 def _inject_regionalsales_calculated_fields(
@@ -2487,6 +3047,374 @@ def _build_datasource_field_names_lookup(datasource_nodes: list[ET.Element]) -> 
     return lookup
 
 
+def _build_datasource_field_metadata_lookup(datasource_nodes: list[ET.Element]) -> dict[str, dict[str, dict[str, str]]]:
+    lookup: dict[str, dict[str, dict[str, str]]] = {}
+    for ds_node in datasource_nodes:
+        ds_name = ds_node.attrib.get("name", "") if isinstance(ds_node, ET.Element) else ""
+        if not isinstance(ds_name, str) or not ds_name.strip():
+            continue
+
+        ds_key = ds_name.strip().lower()
+        field_map = lookup.setdefault(ds_key, {})
+        for col in [c for c in list(ds_node) if _local_name(c.tag) == "column"]:
+            field_name = _clean_bracketed_name(col.attrib.get("name", "")).strip()
+            if not field_name:
+                continue
+            field_map[field_name.lower()] = {
+                "name": field_name,
+                "role": (col.attrib.get("role") or "").strip().lower(),
+                "datatype": (col.attrib.get("datatype") or "").strip().lower(),
+                "type": (col.attrib.get("type") or "").strip().lower(),
+            }
+
+    return lookup
+
+
+def _build_parameter_filter_specs(
+    datasets: list,
+    mapping: dict,
+    report_parameters: list[dict],
+) -> list[dict[str, object]]:
+    specs: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    _ = mapping
+
+    def _add_spec(
+        field_name: str,
+        parameter_name: str = "",
+        values: list[str] | None = None,
+        dataset_name: str = "",
+    ) -> None:
+        clean_field = (field_name or "").strip()
+        if not clean_field:
+            return
+        clean_parameter = (parameter_name or "").strip()
+        clean_dataset = (dataset_name or "").strip()
+        key = (clean_field.lower(), clean_parameter.lower(), clean_dataset.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        specs.append(
+            {
+                "field": clean_field,
+                "parameter_name": clean_parameter,
+                "values": _unique_filter_values(values or []),
+                "dataset_names": [clean_dataset] if clean_dataset else [],
+            }
+        )
+
+    for dataset in datasets if isinstance(datasets, list) else []:
+        if not isinstance(dataset, dict):
+            continue
+        dataset_name = dataset.get("name") if isinstance(dataset.get("name"), str) else ""
+
+        for filter_entry in dataset.get("filters") if isinstance(dataset.get("filters"), list) else []:
+            if not isinstance(filter_entry, dict):
+                continue
+            filter_values = filter_entry.get("values") if isinstance(filter_entry.get("values"), list) else []
+            parameter_refs = filter_entry.get("parameter_references") if isinstance(filter_entry.get("parameter_references"), list) else []
+            parameter_name = next((x.strip() for x in parameter_refs if isinstance(x, str) and x.strip()), "")
+            values = _resolve_filter_values(filter_values, parameter_name, report_parameters)
+            fields = _extract_fields_from_expressions(
+                [
+                    filter_entry.get("expression"),
+                    *(filter_values if isinstance(filter_values, list) else []),
+                ]
+            )
+            for field_name in fields:
+                _add_spec(field_name, parameter_name=parameter_name, values=values, dataset_name=dataset_name)
+
+        query = dataset.get("query") if isinstance(dataset.get("query"), str) else ""
+        for query_parameter in dataset.get("query_parameters") if isinstance(dataset.get("query_parameters"), list) else []:
+            if not isinstance(query_parameter, dict):
+                continue
+            parameter_refs = query_parameter.get("parameter_references") if isinstance(query_parameter.get("parameter_references"), list) else []
+            value = query_parameter.get("value")
+            if isinstance(value, str):
+                parameter_refs = [*parameter_refs, *[m.group(1).strip() for m in PARAM_EXPR_REF_RE.finditer(value)]]
+            for parameter_name in parameter_refs:
+                if not isinstance(parameter_name, str) or not parameter_name.strip():
+                    continue
+                default_value = _extract_report_parameter_default(report_parameters, parameter_name)
+                values = [default_value] if default_value else []
+                for field_name in _extract_sql_parameter_filter_fields(query, parameter_name, dataset):
+                    _add_spec(field_name, parameter_name=parameter_name, values=values, dataset_name=dataset_name)
+
+    return specs
+
+
+def _apply_parameter_filters_to_worksheets(
+    root: ET.Element,
+    filter_specs: list[dict[str, object]],
+    datasource_field_roles: dict[str, dict[str, str]],
+    datasource_field_metadata: dict[str, dict[str, dict[str, str]]],
+    datasource_field_names: dict[str, list[str]],
+    worksheet_dataset_by_name: dict[str, str],
+    default_ds_name: str,
+) -> None:
+    worksheets = _find_direct_child(root, "worksheets")
+    if worksheets is None:
+        return
+
+    for ws in [c for c in list(worksheets) if _local_name(c.tag) == "worksheet"]:
+        table = _find_direct_child(ws, "table")
+        if table is None:
+            continue
+        view = _find_direct_child(table, "view")
+        if view is None:
+            view = ET.SubElement(table, "view")
+
+        deps = _find_direct_child(view, "datasource-dependencies")
+        ds_name = default_ds_name
+        if deps is not None:
+            bound_name = deps.attrib.get("datasource")
+            if isinstance(bound_name, str) and bound_name.strip():
+                ds_name = bound_name.strip()
+        else:
+            deps = ET.SubElement(view, "datasource-dependencies", attrib={"datasource": ds_name})
+
+        ds_key = ds_name.lower()
+        worksheet_name = ws.attrib.get("name", "")
+        worksheet_dataset = (
+            worksheet_dataset_by_name.get(worksheet_name.strip().lower(), "")
+            if isinstance(worksheet_name, str)
+            else ""
+        )
+        for spec in filter_specs:
+            spec_dataset_names = spec.get("dataset_names") if isinstance(spec.get("dataset_names"), list) else []
+            clean_spec_datasets = {
+                str(item).strip().lower()
+                for item in spec_dataset_names
+                if isinstance(item, str) and item.strip()
+            }
+            if clean_spec_datasets and worksheet_dataset.strip().lower() not in clean_spec_datasets:
+                continue
+
+            field_name = _resolve_filter_field_name(spec.get("field"), datasource_field_names.get(ds_key, []))
+            if not field_name:
+                continue
+            metadata = datasource_field_metadata.get(ds_key, {}).get(field_name.lower(), {})
+            role = metadata.get("role") or datasource_field_roles.get(ds_key, {}).get(field_name.lower(), "dimension")
+            if role not in {"dimension", "measure"}:
+                role = "dimension"
+            datatype = metadata.get("datatype", "")
+            type_value = metadata.get("type", "")
+
+            _append_dependency_binding(
+                deps,
+                field_name,
+                role=role,
+                datatype=datatype,
+                type_value=type_value,
+            )
+            column_ref = _filter_column_reference(ds_name, field_name, role, datatype=datatype)
+            if not column_ref:
+                continue
+            _ensure_view_filter(view, column_ref, field_name, role, spec, datatype=datatype)
+            _ensure_filter_slice(view, column_ref)
+
+        _reorder_view_children_for_tableau(view)
+
+
+def _resolve_filter_values(
+    raw_values: list,
+    parameter_name: str,
+    report_parameters: list[dict],
+) -> list[str]:
+    if parameter_name:
+        default_value = _clean_filter_literal(_extract_report_parameter_default(report_parameters, parameter_name))
+        return [default_value] if default_value else []
+
+    values: list[str] = []
+    for value in raw_values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if FIELD_EXPR_REF_RE.search(value) or PARAM_EXPR_REF_RE.search(value):
+            continue
+        clean = _clean_filter_literal(value)
+        if clean and clean not in values:
+            values.append(clean)
+    return values
+
+
+def _unique_filter_values(values: list[str]) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        clean = _clean_filter_literal(value) if isinstance(value, str) else ""
+        if clean and clean not in out:
+            out.append(clean)
+    return out
+
+
+def _clean_filter_literal(value: str) -> str:
+    clean = (value or "").strip()
+    if not clean:
+        return ""
+    if clean.startswith("="):
+        clean = clean[1:].strip()
+    if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith("'") and clean.endswith("'")):
+        clean = clean[1:-1].strip()
+    return clean
+
+
+def _is_numeric_filter_datatype(datatype: str) -> bool:
+    return (datatype or "").strip().lower() in {"integer", "real", "float", "double", "decimal"}
+
+
+def _is_numeric_literal(value: str) -> bool:
+    return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", (value or "").strip()))
+
+
+def _format_groupfilter_member(value: str, datatype: str) -> str:
+    clean = _clean_filter_literal(value)
+    if _is_numeric_filter_datatype(datatype) and _is_numeric_literal(clean):
+        return clean
+    return f'"{clean}"'
+
+
+def _extract_sql_parameter_filter_fields(query: str, parameter_name: str, dataset: dict) -> list[str]:
+    param = (parameter_name or "").strip().lstrip("@")
+    if not isinstance(query, str) or not query.strip() or not param:
+        return []
+
+    identifier = r"(?:\[[^\]]+\]|[A-Za-z_][\w$]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$]*))*"
+    patterns = [
+        rf"(?P<field>{identifier})\s*(?:=|<>|!=|>=|<=|>|<)\s*@{re.escape(param)}\b",
+        rf"@{re.escape(param)}\b\s*(?:=|<>|!=|>=|<=|>|<)\s*(?P<field>{identifier})",
+        rf"(?P<field>{identifier})\s+in\s*\(\s*@{re.escape(param)}\b",
+    ]
+    dataset_fields = _dataset_field_names(dataset)
+    out: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+            field_name = _clean_sql_identifier_leaf(match.group("field"))
+            resolved = _resolve_filter_field_name(field_name, dataset_fields) or field_name
+            if resolved and resolved not in out:
+                out.append(resolved)
+    return out
+
+
+def _dataset_field_names(dataset: dict) -> list[str]:
+    fields: list[str] = []
+    for field in dataset.get("fields") if isinstance(dataset.get("fields"), list) else []:
+        if not isinstance(field, dict):
+            continue
+        for key in ["name", "data_field"]:
+            value = field.get(key)
+            if isinstance(value, str) and value.strip() and value.strip() not in fields:
+                fields.append(value.strip())
+    return fields
+
+
+def _clean_sql_identifier_leaf(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    return _clean_bracketed_name(text.split(".")[-1]).strip()
+
+
+def _resolve_filter_field_name(raw_field: object, available_fields: list[str]) -> str:
+    if not isinstance(raw_field, str) or not raw_field.strip():
+        return ""
+    clean = raw_field.strip()
+    if not available_fields:
+        return clean
+    for candidate in available_fields:
+        if isinstance(candidate, str) and candidate.strip().lower() == clean.lower():
+            return candidate.strip()
+    leaf = _clean_sql_identifier_leaf(clean)
+    for candidate in available_fields:
+        if isinstance(candidate, str) and candidate.strip().lower() == leaf.lower():
+            return candidate.strip()
+    return ""
+
+
+def _filter_column_reference(datasource_name: str, field_name: str, role: str, datatype: str = "") -> str:
+    ds_name = (datasource_name or "").strip()
+    clean_field = (field_name or "").strip()
+    if not ds_name or not clean_field:
+        return ""
+    if (role or "").strip().lower() == "measure":
+        return f"[{ds_name}].[sum:{clean_field}:qk]"
+    if _is_numeric_filter_datatype(datatype):
+        return f"[{ds_name}].[none:{clean_field}:qk]"
+    return f"[{ds_name}].[none:{clean_field}:nk]"
+
+
+def _ensure_view_filter(
+    view_node: ET.Element,
+    column_ref: str,
+    field_name: str,
+    role: str,
+    spec: dict[str, object],
+    datatype: str = "",
+) -> None:
+    filter_node: ET.Element | None = None
+    for child in list(view_node):
+        if _local_name(child.tag) == "filter" and (child.attrib.get("column") or "").strip() == column_ref:
+            filter_node = child
+            break
+    if filter_node is None:
+        filter_node = ET.SubElement(view_node, "filter")
+
+    for child in list(filter_node):
+        filter_node.remove(child)
+
+    values = spec.get("values") if isinstance(spec.get("values"), list) else []
+    clean_values = _unique_filter_values([str(value) for value in values])
+    role_norm = (role or "").strip().lower()
+
+    if role_norm == "dimension" and _is_numeric_filter_datatype(datatype):
+        filter_node.attrib.clear()
+        filter_node.attrib.update({"class": "quantitative", "column": column_ref, "included-values": "in-range"})
+        range_values = [value for value in clean_values if _is_numeric_literal(value)]
+        if range_values:
+            min_value = range_values[0]
+            max_value = range_values[1] if len(range_values) > 1 else range_values[0]
+        else:
+            filter_node.attrib["included-values"] = "in-range-or-null"
+            min_value = "0"
+            max_value = "9999"
+        min_node = ET.SubElement(filter_node, "min")
+        min_node.text = min_value
+        max_node = ET.SubElement(filter_node, "max")
+        max_node.text = max_value
+        return
+
+    if role_norm == "measure" and len(clean_values) >= 2:
+        filter_node.attrib.clear()
+        filter_node.attrib.update({"class": "quantitative", "column": column_ref, "included-values": "in-range"})
+        min_node = ET.SubElement(filter_node, "min")
+        min_node.text = clean_values[0]
+        max_node = ET.SubElement(filter_node, "max")
+        max_node.text = clean_values[1]
+        return
+
+    filter_node.attrib.clear()
+    filter_node.attrib.update({"class": "categorical", "column": column_ref, "filter-group": "1"})
+    level = f"[sum:{field_name}:qk]" if role_norm == "measure" else f"[none:{field_name}:nk]"
+    if clean_values:
+        for value in clean_values:
+            ET.SubElement(
+                filter_node,
+                "groupfilter",
+                attrib={"function": "member", "level": level, "member": _format_groupfilter_member(value, datatype)},
+            )
+    else:
+        ET.SubElement(filter_node, "groupfilter", attrib={"function": "level-members", "level": level})
+
+
+def _ensure_filter_slice(view_node: ET.Element, column_ref: str) -> None:
+    slices = _find_direct_child(view_node, "slices")
+    if slices is None:
+        slices = ET.SubElement(view_node, "slices")
+    for child in list(slices):
+        if _local_name(child.tag) == "column" and isinstance(child.text, str) and child.text.strip() == column_ref:
+            return
+    node = ET.SubElement(slices, "column")
+    node.text = column_ref
+
+
 def _collect_fields_used_by_workbook_views(root: ET.Element) -> set[str]:
     used: set[str] = set()
 
@@ -2637,7 +3565,6 @@ def _is_regionalsales_report(visual_model: dict) -> bool:
 
 def _build_regionalsales_sheet_specs(
     mapped_dataset_by_visual: dict[str, str],
-    parameter_usage: list,
 ) -> list[dict]:
     dataset_name = mapped_dataset_by_visual.get("tablixregionsummary", "")
     if not dataset_name:
@@ -2771,33 +3698,6 @@ def _build_regionalsales_sheet_specs(
         },
     ]
 
-    if isinstance(parameter_usage, list):
-        for usage in parameter_usage:
-            if not isinstance(usage, dict):
-                continue
-            parameter_name = usage.get("parameter_name")
-            if not isinstance(parameter_name, str) or not parameter_name.strip():
-                continue
-
-            fields: list[str] = []
-            for field_name in usage.get("fields") if isinstance(usage.get("fields"), list) else []:
-                if isinstance(field_name, str) and field_name.strip() and field_name.strip() not in fields:
-                    fields.append(field_name.strip())
-            if not fields:
-                fields = ["SalesTerritoryRegion"]
-
-            specs.append(
-                {
-                    "name": f"Filter - {parameter_name.strip()}",
-                    "visual_type": "Filter",
-                    "dataset_name": dataset_name,
-                    "fields": fields,
-                    "semantic_kind": "filter",
-                    "filters": [],
-                    "parameter_name": parameter_name.strip(),
-                }
-            )
-
     return specs
 
 
@@ -2835,10 +3735,8 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
             if fields:
                 mapped_fields_by_visual[visual_name.strip().lower()] = fields
 
-    parameter_usage = mapping.get("parameter_usage", []) if isinstance(mapping, dict) else []
-
     if _is_regionalsales_report(visual_model):
-        return _build_regionalsales_sheet_specs(mapped_dataset_by_visual, parameter_usage)
+        return _build_regionalsales_sheet_specs(mapped_dataset_by_visual)
 
     sheets = visual_model.get("sheets", []) if isinstance(visual_model, dict) else []
     if isinstance(sheets, list):
@@ -2862,6 +3760,9 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
             semantic_kind = _derive_sheet_semantic_kind(name.strip(), visual_type, visual_node)
             visual_properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
             visual_filters = visual_properties.get("filters") if isinstance(visual_properties.get("filters"), list) else []
+            static_text = _extract_static_text_from_visual_properties(visual_properties)
+            static_text_values = _extract_static_text_values_from_visual_properties(visual_properties)
+            visual_expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
 
             if _should_skip_sheet_spec(
                 visual_name=name.strip(),
@@ -2880,6 +3781,10 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
                     "fields": referenced_fields,
                     "semantic_kind": semantic_kind,
                     "filters": visual_filters,
+                    "expressions": visual_expressions,
+                    "properties": visual_properties,
+                    "static_text": static_text,
+                    "static_text_values": static_text_values,
                 }
             )
 
@@ -2897,6 +3802,9 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
             semantic_kind = _derive_sheet_semantic_kind(name, visual_type, visual_node)
             visual_properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
             visual_filters = visual_properties.get("filters") if isinstance(visual_properties.get("filters"), list) else []
+            static_text = _extract_static_text_from_visual_properties(visual_properties)
+            static_text_values = _extract_static_text_values_from_visual_properties(visual_properties)
+            visual_expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
 
             if _should_skip_sheet_spec(
                 visual_name=name,
@@ -2915,46 +3823,12 @@ def _collect_sheet_specs(visual_model: dict, mapping: dict) -> list[dict]:
                     "fields": referenced_fields,
                     "semantic_kind": semantic_kind,
                     "filters": visual_filters,
+                    "expressions": visual_expressions,
+                    "properties": visual_properties,
+                    "static_text": static_text,
+                    "static_text_values": static_text_values,
                 }
             )
-
-    if isinstance(parameter_usage, list):
-        for usage in parameter_usage:
-            if not isinstance(usage, dict):
-                continue
-            parameter_name = usage.get("parameter_name")
-            if not isinstance(parameter_name, str) or not parameter_name.strip():
-                continue
-
-            spec_name = f"Filter - {parameter_name.strip()}"
-            key = spec_name.lower()
-            if key in seen:
-                continue
-
-            dataset_name = ""
-            dataset_names = usage.get("dataset_names") if isinstance(usage.get("dataset_names"), list) else []
-            for ds_name in dataset_names:
-                if isinstance(ds_name, str) and ds_name.strip():
-                    dataset_name = ds_name.strip()
-                    break
-
-            fields: list[str] = []
-            for field in usage.get("fields") if isinstance(usage.get("fields"), list) else []:
-                if isinstance(field, str) and field.strip() and field.strip() not in fields:
-                    fields.append(field.strip())
-
-            specs.append(
-                {
-                    "name": spec_name,
-                    "visual_type": "Filter",
-                    "dataset_name": dataset_name,
-                    "fields": fields,
-                    "semantic_kind": "filter",
-                    "filters": [],
-                    "parameter_name": parameter_name.strip(),
-                }
-            )
-            seen.add(key)
 
     return specs
 
@@ -3168,7 +4042,6 @@ def _rebuild_regionalsales_dashboard(
     add_zone("PageHeader_TitleTile", 14000, 0, 86000, 18000)
     add_text("Regional Sales", 14000, 2200, 86000, 7000, font_size="24", bold=True)
     add_zone("PageHeader_ReportSubtitle", 16000, 9800, 80000, 5600)
-    add_zone("Filter - SalesTerritoryGroup", 76000, 15000, 24000, 3000)
 
     add_zone("tablixRegionSummary_SalesTerritoryRegion", 0, 18000, 100000, 7000)
     add_text("ORDERS", 0, 25000, 20000, 5000, font_size="12", bold=True)
@@ -3209,7 +4082,6 @@ def _rebuild_regionalsales_dashboard(
         ("worksheet", "PageHeader_TitleTile"),
         ("text", "Regional Sales"),
         ("worksheet", "PageHeader_ReportSubtitle"),
-        ("worksheet", "Filter - SalesTerritoryGroup"),
         ("worksheet", "tablixRegionSummary_SalesTerritoryRegion"),
         ("text", "ORDERS     SALES     QUOTA     VARIANCE"),
         ("worksheet", "tablixRegionSummary_Quantity"),
@@ -3562,11 +4434,54 @@ def _extract_fields_from_visual_node(visual_node: dict) -> list[str]:
     return names
 
 
+def _extract_static_text_from_visual_properties(properties: dict) -> str:
+    if not isinstance(properties, dict):
+        return ""
+
+    text_values = _extract_static_text_values_from_visual_properties(properties)
+    parts: list[str] = []
+    for raw in text_values:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw.strip()
+        if text.startswith("="):
+            param_match = PARAM_EXPR_REF_RE.fullmatch(text[1:].strip())
+            global_match = re.fullmatch(r"Globals!([A-Za-z0-9_]+)", text[1:].strip(), flags=re.IGNORECASE)
+            if param_match is not None:
+                text = f"[{param_match.group(1).strip()}]"
+            elif global_match is not None:
+                text = f"[{global_match.group(1).strip()}]"
+            else:
+                continue
+        if text and text not in parts:
+            parts.append(text)
+
+    return " ".join(parts).strip()
+
+
+def _extract_static_text_values_from_visual_properties(properties: dict) -> list[str]:
+    if not isinstance(properties, dict):
+        return []
+    text_values = properties.get("text_values") if isinstance(properties.get("text_values"), list) else []
+    return [value for value in text_values if isinstance(value, str) and value.strip()]
+
+
 def _derive_sheet_semantic_kind(sheet_name: str, visual_type: str, visual_node: dict) -> str:
     name_hint = (sheet_name or "").strip().lower()
     type_hint = (visual_type or "").strip().lower()
 
     properties = visual_node.get("properties") if isinstance(visual_node.get("properties"), dict) else {}
+    semantic_hint = properties.get("semantic_hint") if isinstance(properties.get("semantic_hint"), str) else ""
+    if semantic_hint.strip().lower() == "static_text":
+        return "static_text"
+
+    if "filter" in type_hint or name_hint.startswith("filter"):
+        return "filter"
+    if "gauge" in type_hint:
+        return "gauge"
+    if "image" in type_hint:
+        return "image"
+
     section_hint = (
         properties.get("container_section")
         if isinstance(properties.get("container_section"), str)
@@ -3578,20 +4493,12 @@ def _derive_sheet_semantic_kind(sheet_name: str, visual_type: str, visual_node: 
     if "pagefooter" in section_hint:
         return "footer"
 
-    if "filter" in type_hint or name_hint.startswith("filter"):
-        return "filter"
-    if "gauge" in type_hint:
-        return "gauge"
-    if "image" in type_hint:
-        return "image"
-
     if "textbox" in type_hint or "text" in type_hint:
         if any(token in name_hint for token in ["header", "title", "subtitle"]):
             return "header"
         if any(token in name_hint for token in ["footer", "footnote"]):
             return "footer"
 
-        semantic_hint = properties.get("semantic_hint") if isinstance(properties.get("semantic_hint"), str) else ""
         if semantic_hint.strip().lower() == "kpi":
             expressions = visual_node.get("expressions") if isinstance(visual_node.get("expressions"), list) else []
             if any(AGGREGATE_EXPR_HINT_RE.search(expr) for expr in expressions if isinstance(expr, str)):
@@ -3611,6 +4518,8 @@ def _derive_sheet_semantic_kind(sheet_name: str, visual_type: str, visual_node: 
             token in blob for token in ["sales", "quota", "amount", "target", "variance", "quantity", "kpi", "%"]
         ):
             return "kpi"
+        if _extract_static_text_from_visual_properties(properties):
+            return "static_text"
         return "text"
 
     if any(token in name_hint for token in ["header", "title", "subtitle"]):
@@ -3639,14 +4548,8 @@ def _should_skip_sheet_spec(
     if vt == "rectangle":
         return True
 
-    # Keep page header/footer content out of worksheet tabs.
-    if kind in {"header", "footer"}:
+    if kind == "filter":
         return True
-
-    if kind == "text" and section == "body":
-        # Dimension-only body textboxes are usually table labels/captions and add noisy empty sheets.
-        if not any(_looks_kpi_field_name(field) for field in referenced_fields if isinstance(field, str)):
-            return True
 
     _ = visual_name  # Keep signature explicit for future naming heuristics.
     return False
@@ -3739,7 +4642,21 @@ def _rebuild_worksheets_from_sheet_specs(
             worksheet_name=worksheet_name,
         )
 
-        if semantic_kind in {"kpi", "gauge"}:
+        expression_measure_field = _resolve_expression_measure_field_for_spec(
+            spec=spec,
+            semantic_kind=semantic_kind,
+            candidate_pool=candidate_pool,
+            field_roles=field_roles,
+        )
+        if expression_measure_field:
+            measure_field = expression_measure_field
+            has_numeric_measure = True
+        if semantic_kind == "gauge" and field_roles.get(dim_field.lower(), "") != "dimension":
+            context_dim_field = _select_context_dimension_field(candidate_pool, field_roles)
+            if context_dim_field:
+                dim_field = context_dim_field
+
+        if semantic_kind in {"kpi", "gauge"} and not expression_measure_field:
             for candidate in referenced_fields:
                 if not isinstance(candidate, str):
                     continue
@@ -3801,6 +4718,21 @@ def _rebuild_worksheets_from_sheet_specs(
 
         rows = ET.SubElement(table, "rows")
         cols = ET.SubElement(table, "cols")
+        static_text = spec.get("static_text") if isinstance(spec.get("static_text"), str) else ""
+        if static_text.strip() and semantic_kind in {"header", "footer", "static_text", "text"}:
+            static_field = _static_text_field_name(worksheet_name)
+            _append_dependency_binding(deps, static_field, role="dimension", datatype="string", type_value="nominal")
+            rows.text = ""
+            cols.text = ""
+            _set_text_pane_encoding(pane, sheet_ds_name, static_field, role="dimension")
+            continue
+
+        if semantic_kind == "text":
+            _append_dependency_binding(deps, dim_field, role="dimension")
+            rows.text = ""
+            cols.text = ""
+            _set_text_pane_encoding(pane, sheet_ds_name, dim_field, role="dimension")
+            continue
 
         if template_role == "logo_placeholder":
             logo_field = dim_field
@@ -3837,12 +4769,6 @@ def _rebuild_worksheets_from_sheet_specs(
                 )
                 _append_dependency_binding(deps, year_field, role="dimension")
                 _append_dependency_binding(deps, group_field, role="dimension")
-                _ensure_subtitle_filter_context(
-                    view_node=view,
-                    datasource_name=sheet_ds_name,
-                    year_field=year_field,
-                    group_field=group_field,
-                )
                 cols.text = f"[{sheet_ds_name}].[attr:{text_field}:nk]"
             else:
                 cols.text = f"[{sheet_ds_name}].[none:{text_field}:nk]"
@@ -3885,12 +4811,12 @@ def _rebuild_worksheets_from_sheet_specs(
             if field_roles.get(kpi_measure_field.lower(), "") == "measure":
                 _append_dependency_binding(deps, kpi_measure_field, role="measure")
 
-            rows.text = f"[{sheet_ds_name}].[none:{kpi_dim_field}:nk]"
-            cols.text = (
-                f"[{sheet_ds_name}].[sum:{kpi_measure_field}:qk]"
-                if field_roles.get(kpi_measure_field.lower(), "") == "measure"
-                else f"[{sheet_ds_name}].[none:{kpi_dim_field}:nk]"
-            )
+            rows.text = ""
+            cols.text = ""
+            if field_roles.get(kpi_measure_field.lower(), "") == "measure":
+                _set_text_pane_encoding(pane, sheet_ds_name, kpi_measure_field, role="measure")
+            else:
+                _set_text_pane_encoding(pane, sheet_ds_name, kpi_dim_field, role="dimension")
             continue
 
         if template_role == "gauge_by_region":
@@ -3956,11 +4882,11 @@ def _rebuild_worksheets_from_sheet_specs(
 
         if semantic_kind == "kpi":
             rows.text = ""
-            cols.text = (
-                f"[{sheet_ds_name}].[sum:{measure_field}:qk]"
-                if has_numeric_measure
-                else f"[{sheet_ds_name}].[none:{dim_field}:nk]"
-            )
+            cols.text = ""
+            if has_numeric_measure:
+                _set_text_pane_encoding(pane, sheet_ds_name, measure_field, role="measure")
+            else:
+                _set_text_pane_encoding(pane, sheet_ds_name, dim_field, role="dimension")
             continue
 
         if semantic_kind == "gauge" and has_numeric_measure:
@@ -4864,11 +5790,15 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                 cols_text = ""
                 deps_datasource_name = first_ds_name
                 dependency_children: list[ET.Element] = []
+                view_filter_children: list[ET.Element] = []
+                slice_columns: list[str] = []
                 has_measure_dependency = False
                 sheet_dim_field = ""
                 sheet_measure_field = ""
+                text_encoding_column = ""
                 table_old = _find_direct_child(ws, "table")
                 if table_old is not None:
+                    text_encoding_column = _extract_text_encoding_column(table_old)
                     rows_old = _find_direct_child(table_old, "rows")
                     cols_old = _find_direct_child(table_old, "cols")
                     if rows_old is not None and isinstance(rows_old.text, str):
@@ -4897,6 +5827,16 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                                             has_measure_dependency = True
                                     dependency_children.append(_clone_xml_element(dep_child))
 
+                        for view_child in list(view_old):
+                            if _local_name(view_child.tag) == "filter":
+                                view_filter_children.append(_clone_xml_element(view_child))
+
+                        slices_old = _find_direct_child(view_old, "slices")
+                        if slices_old is not None:
+                            for slice_child in [c for c in list(slices_old) if _local_name(c.tag) == "column"]:
+                                if isinstance(slice_child.text, str) and slice_child.text.strip():
+                                    slice_columns.append(slice_child.text.strip())
+
                 if dependency_children:
                     sheet_dim_field, sheet_measure_field = _extract_dim_measure_from_dependency_nodes(dependency_children)
 
@@ -4909,8 +5849,10 @@ def _sanitize_worksheets(root: ET.Element) -> None:
 
                 mark_class = _extract_table_mark_class(table_old)
                 preserve_empty_shelves = False
+                text_measure_only_shelves = False
                 if table_old is not None and _is_text_mark_class(mark_class):
                     preserve_empty_shelves = not rows_text and not cols_text
+                    text_measure_only_shelves = _shelves_are_measure_only(rows_text, cols_text)
                 elif table_old is not None and isinstance(mark_class, str) and mark_class.strip().lower() == "shape":
                     preserve_empty_shelves = not rows_text
                 sheets_payload.append(
@@ -4922,9 +5864,13 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                         "preserve_empty_shelves": "true" if preserve_empty_shelves else "",
                         "deps_datasource_name": deps_datasource_name,
                         "dependency_children": dependency_children,
+                        "view_filter_children": view_filter_children,
+                        "slice_columns": slice_columns,
                         "has_measure_dependency": "true" if has_measure_dependency else "",
                         "sheet_dim_field": sheet_dim_field,
                         "sheet_measure_field": sheet_measure_field,
+                        "text_encoding_column": text_encoding_column,
+                        "text_measure_only_shelves": "true" if text_measure_only_shelves else "",
                     }
                 )
 
@@ -4937,6 +5883,8 @@ def _sanitize_worksheets(root: ET.Element) -> None:
                 "mark_class": "Bar",
                 "deps_datasource_name": first_ds_name,
                 "dependency_children": [],
+                "view_filter_children": [],
+                "slice_columns": [],
             }
         ]
 
@@ -4957,6 +5905,7 @@ def _sanitize_worksheets(root: ET.Element) -> None:
         is_shape = isinstance(mark_class, str) and mark_class.strip().lower() == "shape"
         preserve_empty_shelves = sheet.get("preserve_empty_shelves") == "true"
         has_measure_dependency = sheet.get("has_measure_dependency") == "true"
+        text_measure_only_shelves = sheet.get("text_measure_only_shelves") == "true"
 
         deps_datasource_name = sheet.get("deps_datasource_name")
         if not isinstance(deps_datasource_name, str) or not deps_datasource_name.strip():
@@ -4967,6 +5916,7 @@ def _sanitize_worksheets(root: ET.Element) -> None:
         sheet_measure_field = sheet.get("sheet_measure_field") if isinstance(sheet.get("sheet_measure_field"), str) else ""
         sheet_dim_field = sheet_dim_field.strip() if sheet_dim_field.strip() else dim_field
         sheet_measure_field = sheet_measure_field.strip() if sheet_measure_field.strip() else measure_field
+        text_encoding_column = sheet.get("text_encoding_column") if isinstance(sheet.get("text_encoding_column"), str) else ""
 
         # Tableau cartesian default: X on columns, Y on rows.
         rows_default = f"[{deps_datasource_name}].[sum:{sheet_measure_field}:qk]"
@@ -4976,7 +5926,7 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             # Preserve explicit text/KPI/filter shelf intent from injected semantic bindings.
             rows_text = sheet["rows"] if isinstance(sheet.get("rows"), str) else ""
             cols_text = sheet["cols"] if isinstance(sheet.get("cols"), str) else ""
-            if preserve_empty_shelves:
+            if preserve_empty_shelves or text_measure_only_shelves:
                 rows_text = ""
                 cols_text = ""
         elif is_shape and preserve_empty_shelves:
@@ -4992,7 +5942,7 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             if _contains_placeholder_field_reference(cols_text):
                 cols_text = cols_default
 
-        if _is_text_mark_class(mark_class) and not has_measure_dependency:
+        if _is_text_mark_class(mark_class) and not has_measure_dependency and not text_encoding_column.strip():
             if not rows_text and not cols_text:
                 cols_text = f"[{deps_datasource_name}].[none:{sheet_dim_field}:nk]"
 
@@ -5028,8 +5978,28 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             add_instances=not has_dependency_instances,
         )
 
+        view_filter_children = sheet.get("view_filter_children")
+        if isinstance(view_filter_children, list):
+            for filter_child in view_filter_children:
+                if isinstance(filter_child, ET.Element):
+                    view.append(_clone_xml_element(filter_child))
+
         ET.SubElement(view, "perspectives")
+        slice_columns = sheet.get("slice_columns")
+        if isinstance(slice_columns, list) and slice_columns:
+            slices = ET.SubElement(view, "slices")
+            seen_slices: set[str] = set()
+            for slice_column in slice_columns:
+                if not isinstance(slice_column, str) or not slice_column.strip():
+                    continue
+                clean_slice = slice_column.strip()
+                if clean_slice in seen_slices:
+                    continue
+                seen_slices.add(clean_slice)
+                slice_node = ET.SubElement(slices, "column")
+                slice_node.text = clean_slice
         ET.SubElement(view, "aggregation", attrib={"value": "true"})
+        _reorder_view_children_for_tableau(view)
 
         ET.SubElement(table, "style")
         panes = ET.SubElement(table, "panes")
@@ -5039,6 +6009,11 @@ def _sanitize_worksheets(root: ET.Element) -> None:
             ET.SubElement(pane, "mark", attrib={"class": mark_class})
             if is_pie:
                 _set_pie_pane_encodings(pane, deps_datasource_name, sheet_dim_field, sheet_measure_field)
+            elif is_text:
+                if text_encoding_column.strip():
+                    _set_text_pane_encoding_column(pane, text_encoding_column)
+                elif has_measure_dependency and (preserve_empty_shelves or text_measure_only_shelves):
+                    _set_text_pane_encoding(pane, deps_datasource_name, sheet_measure_field, role="measure")
         rows = ET.SubElement(table, "rows")
         rows.text = rows_text
         cols = ET.SubElement(table, "cols")
@@ -5116,6 +6091,8 @@ def _append_dependency_binding(
     deps_node: ET.Element,
     field_name: str,
     role: str,
+    datatype: str = "",
+    type_value: str = "",
 ) -> None:
     clean = (field_name or "").strip()
     if not clean:
@@ -5139,33 +6116,43 @@ def _append_dependency_binding(
     clean_lower = clean.lower()
     if clean_lower not in existing_columns:
         if role_norm == "dimension":
+            inferred_datatype, inferred_type = _infer_dimension_dependency_spec(clean)
+            column_datatype = datatype.strip().lower() if isinstance(datatype, str) and datatype.strip() else inferred_datatype
+            column_type = type_value.strip().lower() if isinstance(type_value, str) and type_value.strip() else inferred_type
+            if _is_numeric_filter_datatype(column_datatype):
+                column_type = "quantitative"
             ET.SubElement(
                 deps_node,
                 "column",
                 attrib={
                     "name": f"[{clean}]",
                     "role": "dimension",
-                    "datatype": _infer_dimension_dependency_spec(clean)[0],
-                    "type": _infer_dimension_dependency_spec(clean)[1],
+                    "datatype": column_datatype,
+                    "type": column_type,
                     "caption": clean,
                 },
             )
         else:
+            column_datatype = datatype.strip().lower() if isinstance(datatype, str) and datatype.strip() else "real"
             ET.SubElement(
                 deps_node,
                 "column",
                 attrib={
                     "name": f"[{clean}]",
                     "role": "measure",
-                    "datatype": "real",
+                    "datatype": column_datatype,
                     "type": "quantitative",
                     "caption": clean,
                 },
             )
 
     if role_norm == "dimension":
-        instance_name = f"none:{clean}:nk"
+        instance_suffix = "qk" if _is_numeric_filter_datatype(datatype) else "nk"
+        instance_name = f"none:{clean}:{instance_suffix}"
         if instance_name.lower() not in existing_instances:
+            instance_type = type_value.strip().lower() if isinstance(type_value, str) and type_value.strip() else _infer_dimension_dependency_spec(clean)[1]
+            if _is_numeric_filter_datatype(datatype):
+                instance_type = "quantitative"
             ET.SubElement(
                 deps_node,
                 "column-instance",
@@ -5174,7 +6161,7 @@ def _append_dependency_binding(
                     "derivation": "None",
                     "name": f"[{instance_name}]",
                     "pivot": "key",
-                    "type": _infer_dimension_dependency_spec(clean)[1],
+                    "type": instance_type,
                 },
             )
     else:
@@ -5381,6 +6368,26 @@ def _extract_table_mark_class(table_node: ET.Element | None) -> str:
     return "Bar"
 
 
+def _extract_text_encoding_column(table_node: ET.Element | None) -> str:
+    if table_node is None:
+        return ""
+
+    panes = _find_direct_child(table_node, "panes")
+    if panes is None:
+        return ""
+
+    for pane in [c for c in list(panes) if _local_name(c.tag) == "pane"]:
+        encodings = _find_direct_child(pane, "encodings")
+        if encodings is None:
+            continue
+        for encoding in [c for c in list(encodings) if _local_name(c.tag) == "text"]:
+            column = encoding.attrib.get("column")
+            if isinstance(column, str) and column.strip():
+                return column.strip()
+
+    return ""
+
+
 def _set_table_mark_class(table_node: ET.Element, mark_class: str) -> None:
     panes = _find_direct_child(table_node, "panes")
     if panes is None:
@@ -5445,6 +6452,41 @@ def _set_pie_pane_encodings(
         "wedge-size",
         attrib={"column": f"[{datasource_name}].[sum:{measure_field}:qk]"},
     )
+
+
+def _set_text_pane_encoding(
+    pane_node: ET.Element,
+    datasource_name: str,
+    field_name: str,
+    role: str,
+) -> None:
+    clean_field = (field_name or "").strip()
+    clean_datasource = (datasource_name or "").strip()
+    if not clean_field or not clean_datasource:
+        return
+
+    role_norm = (role or "").strip().lower()
+    if role_norm == "measure":
+        column = f"[{clean_datasource}].[sum:{clean_field}:qk]"
+    else:
+        column = f"[{clean_datasource}].[none:{clean_field}:nk]"
+    _set_text_pane_encoding_column(pane_node, column)
+
+
+def _set_text_pane_encoding_column(pane_node: ET.Element, column: str) -> None:
+    clean_column = (column or "").strip()
+    if not clean_column:
+        return
+
+    encodings = _find_direct_child(pane_node, "encodings")
+    if encodings is None:
+        encodings = ET.SubElement(pane_node, "encodings")
+
+    for child in list(encodings):
+        if _local_name(child.tag) == "text":
+            encodings.remove(child)
+
+    ET.SubElement(encodings, "text", attrib={"column": clean_column})
 
 
 def _is_pie_mark_class(mark_class: str | None) -> bool:
@@ -5679,32 +6721,33 @@ def _extract_dim_measure_from_shelves(rows_text: str, cols_text: str) -> tuple[s
     return dim, measure
 
 
+def _shelves_are_measure_only(rows_text: str, cols_text: str) -> bool:
+    derivations: list[str] = []
+    for shelf_text in [rows_text, cols_text]:
+        if not isinstance(shelf_text, str) or not shelf_text.strip():
+            continue
+        for match in SHELF_FIELD_REF_RE.finditer(shelf_text):
+            derivations.append((match.group("derivation") or "").strip().lower())
+
+    if not derivations:
+        return False
+
+    aggregate_derivations = {"sum", "avg", "average", "min", "max", "count"}
+    return all(derivation in aggregate_derivations for derivation in derivations)
+
+
 def _sanitize_windows(root: ET.Element) -> None:
     windows = _find_direct_child(root, "windows")
     if windows is None:
         windows = ET.SubElement(root, "windows")
 
     default_ds_name = "DataSource_1"
-    has_year_filter_field = False
-    has_group_filter_field = False
 
     datasources_node = _find_direct_child(root, "datasources")
     if datasources_node is not None:
         first_ds = _find_direct_child(datasources_node, "datasource")
         if first_ds is not None and first_ds.attrib.get("name"):
             default_ds_name = first_ds.attrib["name"]
-
-        for ds_node in [c for c in list(datasources_node) if _local_name(c.tag) == "datasource"]:
-            for col in [c for c in list(ds_node) if _local_name(c.tag) == "column"]:
-                field_name = _clean_bracketed_name(col.attrib.get("name", "")).strip().lower()
-                if field_name == "calendaryear":
-                    has_year_filter_field = True
-                elif field_name == "salesterritorygroup":
-                    has_group_filter_field = True
-                if has_year_filter_field and has_group_filter_field:
-                    break
-            if has_year_filter_field and has_group_filter_field:
-                break
 
     worksheet_names: list[str] = []
     worksheets = _find_direct_child(root, "worksheets")
@@ -5713,6 +6756,8 @@ def _sanitize_windows(root: ET.Element) -> None:
             name = ws.attrib.get("name")
             if name:
                 worksheet_names.append(name)
+
+    filter_card_columns = _collect_filter_card_columns(root)
 
     dashboard_names: list[str] = []
     dashboards = _find_direct_child(root, "dashboards")
@@ -5739,28 +6784,37 @@ def _sanitize_windows(root: ET.Element) -> None:
     for name in worksheet_names or ["Sheet 1"]:
         win = ET.SubElement(windows, "window", attrib={"name": name, "class": "worksheet"})
         cards = ET.SubElement(win, "cards")
-        if has_year_filter_field and has_group_filter_field:
+        if filter_card_columns:
             edge = ET.SubElement(cards, "edge", attrib={"name": "right"})
             strip = ET.SubElement(edge, "strip", attrib={"size": "160"})
-            ET.SubElement(
-                strip,
-                "card",
-                attrib={
-                    "param": f"[{default_ds_name}].[none:SalesTerritoryGroup:nk]",
-                    "type": "filter",
-                },
-            )
-            ET.SubElement(
-                strip,
-                "card",
-                attrib={
-                    "param": f"[{default_ds_name}].[none:CalendarYear:qk]",
-                    "show-domain": "false",
-                    "show-null-ctrls": "false",
-                    "type": "filter",
-                },
-            )
+            for column_ref in filter_card_columns:
+                card_attrib = {"param": column_ref, "type": "filter"}
+                if ":qk]" in column_ref:
+                    card_attrib["show-domain"] = "false"
+                    card_attrib["show-null-ctrls"] = "false"
+                ET.SubElement(strip, "card", attrib=card_attrib)
         ET.SubElement(win, "viewpoint")
+
+
+def _collect_filter_card_columns(root: ET.Element) -> list[str]:
+    columns: list[str] = []
+    worksheets = _find_direct_child(root, "worksheets")
+    if worksheets is None:
+        return columns
+
+    for ws in [c for c in list(worksheets) if _local_name(c.tag) == "worksheet"]:
+        table = _find_direct_child(ws, "table")
+        if table is None:
+            continue
+        view = _find_direct_child(table, "view")
+        if view is None:
+            continue
+        for filter_node in [c for c in list(view) if _local_name(c.tag) == "filter"]:
+            column_ref = filter_node.attrib.get("column")
+            if isinstance(column_ref, str) and column_ref.strip() and column_ref.strip() not in columns:
+                columns.append(column_ref.strip())
+
+    return columns
 
 
 def _reorder_workbook_children(root: ET.Element) -> None:
@@ -6113,10 +7167,24 @@ def validate_twb_structure(xml_content: str) -> list[str]:
     if "shelfsort" in xml_lower or "shelf-sort" in xml_lower:
         issues.append("Unexpected shelf sort element detected")
 
-    schema_tags = ["<group", "<sequence", "<choice", "<all", "<complexType", "<simpleType", "<xs:"]
-    for token in schema_tags:
-        if token.lower() in xml_lower:
-            issues.append(f"Schema-definition token found in instance XML: {token}")
+    schema_tags = {
+        "schema",
+        "group",
+        "sequence",
+        "choice",
+        "all",
+        "complextype",
+        "simpletype",
+    }
+    found_schema_tokens: set[str] = set()
+    for elem in root.iter():
+        tag_name = str(elem.tag)
+        local = _local_name(tag_name).lower()
+        raw = tag_name.lower()
+        if local in schema_tags or raw.startswith("xs:") or raw.startswith("{http://www.w3.org/2001/xmlschema}"):
+            found_schema_tokens.add(f"<{_local_name(tag_name)}")
+    for token in sorted(found_schema_tokens):
+        issues.append(f"Schema-definition token found in instance XML: {token}")
 
     required_top_level = ["datasources", "worksheets", "windows"]
     for tag in required_top_level:
@@ -6127,6 +7195,26 @@ def validate_twb_structure(xml_content: str) -> list[str]:
     if not worksheets:
         issues.append("No worksheet elements found")
 
+    worksheet_only_nodes = {
+        "layout-options",
+        "table",
+        "view",
+        "rows",
+        "cols",
+        "panes",
+        "marks",
+        "encodings",
+    }
+    datasources = [el for el in root.iter() if _local_name(el.tag) == "datasource"]
+    for idx, datasource in enumerate(datasources, start=1):
+        ds_name = datasource.attrib.get("name", f"datasource_{idx}")
+        for child in list(datasource):
+            child_name = _local_name(child.tag)
+            if child_name in worksheet_only_nodes:
+                issues.append(
+                    f"Datasource '{ds_name}' contains worksheet-only element '{child_name}'"
+                )
+
     for idx, ws in enumerate(worksheets, start=1):
         ws_name = ws.attrib.get("name", f"worksheet_{idx}")
         if _find_direct_child(ws, "layout-options") is None and _find_direct_child(ws, "repository-location") is None:
@@ -6135,6 +7223,15 @@ def validate_twb_structure(xml_content: str) -> list[str]:
             issues.append(f"Worksheet '{ws_name}' missing table")
 
     dashboards = [el for el in root.iter() if _local_name(el.tag) == "dashboard"]
+    worksheet_names = {
+        ws.attrib.get("name", "").strip()
+        for ws in worksheets
+        if isinstance(ws.attrib.get("name"), str) and ws.attrib.get("name", "").strip()
+    }
+    if worksheet_names and not dashboards:
+        issues.append("Missing dashboard: at least one dashboard is required when worksheets exist")
+
+    dashboard_zone_sheet_names: set[str] = set()
     for idx, dashboard in enumerate(dashboards, start=1):
         dashboard_name = dashboard.attrib.get("name", f"dashboard_{idx}")
 
@@ -6153,6 +7250,14 @@ def validate_twb_structure(xml_content: str) -> list[str]:
         dash_zones = _find_direct_child(dashboard, "zones")
         if dash_zones is None:
             issues.append(f"Dashboard '{dashboard_name}' missing zones")
+        else:
+            for zone in dashboard.iter():
+                if _local_name(zone.tag) != "zone":
+                    continue
+                zone_type = (zone.attrib.get("type-v2") or "").strip().lower()
+                zone_name = (zone.attrib.get("name") or "").strip()
+                if zone_type == "worksheet" and zone_name:
+                    dashboard_zone_sheet_names.add(zone_name)
 
         dash_devicelayouts = _find_direct_child(dashboard, "devicelayouts")
         if dash_devicelayouts is None:
@@ -6161,6 +7266,13 @@ def validate_twb_structure(xml_content: str) -> list[str]:
             devicelayout_nodes = [el for el in list(dash_devicelayouts) if _local_name(el.tag) == "devicelayout"]
             if not devicelayout_nodes:
                 issues.append(f"Dashboard '{dashboard_name}' devicelayouts is empty")
+
+    if worksheet_names:
+        missing_in_dashboard = sorted(name for name in worksheet_names if name not in dashboard_zone_sheet_names)
+        for worksheet_name in missing_in_dashboard:
+            issues.append(
+                f"Worksheet '{worksheet_name}' is not placed in any dashboard zone"
+            )
 
     windows = [el for el in root.iter() if _local_name(el.tag) == "window"]
     for idx, window in enumerate(windows, start=1):
