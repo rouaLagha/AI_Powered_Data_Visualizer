@@ -171,6 +171,19 @@ export function analyzeModel({ sqlQuery, followUp = "", configPath = "" }) {
   });
 }
 
+export function applyRelationshipOperation({ model = null, operation, relationship = null, match = null, previewOnly = false }) {
+  return requestJson("/api/model/relationships/apply", {
+    method: "POST",
+    body: JSON.stringify({
+      model,
+      operation,
+      relationship,
+      match,
+      preview_only: previewOnly,
+    }),
+  });
+}
+
 export function validateSchema() {
   return requestJson("/api/schema/validate", { method: "POST", body: "{}" });
 }
@@ -225,10 +238,12 @@ export function runQlikMetadataJob({
   jobsRoot = "",
   qlikEndpoint = "ws://localhost:4848/app",
   qlikAppsDir = "",
+  dataprepCacheDir = "",
   qlikUserDirectory = "",
   qlikUserId = "",
   qlikSessionCookie = "",
   jobId = "",
+  requestTimeoutSeconds = 30,
 }) {
   return requestJson("/api/qlik/metadata/run", {
     method: "POST",
@@ -239,9 +254,46 @@ export function runQlikMetadataJob({
       job_id: jobId,
       qlik_endpoint: qlikEndpoint,
       qlik_apps_dir: qlikAppsDir,
+      dataprep_cache_dir: dataprepCacheDir,
       qlik_user_directory: qlikUserDirectory,
       qlik_user_id: qlikUserId,
       qlik_session_cookie: qlikSessionCookie,
+      request_timeout_seconds: requestTimeoutSeconds,
+    }),
+  });
+}
+
+export function runQlikConversionJob({
+  fileName,
+  contentBase64,
+  jobsRoot = "",
+  outputDir = "",
+  configPath = "",
+  qlikEndpoint = "ws://localhost:4848/app",
+  qlikAppsDir = "",
+  dataprepCacheDir = "",
+  qlikUserDirectory = "",
+  qlikUserId = "",
+  qlikSessionCookie = "",
+  jobId = "",
+  requestTimeoutSeconds = 30,
+}) {
+  return requestJson("/api/qlik/convert/run", {
+    method: "POST",
+    body: JSON.stringify({
+      file_name: fileName,
+      content_base64: contentBase64,
+      jobs_root: jobsRoot,
+      output_dir: outputDir,
+      config_path: configPath,
+      job_id: jobId,
+      qlik_endpoint: qlikEndpoint,
+      qlik_apps_dir: qlikAppsDir,
+      dataprep_cache_dir: dataprepCacheDir,
+      qlik_user_directory: qlikUserDirectory,
+      qlik_user_id: qlikUserId,
+      qlik_session_cookie: qlikSessionCookie,
+      request_timeout_seconds: requestTimeoutSeconds,
     }),
   });
 }

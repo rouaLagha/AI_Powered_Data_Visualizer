@@ -13,6 +13,28 @@ function artifactRows(artifacts) {
   return Object.entries(artifacts || {}).filter(([, artifact]) => artifact?.exists);
 }
 
+function warningRows(result) {
+  const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+  const nestedWarnings = Array.isArray(result?.result?.warnings) ? result.result.warnings : [];
+  return [...warnings, ...nestedWarnings].map((warning) => {
+    if (warning && typeof warning === "object") {
+      return {
+        code: warning.code || warning.type || "pipeline_warning",
+        severity: warning.severity || "warning",
+        message: warning.message || JSON.stringify(warning),
+      };
+    }
+    return { code: "pipeline_warning", severity: "warning", message: String(warning) };
+  });
+}
+
+function statusTone(result) {
+  const status = String(result?.status || "").toLowerCase();
+  if (status === "completed") return "green";
+  if (status === "blocked" || status === "failed") return "red";
+  return result?.ok ? "indigo" : "gray";
+}
+
 export default function RdlConversionPage({ defaultConfigPath = "" }) {
   const inputRef = useRef(null);
   const [fileState, setFileState] = useState(null);
@@ -66,13 +88,15 @@ export default function RdlConversionPage({ defaultConfigPath = "" }) {
   }
 
   const artifacts = artifactRows(result?.artifacts);
+  const warnings = warningRows(result);
+  const resultStatus = result?.status || (result?.ok ? "completed" : "REST API");
 
   return (
     <div className="page-stack conversion-page">
       <Card
         title="RDL to TWB conversion"
         eyebrow="Direct converter"
-        actions={<Badge tone={result?.ok ? "green" : "indigo"}>{result?.ok ? "Completed" : "REST API"}</Badge>}
+        actions={<Badge tone={statusTone(result)}>{result ? resultStatus : "REST API"}</Badge>}
       >
         <div className="form-grid">
           <label>
@@ -98,6 +122,17 @@ export default function RdlConversionPage({ defaultConfigPath = "" }) {
         </div>
 
         {error && <div className="loading-banner error-banner">{error}</div>}
+        {result?.error && <div className="loading-banner error-banner">{result.error}</div>}
+        {warnings.length > 0 && (
+          <div className="warning-list">
+            {warnings.map((warning, index) => (
+              <div className={`warning-card warning-${warning.severity}`} key={`${warning.code}-${index}`}>
+                <strong>{warning.code}</strong>
+                <span>{warning.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {loading && <div className="loading-banner">Conversion in progress...</div>}
 
         <div className="button-row">

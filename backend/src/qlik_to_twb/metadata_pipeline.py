@@ -28,9 +28,11 @@ def run_qlik_metadata_job(
     qlik_client: QlikEngineApiClient | None = None,
     qlik_endpoint: str = "ws://localhost:4848/app",
     qlik_apps_dir: str = "",
+    dataprep_cache_dir: str = "",
     qlik_user_directory: str = "",
     qlik_user_id: str = "",
     qlik_session_cookie: str = "",
+    request_timeout_seconds: float = 30.0,
 ) -> JsonDict:
     """Store a QVF under a job folder and extract real QIX metadata."""
     source = Path(str(source_qvf_path)).expanduser()
@@ -55,9 +57,11 @@ def run_qlik_metadata_job(
         qlik_client=qlik_client,
         qlik_endpoint=qlik_endpoint,
         qlik_apps_dir=qlik_apps_dir,
+        dataprep_cache_dir=dataprep_cache_dir,
         qlik_user_directory=qlik_user_directory,
         qlik_user_id=qlik_user_id,
         qlik_session_cookie=qlik_session_cookie,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -69,9 +73,11 @@ def run_uploaded_qlik_metadata_job(
     qlik_client: QlikEngineApiClient | None = None,
     qlik_endpoint: str = "ws://localhost:4848/app",
     qlik_apps_dir: str = "",
+    dataprep_cache_dir: str = "",
     qlik_user_directory: str = "",
     qlik_user_id: str = "",
     qlik_session_cookie: str = "",
+    request_timeout_seconds: float = 30.0,
 ) -> JsonDict:
     """Persist uploaded QVF bytes under a job folder and extract real QIX metadata."""
     if not file_bytes:
@@ -92,9 +98,11 @@ def run_uploaded_qlik_metadata_job(
         qlik_client=qlik_client,
         qlik_endpoint=qlik_endpoint,
         qlik_apps_dir=qlik_apps_dir,
+        dataprep_cache_dir=dataprep_cache_dir,
         qlik_user_directory=qlik_user_directory,
         qlik_user_id=qlik_user_id,
         qlik_session_cookie=qlik_session_cookie,
+        request_timeout_seconds=request_timeout_seconds,
     )
 
 
@@ -105,9 +113,11 @@ def _run_stored_qvf_job(
     qlik_client: QlikEngineApiClient | None,
     qlik_endpoint: str,
     qlik_apps_dir: str,
+    dataprep_cache_dir: str,
     qlik_user_directory: str,
     qlik_user_id: str,
     qlik_session_cookie: str,
+    request_timeout_seconds: float,
 ) -> JsonDict:
     trace_steps: list[str] = [
         "QVF uploaded and stored by backend",
@@ -120,9 +130,11 @@ def _run_stored_qvf_job(
     config = QlikEngineClientConfig(
         endpoint_url=qlik_endpoint or "ws://localhost:4848/app",
         apps_dir=qlik_apps_dir,
+        dataprep_cache_dir=dataprep_cache_dir,
         user_directory=qlik_user_directory,
         user_id=qlik_user_id,
         session_cookie=qlik_session_cookie,
+        request_timeout_seconds=request_timeout_seconds,
     )
     client = qlik_client or create_qlik_engine_client(config=config)
     _require_real_qix_client(client)
@@ -131,10 +143,33 @@ def _run_stored_qvf_job(
     qlik_metadata = extract_qlik_metadata(client=client, app_id=app_id, qvf_path=stored_qvf_path)
     _require_real_qlik_metadata(qlik_metadata)
     trace_steps.append("Qlik app opened and metadata extracted through QIX")
+    trace_steps.append(f"Visual metadata extracted ({len(_as_list(qlik_metadata.get('visual_objects')))} objects)")
+    trace_steps.append(f"Connection metadata extracted ({len(_as_list(qlik_metadata.get('connections')))} connections)")
+    trace_steps.append(
+        f"DataPrep QVD cache inspected ({len(_as_list((qlik_metadata.get('dataprep_cache') or {}).get('qvd_tables')))} tables)"
+    )
 
     metadata_path = job_dir / "qlik_metadata.json"
     _write_json(metadata_path, qlik_metadata)
     trace_steps.append("qlik_metadata.json written")
+
+    visual_metadata_path = job_dir / "visual_metadata.json"
+    _write_json(visual_metadata_path, {"visual_objects": _as_list(qlik_metadata.get("visual_objects"))})
+    trace_steps.append("visual_metadata.json written")
+
+    connection_metadata_path = job_dir / "connection_metadata.json"
+    _write_json(
+        connection_metadata_path,
+        {
+            "connections": _as_list(qlik_metadata.get("connections")),
+            "warnings": _as_list(qlik_metadata.get("connection_warnings")),
+        },
+    )
+    trace_steps.append("connection_metadata.json written")
+
+    dataprep_cache_metadata_path = job_dir / "dataprep_cache_metadata.json"
+    _write_json(dataprep_cache_metadata_path, dict(qlik_metadata.get("dataprep_cache") or {}))
+    trace_steps.append("dataprep_cache_metadata.json written")
 
     job_payload: JsonDict = {
         "ok": True,
@@ -146,6 +181,13 @@ def _run_stored_qvf_job(
         "client": client.client_name,
         "extraction_mode": client.extraction_mode,
         "qlik_metadata": str(metadata_path),
+        "visual_metadata_path": str(visual_metadata_path),
+        "connection_metadata_path": str(connection_metadata_path),
+        "dataprep_cache_metadata_path": str(dataprep_cache_metadata_path),
+        "visual_metadata": _as_list(qlik_metadata.get("visual_objects")),
+        "connection_metadata": _as_list(qlik_metadata.get("connections")),
+        "connection_warnings": _as_list(qlik_metadata.get("connection_warnings")),
+        "dataprep_cache_metadata": dict(qlik_metadata.get("dataprep_cache") or {}),
         "summary": _metadata_summary(qlik_metadata),
         "trace_steps": trace_steps,
     }
@@ -179,6 +221,8 @@ def _metadata_summary(qlik_metadata: JsonDict) -> JsonDict:
         "master_dimension_count": len(_as_list(qlik_metadata.get("master_dimensions"))),
         "master_measure_count": len(_as_list(qlik_metadata.get("master_measures"))),
         "variable_count": len(_as_list(qlik_metadata.get("variables"))),
+        "connection_count": len(_as_list(qlik_metadata.get("connections"))),
+        "dataprep_qvd_table_count": len(_as_list((qlik_metadata.get("dataprep_cache") or {}).get("qvd_tables"))),
         "load_script_bytes": len(str(qlik_metadata.get("load_script") or "").encode("utf-8")),
     }
 
@@ -218,9 +262,11 @@ def main() -> None:
     parser.add_argument("--job-id", default="", help="Optional stable job id")
     parser.add_argument("--qlik-endpoint", default="ws://localhost:4848/app", help="QIX WebSocket endpoint")
     parser.add_argument("--qlik-apps-dir", default="", help="Qlik Sense Desktop Apps directory")
+    parser.add_argument("--dataprep-cache-dir", default="", help="Optional Qlik DataPrepAppCache directory")
     parser.add_argument("--qlik-user-directory", default="", help="Optional X-Qlik-User directory")
     parser.add_argument("--qlik-user-id", default="", help="Optional X-Qlik-User id")
     parser.add_argument("--qlik-session-cookie", default="", help="Optional Qlik session cookie for secured endpoints")
+    parser.add_argument("--request-timeout-seconds", type=float, default=30.0, help="QIX request timeout in seconds")
     args = parser.parse_args()
 
     result = run_qlik_metadata_job(
@@ -229,9 +275,11 @@ def main() -> None:
         job_id=args.job_id or None,
         qlik_endpoint=args.qlik_endpoint,
         qlik_apps_dir=args.qlik_apps_dir,
+        dataprep_cache_dir=args.dataprep_cache_dir,
         qlik_user_directory=args.qlik_user_directory,
         qlik_user_id=args.qlik_user_id,
         qlik_session_cookie=args.qlik_session_cookie,
+        request_timeout_seconds=args.request_timeout_seconds,
     )
     print(json.dumps(result, indent=2, ensure_ascii=True))
 

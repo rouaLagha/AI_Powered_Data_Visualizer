@@ -6,6 +6,7 @@ import Button from "../shared/Button.jsx";
 import RelationshipEditor from "../model/RelationshipEditor.jsx";
 import MeasuresPanel from "../model/MeasuresPanel.jsx";
 import DatabaseOverviewPanel from "../model/DatabaseOverviewPanel.jsx";
+import WarningsPanel from "../model/WarningsPanel.jsx";
 
 export default function HumanValidationStep({
   model,
@@ -19,6 +20,7 @@ export default function HumanValidationStep({
   databaseContext,
 }) {
   const hasModel = Boolean(model.tables.length);
+  const warnings = Array.isArray(model.warnings) ? model.warnings : [];
   const tableRows = (
     <div className="table-wrap">
       <table>
@@ -42,6 +44,8 @@ export default function HumanValidationStep({
 
   return (
     <Card title="6. Validation" eyebrow="Human approval" className="validation-card">
+      {warnings.length > 0 && <WarningsPanel warnings={warnings} />}
+
       <Tabs
         tabs={[
           { id: "tables", label: "Tables", content: tableRows },

@@ -13,6 +13,13 @@
     "temperature": 0.1,
     "timeout_seconds": 1800
   },
+  "qlik_twb_agent": {
+    "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "api_key": "",
+    "model": "llama3.2:3b",
+    "temperature": 0.1,
+    "timeout_seconds": 1800
+  },
   "tableau_server": {
     "enabled": false,
     "server_url": "https://your-tableau-server",

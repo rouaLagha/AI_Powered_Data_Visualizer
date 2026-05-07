@@ -63,6 +63,21 @@ def run_conversion(
     _write_json(output_dir / "rdl_xsd_summary.json", rdl_xsd_summary)
     _write_json(output_dir / "twb_xsd_summary.json", twb_xsd_summary)
 
+    data_validation = _validate_parsed_report_payload(parsed_payload)
+    _write_json(output_dir / "data_validation_report.json", data_validation)
+    if data_validation.get("status") == "blocked":
+        pipeline_trace.append("Pipeline blocked during data verification")
+        _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
+        return {
+            "status": "blocked",
+            "error": data_validation.get("error", ""),
+            "warnings": data_validation.get("warnings", []),
+            "parsed_rdl": str(output_dir / "parsed_rdl.json"),
+            "data_validation_report": str(output_dir / "data_validation_report.json"),
+            "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+        }
+    pipeline_trace.append("Data verification passed")
+
     db_catalog = build_db_catalog(
         data_sources=parsed_payload.get("data_sources", []),
         data_sets=parsed_payload.get("data_sets", []),
@@ -415,6 +430,7 @@ def run_conversion(
 
     result = {
         "parsed_rdl": str(output_dir / "parsed_rdl.json"),
+        "data_validation_report": str(output_dir / "data_validation_report.json"),
         "data_model": str(output_dir / "data_model.json"),
         "visual_model": str(output_dir / "visual_model.json"),
         "mapping": str(output_dir / "mapping.json"),
@@ -519,6 +535,54 @@ def _load_config(config_path: str | Path) -> dict:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _validation_warning(code: str, message: str, severity: str = "warning") -> dict:
+    return {
+        "code": code,
+        "type": code,
+        "severity": severity,
+        "stage": "data_verification",
+        "message": message,
+    }
+
+
+def _validate_parsed_report_payload(parsed_payload: dict) -> dict:
+    data_sets = parsed_payload.get("data_sets", []) if isinstance(parsed_payload, dict) else []
+    data_sets = data_sets if isinstance(data_sets, list) else []
+    query_datasets = [
+        dataset
+        for dataset in data_sets
+        if isinstance(dataset, dict) and str(dataset.get("query") or "").strip()
+    ]
+
+    if not data_sets:
+        message = "Pipeline blocked: no dataset was found in the RDL."
+        return {
+            "status": "blocked",
+            "error": message,
+            "warnings": [_validation_warning("missing_dataset", message, severity="error")],
+            "dataset_count": 0,
+            "query_dataset_count": 0,
+        }
+
+    if not query_datasets:
+        message = "Pipeline blocked: no dataset with a SQL query was found in the RDL."
+        return {
+            "status": "blocked",
+            "error": message,
+            "warnings": [_validation_warning("missing_dataset", message, severity="error")],
+            "dataset_count": len(data_sets),
+            "query_dataset_count": 0,
+        }
+
+    return {
+        "status": "passed",
+        "error": "",
+        "warnings": [],
+        "dataset_count": len(data_sets),
+        "query_dataset_count": len(query_datasets),
+    }
 
 
 def _safe_positive_int(value: object) -> int | None:

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import alasql from "alasql";
+import { buildActualQueryFromSemanticModel } from "./support/semantic-query-builder.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -291,8 +292,17 @@ test("TC-CONV-002 - end-to-end BI report conversion preserves business results",
       throw new Error("Unable to resolve a dataset query from the generated data model.");
     }
 
+    const visualName = Array.isArray(visualModel?.visuals)
+      ? visualModel.visuals.find((visual) => visual.dataset_name)?.name || visualModel.visuals[0]?.name || ""
+      : "";
+    const queryBuilderResult = buildActualQueryFromSemanticModel({
+      dataModel,
+      visualModel,
+      mappingModel,
+      visualName,
+    });
     const expectedQuery = dataset.query;
-    const actualQuery = dataset.query;
+    const actualQuery = queryBuilderResult.sql;
     const baseExpectedRows = executeQuery(expectedQuery);
     const baseActualRows = executeQuery(actualQuery);
     const baseComparison = compareResultSets(baseExpectedRows, baseActualRows, tolerance);
@@ -342,7 +352,8 @@ test("TC-CONV-002 - end-to-end BI report conversion preserves business results",
       expectedRows: serializeRows(baseExpectedRows),
       actualRows: serializeRows(baseActualRows),
       comparison: baseComparison,
-      visualName: Array.isArray(visualModel?.visuals) ? visualModel.visuals.find((visual) => visual.dataset_name)?.name || visualModel.visuals[0]?.name || "" : "",
+      visualName,
+      queryBuilder: queryBuilderResult,
     };
     report.criticalCases = criticalCases;
   } catch (error) {

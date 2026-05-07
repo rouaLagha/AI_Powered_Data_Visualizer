@@ -7256,6 +7256,12 @@ def validate_twb_structure(xml_content: str) -> list[str]:
                     continue
                 zone_type = (zone.attrib.get("type-v2") or "").strip().lower()
                 zone_name = (zone.attrib.get("name") or "").strip()
+                missing_attrs = [attr for attr in ("id", "x", "y", "w", "h") if not str(zone.attrib.get(attr) or "").strip()]
+                if missing_attrs:
+                    zone_label = zone_name or zone_type or "zone"
+                    issues.append(
+                        f"Dashboard '{dashboard_name}' zone '{zone_label}' missing required attribute(s): {', '.join(missing_attrs)}"
+                    )
                 if zone_type == "worksheet" and zone_name:
                     dashboard_zone_sheet_names.add(zone_name)
 

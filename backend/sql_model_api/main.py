@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +44,7 @@ from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agen
 from src.rdl_ai_editor.logging_utils import write_patch_log
 from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
 from src.qlik_to_twb.metadata_pipeline import run_qlik_metadata_job, run_uploaded_qlik_metadata_job
+from src.qlik_to_twb.pipeline import run_qlik_to_twb
 from sql_model_assistant_app import (
     DEFAULT_LLM_CONFIG,
     FALLBACK_LLM_CONFIG,
@@ -219,6 +221,16 @@ def _resolve_workspace_path(path_value: str) -> Path:
     return resolved
 
 
+def _resolve_config_path_value(path_value: str | Path | None = None) -> Path:
+    raw_value = str(path_value or "").strip()
+    if not raw_value:
+        return _preferred_config_path()
+    path = Path(raw_value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
 def _file_payload(path_value: str) -> dict[str, Any]:
     if not path_value:
         return {}
@@ -256,6 +268,25 @@ def _safe_artifact_file_name(value: str, fallback: str) -> str:
 
 def _timestamp_token() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _pipeline_warning(
+    code: str,
+    message: str,
+    severity: str = "warning",
+    stage: str = "validation",
+    constraint: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "code": code,
+        "type": code,
+        "severity": severity,
+        "stage": stage,
+        "message": message,
+    }
+    if constraint:
+        payload["constraint"] = constraint
+    return payload
 
 
 def _directory_payload(path_value: str) -> dict[str, Any]:
@@ -593,6 +624,216 @@ def _artifact_payloads(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if payload:
                 artifacts[key] = payload
     return artifacts
+
+
+def _standalone_conversion_artifact_root(output_dir: Path, artifact_root: Path | None) -> Path | None:
+    if artifact_root is not None:
+        return artifact_root
+    if output_dir.name == CONVERSION_DIR_NAME:
+        return output_dir.parent
+    return None
+
+
+def _write_standalone_conversion_manifest(
+    *,
+    file_name: str,
+    output_dir: Path,
+    artifact_root: Path | None,
+    result: dict[str, Any],
+    stage: str,
+    warnings: list[dict[str, Any]] | None = None,
+    error: str = "",
+) -> None:
+    root = _standalone_conversion_artifact_root(output_dir, artifact_root)
+    if root is None:
+        return
+    manifest_path = root / "artifact_manifest.json"
+    _write_json_artifact(
+        manifest_path,
+        {
+            "stage": stage,
+            "updated_at": _timestamp_token(),
+            "report_name": file_name,
+            "artifact_root": str(root),
+            "status": result.get("status", stage),
+            "error": error,
+            "warnings": warnings or [],
+            "layout": {
+                "input_report": str(root / INPUT_DIR_NAME),
+                "conversion_and_visual_mapping": str(root / CONVERSION_DIR_NAME),
+            },
+            "artifacts": {
+                "input_rdl": _file_payload(str(root / INPUT_DIR_NAME / _safe_artifact_file_name(file_name, "uploaded_report.rdl"))),
+                **_artifact_payloads(result),
+            },
+        },
+    )
+
+
+def _write_blocked_conversion_artifacts(
+    *,
+    file_name: str,
+    output_dir: Path,
+    artifact_root: Path | None,
+    status: str,
+    error: str,
+    warnings: list[dict[str, Any]],
+    trace_steps: list[str],
+    parsed_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Any] = {
+        "status": status,
+        "error": error,
+        "data_validation_report": str(output_dir / "data_validation_report.json"),
+        "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+    }
+    if parsed_report is not None:
+        parsed_path = output_dir / "parsed_rdl.json"
+        _write_json_artifact(parsed_path, parsed_report)
+        result["parsed_rdl"] = str(parsed_path)
+
+    _write_json_artifact(
+        output_dir / "data_validation_report.json",
+        {
+            "status": status,
+            "report_name": file_name,
+            "error": error,
+            "warnings": warnings,
+        },
+    )
+    _write_json_artifact(output_dir / "pipeline_trace.json", {"steps": trace_steps})
+    _write_standalone_conversion_manifest(
+        file_name=file_name,
+        output_dir=output_dir,
+        artifact_root=artifact_root,
+        result=result,
+        stage=f"standalone_conversion_{status}",
+        warnings=warnings,
+        error=error,
+    )
+    return result
+
+
+def _rdl_conversion_preflight(
+    *,
+    file_name: str,
+    content: str,
+    output_dir: Path,
+    artifact_root: Path | None,
+) -> dict[str, Any]:
+    trace_steps = ["Input report received"]
+    if not content.strip():
+        warning = _pipeline_warning(
+            "empty_rdl",
+            "Uploaded RDL content is empty. Upload a non-empty .rdl file.",
+            severity="error",
+            stage="rdl_preflight",
+            constraint="empty_rdl",
+        )
+        result = _write_blocked_conversion_artifacts(
+            file_name=file_name,
+            output_dir=output_dir,
+            artifact_root=artifact_root,
+            status="failed",
+            error=warning["message"],
+            warnings=[warning],
+            trace_steps=[*trace_steps, "Pipeline stopped before parsing because the RDL is empty"],
+        )
+        return {
+            "ready": False,
+            "status": "failed",
+            "error": warning["message"],
+            "warnings": [warning],
+            "trace_steps": [*trace_steps, "Pipeline stopped before parsing because the RDL is empty"],
+            "result": result,
+        }
+
+    suffix = Path(file_name).suffix or ".rdl"
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as handle:
+            handle.write(content)
+            temp_path = Path(handle.name)
+        parsed_report = parse_rdl_file(temp_path).to_dict()
+    except ET.ParseError as exc:
+        message = f"RDL parsing failed: {exc}."
+        warning = _pipeline_warning(
+            "invalid_xml_rdl",
+            message,
+            severity="error",
+            stage="rdl_preflight",
+            constraint="invalid_xml_rdl",
+        )
+        result = _write_blocked_conversion_artifacts(
+            file_name=file_name,
+            output_dir=output_dir,
+            artifact_root=artifact_root,
+            status="failed",
+            error=message,
+            warnings=[warning],
+            trace_steps=[*trace_steps, "RDL XML parsing failed"],
+        )
+        return {
+            "ready": False,
+            "status": "failed",
+            "error": message,
+            "warnings": [warning],
+            "trace_steps": [*trace_steps, "RDL XML parsing failed"],
+            "result": result,
+        }
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    data_sets = parsed_report.get("data_sets", []) if isinstance(parsed_report, dict) else []
+    query_datasets = [
+        dataset
+        for dataset in data_sets
+        if isinstance(dataset, dict) and str(dataset.get("query") or "").strip()
+    ]
+    if not data_sets or not query_datasets:
+        message = (
+            "Pipeline blocked: no dataset was found in the RDL."
+            if not data_sets
+            else "Pipeline blocked: no dataset with a SQL query was found in the RDL."
+        )
+        warning = _pipeline_warning(
+            "missing_dataset",
+            message,
+            severity="error",
+            stage="data_verification",
+            constraint="missing_dataset",
+        )
+        result = _write_blocked_conversion_artifacts(
+            file_name=file_name,
+            output_dir=output_dir,
+            artifact_root=artifact_root,
+            status="blocked",
+            error=message,
+            warnings=[warning],
+            trace_steps=[*trace_steps, "RDL parsed", "Pipeline blocked during data verification"],
+            parsed_report=parsed_report,
+        )
+        return {
+            "ready": False,
+            "status": "blocked",
+            "error": message,
+            "warnings": [warning],
+            "trace_steps": [*trace_steps, "RDL parsed", "Pipeline blocked during data verification"],
+            "result": result,
+        }
+
+    validation_report = {
+        "status": "passed",
+        "report_name": file_name,
+        "warnings": [],
+        "dataset_count": len(data_sets),
+        "query_dataset_count": len(query_datasets),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_artifact(output_dir / "data_validation_report.json", validation_report)
+    return {"ready": True, "status": "passed", "warnings": [], "trace_steps": [*trace_steps, "Data verification passed"]}
 
 
 def _clear_visual_conversion_state(cancel_running: bool = False) -> None:
@@ -1097,6 +1338,604 @@ def _model_summary(model: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _clean_relationship_token(value: Any) -> str:
+    return re.sub(r"[\s\[\]`\"]+", "", str(value or "").strip().lower())
+
+
+def _relationship_pair_key(relationship: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _clean_relationship_token(relationship.get("from_table")),
+        _clean_relationship_token(relationship.get("to_table")),
+    )
+
+
+def _relationship_signature(relationship: dict[str, Any]) -> tuple[str, str, str]:
+    from_table, to_table = _relationship_pair_key(relationship)
+    join_condition = _clean_relationship_token(relationship.get("join_condition"))
+    return (from_table, to_table, join_condition)
+
+
+def _relationship_label(relationship: dict[str, Any]) -> str:
+    from_table = str(relationship.get("from_table") or "source").strip()
+    to_table = str(relationship.get("to_table") or "target").strip()
+    join_condition = str(relationship.get("join_condition") or "").strip()
+    return f"{from_table} -> {to_table}" + (f" ({join_condition})" if join_condition else "")
+
+
+def _relationship_matches(candidate: dict[str, Any], matcher: dict[str, Any]) -> bool:
+    if not matcher:
+        return False
+    if matcher.get("join_condition") and _relationship_signature(candidate) == _relationship_signature(matcher):
+        return True
+    return _relationship_pair_key(candidate) == _relationship_pair_key(matcher)
+
+
+def _normalize_model_relationships(model: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized_model = copy.deepcopy(model) if isinstance(model, dict) else {}
+    relationships = normalized_model.get("relationships", [])
+    if not isinstance(relationships, list):
+        normalized_model["relationships"] = []
+        return normalized_model, [
+            _pipeline_warning(
+                "invalid_relationship_collection",
+                "Relationship list was invalid and has been reset.",
+                stage="schema_validation",
+                constraint="relationship_integrity",
+            )
+        ]
+
+    output: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[str, str, str]] = set()
+    pair_to_index: dict[tuple[str, str], int] = {}
+
+    for raw_relationship in relationships:
+        if not isinstance(raw_relationship, dict):
+            warnings.append(
+                _pipeline_warning(
+                    "invalid_relationship",
+                    "A relationship entry was ignored because it is not an object.",
+                    stage="schema_validation",
+                    constraint="relationship_integrity",
+                )
+            )
+            continue
+
+        relationship = copy.deepcopy(raw_relationship)
+        signature = _relationship_signature(relationship)
+        pair_key = _relationship_pair_key(relationship)
+        if not all(pair_key):
+            warnings.append(
+                _pipeline_warning(
+                    "invalid_relationship",
+                    f"Relationship ignored because source or target table is missing: {_relationship_label(relationship)}.",
+                    stage="schema_validation",
+                    constraint="relationship_integrity",
+                )
+            )
+            continue
+
+        if signature in seen_signatures:
+            warnings.append(
+                _pipeline_warning(
+                    "duplicate_relationship",
+                    f"Duplicate relationship refused: {_relationship_label(relationship)}.",
+                    stage="schema_validation",
+                    constraint="duplicate_relationship",
+                )
+            )
+            continue
+
+        previous_index = pair_to_index.get(pair_key)
+        if previous_index is not None:
+            previous = output[previous_index]
+            output[previous_index] = relationship
+            seen_signatures.discard(_relationship_signature(previous))
+            seen_signatures.add(signature)
+            warnings.append(
+                _pipeline_warning(
+                    "relationship_replaced",
+                    f"Existing relationship replaced: {_relationship_label(previous)} -> {_relationship_label(relationship)}.",
+                    stage="schema_validation",
+                    constraint="modify_relationship",
+                )
+            )
+            continue
+
+        output.append(relationship)
+        pair_to_index[pair_key] = len(output) - 1
+        seen_signatures.add(signature)
+
+    normalized_model["relationships"] = output
+    existing_warnings = normalized_model.get("warnings", [])
+    if not isinstance(existing_warnings, list):
+        existing_warnings = [str(existing_warnings)]
+    normalized_model["warnings"] = [*existing_warnings, *warnings]
+    return normalized_model, warnings
+
+
+def _append_model_warnings(model: dict[str, Any], warnings: list[dict[str, Any]]) -> dict[str, Any]:
+    if not warnings:
+        return model
+    existing_warnings = model.get("warnings", [])
+    if not isinstance(existing_warnings, list):
+        existing_warnings = [str(existing_warnings)]
+
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for warning in [*existing_warnings, *warnings]:
+        try:
+            key = json.dumps(warning, sort_keys=True, ensure_ascii=True)
+        except TypeError:
+            key = str(warning)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(warning)
+    model["warnings"] = merged
+    return model
+
+
+def _split_relationship_reference(value: Any) -> tuple[str, str]:
+    token = str(value or "").strip().strip("[]`\"")
+    parts = [part.strip("[]`\" ") for part in token.split(".") if part.strip("[]`\" ")]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    if parts:
+        return "", parts[-1]
+    return "", ""
+
+
+def _relationship_join_pairs(join_condition: Any) -> list[tuple[str, str]]:
+    text = str(join_condition or "")
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(r"([A-Za-z0-9_\[\]`\".]+)\s*=\s*([A-Za-z0-9_\[\]`\".]+)", text)
+    ]
+
+
+def _model_table_entries(model: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(model, dict):
+        return []
+    entries: list[dict[str, Any]] = []
+    for collection_name in ("fact_tables", "direct_dimensions", "snowflake_dimensions"):
+        for table in model.get(collection_name, []) if isinstance(model.get(collection_name), list) else []:
+            if isinstance(table, dict) and str(table.get("name") or "").strip():
+                entries.append(table)
+    return entries
+
+
+def _model_table_names(model: dict[str, Any]) -> dict[str, str]:
+    return {_clean_relationship_token(table.get("name")): str(table.get("name") or "").strip() for table in _model_table_entries(model)}
+
+
+def _model_table_columns(model: dict[str, Any], table_name: Any) -> set[str]:
+    table_key = _clean_relationship_token(table_name)
+    columns: set[str] = set()
+    for table in _model_table_entries(model):
+        if _clean_relationship_token(table.get("name")) != table_key:
+            continue
+        for field_name in (
+            "natural_key",
+            "primary_key",
+            "foreign_key",
+            "foreign_keys",
+            "measures",
+            "attributes",
+            "columns",
+            "fields",
+        ):
+            value = table.get(field_name)
+            values = value if isinstance(value, list) else [value]
+            for column in values:
+                if isinstance(column, dict):
+                    column = column.get("name") or column.get("column") or column.get("field")
+                column_key = _clean_relationship_token(column)
+                if column_key:
+                    columns.add(column_key)
+    return columns
+
+
+def _validate_relationship_against_model(model: dict[str, Any], relationship: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    table_names = _model_table_names(model)
+    from_table = str(relationship.get("from_table") or "").strip()
+    to_table = str(relationship.get("to_table") or "").strip()
+    from_key = _clean_relationship_token(from_table)
+    to_key = _clean_relationship_token(to_table)
+
+    for table_name, table_key in ((from_table, from_key), (to_table, to_key)):
+        if not table_key or table_key not in table_names:
+            warnings.append(
+                _pipeline_warning(
+                    "invalid_relationship",
+                    f"Relationship references an unknown table: {table_name or 'missing table'}.",
+                    severity="error",
+                    stage="relationship_operation",
+                    constraint="invalid_relationship",
+                )
+            )
+
+    join_pairs = _relationship_join_pairs(relationship.get("join_condition"))
+    if not join_pairs:
+        warnings.append(
+            _pipeline_warning(
+                "invalid_relationship",
+                f"Relationship has an invalid join condition: {_relationship_label(relationship)}.",
+                severity="error",
+                stage="relationship_operation",
+                constraint="invalid_relationship",
+            )
+        )
+        return warnings
+
+    for left_ref, right_ref in join_pairs:
+        for raw_table, raw_column in (_split_relationship_reference(left_ref), _split_relationship_reference(right_ref)):
+            table_key = _clean_relationship_token(raw_table)
+            column_key = _clean_relationship_token(raw_column)
+            if not table_key:
+                continue
+            if table_key not in table_names:
+                warnings.append(
+                    _pipeline_warning(
+                        "invalid_relationship",
+                        f"Relationship join references an unknown table: {raw_table}.",
+                        severity="error",
+                        stage="relationship_operation",
+                        constraint="invalid_relationship",
+                    )
+                )
+                continue
+            if column_key and column_key not in _model_table_columns(model, table_names[table_key]):
+                warnings.append(
+                    _pipeline_warning(
+                        "invalid_relationship",
+                        f"Relationship join references an unknown column: {raw_table}.{raw_column}.",
+                        severity="error",
+                        stage="relationship_operation",
+                        constraint="invalid_relationship",
+                    )
+                )
+
+    return warnings
+
+
+def _find_relationship(model: dict[str, Any], matcher: dict[str, Any]) -> dict[str, Any] | None:
+    relationships = model.get("relationships", []) if isinstance(model, dict) else []
+    for relationship in relationships if isinstance(relationships, list) else []:
+        if isinstance(relationship, dict) and _relationship_matches(relationship, matcher):
+            return relationship
+    return None
+
+
+def _remove_tables_from_model(
+    model: dict[str, Any],
+    table_names: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if not table_names:
+        return model, []
+    table_keys = {_clean_relationship_token(table_name) for table_name in table_names if str(table_name or "").strip()}
+    if not table_keys:
+        return model, []
+
+    updated_model = copy.deepcopy(model)
+    warnings: list[dict[str, Any]] = []
+    removed_tables: list[str] = []
+
+    for collection_name in ("fact_tables", "direct_dimensions", "snowflake_dimensions"):
+        tables = updated_model.get(collection_name, [])
+        if not isinstance(tables, list):
+            continue
+        kept_tables: list[dict[str, Any]] = []
+        for table in tables:
+            if isinstance(table, dict) and _clean_relationship_token(table.get("name")) in table_keys:
+                removed_tables.append(str(table.get("name") or "").strip())
+                continue
+            kept_tables.append(table)
+        updated_model[collection_name] = kept_tables
+
+    relationships = updated_model.get("relationships", [])
+    if isinstance(relationships, list):
+        updated_model["relationships"] = [
+            relationship
+            for relationship in relationships
+            if not (
+                isinstance(relationship, dict)
+                and (
+                    _clean_relationship_token(relationship.get("from_table")) in table_keys
+                    or _clean_relationship_token(relationship.get("to_table")) in table_keys
+                )
+            )
+        ]
+
+    if removed_tables:
+        warnings.append(
+            _pipeline_warning(
+                "table_deleted",
+                f"Table removed from the model: {', '.join(sorted(set(removed_tables)))}.",
+                severity="info",
+                stage="relationship_operation",
+                constraint="delete_table",
+            )
+        )
+    else:
+        warnings.append(
+            _pipeline_warning(
+                "table_not_found",
+                f"No table matched the delete request: {', '.join(table_names)}.",
+                stage="relationship_operation",
+                constraint="delete_table",
+            )
+        )
+
+    return updated_model, warnings
+
+
+def _extract_instruction_relationship_parts(text: str) -> dict[str, Any] | None:
+    instruction = str(text or "").strip()
+    if not instruction:
+        return None
+    lowered = instruction.lower()
+    operation = ""
+    if re.match(r"\s*(ajoute|add)\b", lowered):
+        operation = "add"
+    elif re.match(r"\s*modifie\b", lowered):
+        operation = "modify"
+    elif re.match(r"\s*supprime\b", lowered):
+        operation = "delete"
+    elif re.search(r"\bsupprime\b", lowered):
+        operation = "delete"
+    elif re.search(r"\bmodifie\b", lowered):
+        operation = "modify"
+    elif re.search(r"\bajoute\b|\badd\b", lowered):
+        operation = "add"
+    if not operation:
+        return None
+
+    pair_match = re.search(r"entre\s+([A-Za-z0-9_]+)\s+et\s+([A-Za-z0-9_]+)", instruction, flags=re.IGNORECASE)
+    if not pair_match:
+        return None
+
+    condition_match = re.search(
+        r"(?:condition de jointure|condition actuelle|garde la condition de jointure actuelle)\s*:\s*"
+        r"([A-Za-z0-9_\[\]`.]+\s*=\s*[A-Za-z0-9_\[\]`.]+)",
+        instruction,
+        flags=re.IGNORECASE,
+    )
+    cardinality_match = re.search(
+        r"cardinalit\S*\s*(?::|en)\s*([A-Za-z0-9_-]+)",
+        instruction,
+        flags=re.IGNORECASE,
+    )
+    delete_table_match = re.search(r"supprime aussi la table\s+([A-Za-z0-9_]+)", instruction, flags=re.IGNORECASE)
+
+    return {
+        "operation": operation,
+        "from_table": pair_match.group(1),
+        "to_table": pair_match.group(2),
+        "join_condition": condition_match.group(1).strip().rstrip(".;,") if condition_match else "",
+        "cardinality": cardinality_match.group(1).strip() if cardinality_match else "",
+        "delete_tables": [delete_table_match.group(1)] if delete_table_match else [],
+    }
+
+
+def _relationship_payload_from_follow_up(text: str, model: dict[str, Any]) -> dict[str, Any] | None:
+    parts = _extract_instruction_relationship_parts(text)
+    if not parts:
+        return None
+
+    matcher = {
+        "from_table": parts["from_table"],
+        "to_table": parts["to_table"],
+    }
+    if parts.get("join_condition"):
+        matcher["join_condition"] = parts["join_condition"]
+
+    existing = _find_relationship(model, matcher) or _find_relationship(
+        model,
+        {"from_table": parts["from_table"], "to_table": parts["to_table"]},
+    )
+    join_condition = parts.get("join_condition") or str(existing.get("join_condition") or "" if existing else "")
+    cardinality = parts.get("cardinality") or str(existing.get("cardinality") or existing.get("relationship_type") or "" if existing else "")
+
+    payload: dict[str, Any] = {
+        "operation": parts["operation"],
+        "model": model,
+        "match": matcher,
+        "preview_only": False,
+    }
+    if parts["operation"] in {"add", "modify"}:
+        payload["relationship"] = {
+            "from_table": parts["from_table"],
+            "to_table": parts["to_table"],
+            "join_condition": join_condition,
+            "cardinality": cardinality,
+        }
+    if parts["operation"] == "delete":
+        payload["delete_tables"] = parts.get("delete_tables", [])
+    return payload
+
+
+def _relationship_operation_message(operation: str, result: dict[str, Any], warnings: list[dict[str, Any]]) -> str:
+    codes = [str(warning.get("code") or warning.get("type") or "") for warning in warnings if isinstance(warning, dict)]
+    if result.get("status") == "refused":
+        return f"Relationship change refused. Warning: {', '.join(codes) or 'invalid relationship'}."
+    if operation == "add":
+        return "Relationship added and the model is ready for validation."
+    if operation == "modify":
+        return "Relationship modified and the model is ready for validation."
+    if operation == "delete":
+        return "Relationship and requested table deletion applied. The model is ready for validation."
+    return "Relationship operation applied."
+
+
+def _apply_relationship_follow_up(follow_up: str, conversation: list[dict[str, Any]]) -> dict[str, Any] | None:
+    source_model = APP_STATE.get("latest_model", {})
+    if not isinstance(source_model, dict) or not source_model:
+        return None
+    payload = _relationship_payload_from_follow_up(follow_up, source_model)
+    if payload is None:
+        return None
+
+    result = _apply_relationship_operation(payload)
+    warnings = result.get("warnings", []) if isinstance(result.get("warnings"), list) else []
+    conversation.append(
+        {
+            "role": "assistant",
+            "content": _relationship_operation_message(str(payload.get("operation") or ""), result, warnings),
+            "structured_result": result.get("model", {}),
+            "used_fallback": False,
+        }
+    )
+    APP_STATE["conversation"] = conversation
+    return _state_snapshot()
+
+
+def _apply_relationship_operation(payload: dict[str, Any]) -> dict[str, Any]:
+    operation = str(payload.get("operation") or "").strip().lower()
+    if operation not in {"add", "modify", "delete", "load"}:
+        raise ValueError("Relationship operation must be one of: add, modify, delete, load.")
+
+    source_model = payload.get("model")
+    if not isinstance(source_model, dict):
+        source_model = APP_STATE.get("latest_model", {})
+    if not isinstance(source_model, dict) or not source_model:
+        raise ValueError("A semantic model is required before applying relationship operations.")
+
+    model = copy.deepcopy(source_model)
+    relationships = model.get("relationships", [])
+    if not isinstance(relationships, list):
+        relationships = []
+    relationships = [copy.deepcopy(item) for item in relationships if isinstance(item, dict)]
+    warnings: list[dict[str, Any]] = []
+    operation_status = "applied"
+
+    relationship = payload.get("relationship")
+    matcher = payload.get("match")
+    relationship = relationship if isinstance(relationship, dict) else {}
+    matcher = matcher if isinstance(matcher, dict) else relationship
+
+    if operation == "load":
+        operation_status = "loaded"
+
+    if operation == "add":
+        if not relationship:
+            raise ValueError("relationship is required for add operation.")
+        signature = _relationship_signature(relationship)
+        if any(_relationship_signature(existing) == signature for existing in relationships):
+            operation_status = "refused"
+            warnings.append(
+                _pipeline_warning(
+                    "duplicate_relationship",
+                    f"Duplicate relationship refused: {_relationship_label(relationship)}.",
+                    stage="relationship_operation",
+                    constraint="duplicate_relationship",
+                )
+            )
+        else:
+            validation_warnings = _validate_relationship_against_model(model, relationship)
+            if validation_warnings:
+                operation_status = "refused"
+                warnings.extend(validation_warnings)
+            else:
+                relationships.append(copy.deepcopy(relationship))
+
+    if operation == "modify":
+        if not relationship:
+            raise ValueError("relationship is required for modify operation.")
+        replacement_done = False
+        for index, existing in enumerate(relationships):
+            if _relationship_matches(existing, matcher):
+                previous = relationships[index]
+                replacement_done = True
+                validation_warnings = _validate_relationship_against_model(model, relationship)
+                if validation_warnings:
+                    operation_status = "refused"
+                    warnings.extend(validation_warnings)
+                else:
+                    relationships[index] = copy.deepcopy(relationship)
+                    warnings.append(
+                        _pipeline_warning(
+                            "relationship_modified",
+                            f"Relationship modified: {_relationship_label(previous)} -> {_relationship_label(relationship)}.",
+                            stage="relationship_operation",
+                            constraint="modify_relationship",
+                        )
+                    )
+                break
+        if not replacement_done:
+            operation_status = "warning"
+            warnings.append(
+                _pipeline_warning(
+                    "relationship_not_found",
+                    f"No relationship matched the modify request: {_relationship_label(matcher)}.",
+                    stage="relationship_operation",
+                    constraint="modify_relationship",
+                )
+            )
+
+    if operation == "delete":
+        delete_tables = payload.get("delete_tables") or payload.get("delete_table") or []
+        if isinstance(delete_tables, str):
+            delete_tables = [delete_tables]
+        delete_tables = [str(table_name).strip() for table_name in delete_tables if str(table_name or "").strip()]
+    else:
+        delete_tables = []
+
+    if operation == "delete":
+        before_count = len(relationships)
+        relationships = [existing for existing in relationships if not _relationship_matches(existing, matcher)]
+        if len(relationships) == before_count:
+            operation_status = "warning"
+            warnings.append(
+                _pipeline_warning(
+                    "relationship_not_found",
+                    f"No relationship matched the delete request: {_relationship_label(matcher)}.",
+                    stage="relationship_operation",
+                    constraint="delete_relationship",
+                )
+            )
+        else:
+            warnings.append(
+                _pipeline_warning(
+                    "relationship_deleted",
+                    f"Relationship deleted: {_relationship_label(matcher)}.",
+                    severity="info",
+                    stage="relationship_operation",
+                    constraint="delete_relationship",
+                )
+            )
+
+    model["relationships"] = relationships
+    if operation == "delete" and delete_tables:
+        model, table_warnings = _remove_tables_from_model(model, delete_tables)
+        warnings.extend(table_warnings)
+
+    model, normalization_warnings = _normalize_model_relationships(model)
+    warnings.extend(normalization_warnings)
+    model = _append_model_warnings(model, warnings)
+
+    preview_only = bool(payload.get("preview_only", False))
+    if not preview_only:
+        APP_STATE["latest_model"] = model
+        APP_STATE["validated_model"] = {}
+        APP_STATE["generated_twb_path"] = ""
+        _clear_visual_conversion_state(cancel_running=True)
+        _write_data_verification_artifacts("relationship_operation_applied")
+        _write_semantic_model_artifacts("relationship_operation_applied")
+        _write_artifact_manifest("relationship_operation_applied")
+
+    return {
+        "ok": True,
+        "status": operation_status,
+        "operation": operation,
+        "preview_only": preview_only,
+        "warnings": warnings,
+        "model": model,
+        "relationship_count": len(model.get("relationships", [])) if isinstance(model.get("relationships"), list) else 0,
+    }
+
+
 def _tableau_defaults_payload() -> dict[str, Any]:
     defaults = _load_tableau_publish_defaults(str(_preferred_config_path()))
     safe_defaults: dict[str, Any] = {
@@ -1369,7 +2208,7 @@ def _analyze_model(payload: dict[str, Any]) -> dict[str, Any]:
     sql_query = str(payload.get("sql_query") or APP_STATE.get("sql_query") or "").strip()
     if not sql_query:
         raise ValueError("SQL query is required.")
-    config_path = str(payload.get("config_path") or _preferred_config_path())
+    config_path = str(_resolve_config_path_value(payload.get("config_path")))
     follow_up = str(payload.get("follow_up") or "").strip()
 
     datasource, dataset = _selected_context()
@@ -1378,6 +2217,10 @@ def _analyze_model(payload: dict[str, Any]) -> dict[str, Any]:
         conversation = _seed_initial_sql_model_conversation()
     if follow_up:
         conversation.append({"role": "user", "content": follow_up})
+        APP_STATE["sql_query"] = sql_query
+        relationship_state = _apply_relationship_follow_up(follow_up, conversation)
+        if relationship_state is not None:
+            return relationship_state
 
     assistant_text, structured_result, used_fallback = _generate_response(
         sql_query=sql_query,
@@ -1417,7 +2260,20 @@ def _validate_schema() -> dict[str, Any]:
     latest_model = APP_STATE.get("latest_model", {})
     if not isinstance(latest_model, dict) or not latest_model:
         raise ValueError("No model is available to validate.")
-    APP_STATE["validated_model"] = copy.deepcopy(latest_model)
+    validated_model, warnings = _normalize_model_relationships(latest_model)
+    if warnings:
+        conversation = copy.deepcopy(APP_STATE.get("conversation", []))
+        conversation.append(
+            {
+                "role": "assistant",
+                "content": "Schema validation applied relationship guardrails and produced warnings.",
+                "structured_result": validated_model,
+                "used_fallback": False,
+            }
+        )
+        APP_STATE["conversation"] = conversation
+    APP_STATE["latest_model"] = copy.deepcopy(validated_model)
+    APP_STATE["validated_model"] = copy.deepcopy(validated_model)
     _write_data_verification_artifacts("schema_validated")
     _write_semantic_model_artifacts("schema_validated")
     _write_artifact_manifest("schema_validated")
@@ -1431,7 +2287,7 @@ def _map_visual_content(payload: dict[str, Any]) -> dict[str, Any]:
     if not str(APP_STATE.get("rdl_content") or "").strip():
         raise ValueError("RDL content is missing. Re-upload the report before mapping visuals.")
 
-    config_path = str(payload.get("config_path") or _preferred_config_path())
+    config_path = str(_resolve_config_path_value(payload.get("config_path")))
     _run_visual_mapping_now(config_path)
     APP_STATE["visual_model_twb_path"] = ""
     APP_STATE["visual_model_twb_error"] = ""
@@ -1548,7 +2404,7 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
     generated_path = str(APP_STATE.get("generated_twb_path") or "")
     if not generated_path:
         raise ValueError("Generate the TWB before publishing.")
-    config_path = str(payload.get("config_path") or _preferred_config_path())
+    config_path = str(_resolve_config_path_value(payload.get("config_path")))
     overrides = payload.get("tableau", {})
     _configure_streamlit_publish_state(config_path, overrides if isinstance(overrides, dict) else {})
     try:
@@ -1693,8 +2549,6 @@ def _compare_quality_endpoint(_payload: dict[str, Any]) -> dict[str, Any]:
 def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
     file_name = str(payload.get("file_name") or "uploaded_report.rdl")
     content = str(payload.get("content") or "")
-    if not content.strip():
-        raise ValueError("Uploaded RDL content is empty.")
 
     output_dir_value = str(payload.get("output_dir") or "").strip()
     artifact_root: Path | None = None
@@ -1712,9 +2566,33 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
                 "report_name": file_name,
                 "created_at": _timestamp_token(),
                 "publish_enabled": bool(payload.get("publish_enabled", False)),
-                "config_path": str(payload.get("config_path") or _preferred_config_path()),
+                "config_path": str(_resolve_config_path_value(payload.get("config_path"))),
             },
         )
+
+    preflight = _rdl_conversion_preflight(
+        file_name=file_name,
+        content=content,
+        output_dir=output_dir,
+        artifact_root=artifact_root,
+    )
+    if not preflight.get("ready"):
+        result = preflight.get("result") if isinstance(preflight.get("result"), dict) else {}
+        return {
+            "ok": True,
+            "status": preflight.get("status", "blocked"),
+            "error": preflight.get("error", ""),
+            "warnings": preflight.get("warnings", []),
+            "report_name": file_name,
+            "output_dir": str(output_dir),
+            "artifact_workspace": {
+                "root": _directory_payload(str(artifact_root)) if artifact_root is not None else {},
+                "manifest": _file_payload(str(artifact_root / "artifact_manifest.json")) if artifact_root is not None else {},
+            },
+            "result": result,
+            "artifacts": _artifact_payloads(result),
+            "trace_steps": preflight.get("trace_steps", []),
+        }
 
     suffix = Path(file_name).suffix or ".rdl"
     temp_path: Path | None = None
@@ -1727,7 +2605,7 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
             rdl_xsd_path=RDL_XSD_PATH,
             twb_xsd_path=TWB_XSD_PATH,
             output_dir=output_dir,
-            config_path=Path(str(payload.get("config_path") or _preferred_config_path())),
+            config_path=_resolve_config_path_value(payload.get("config_path")),
             publish_enabled=bool(payload.get("publish_enabled", False)),
         )
     finally:
@@ -1746,30 +2624,18 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
             trace_steps = []
 
     if artifact_root is not None:
-        manifest_path = artifact_root / "artifact_manifest.json"
-        _write_json_artifact(
-            manifest_path,
-            {
-                "stage": "standalone_conversion_completed",
-                "updated_at": _timestamp_token(),
-                "report_name": file_name,
-                "artifact_root": str(artifact_root),
-                "layout": {
-                    "input_report": str(artifact_root / INPUT_DIR_NAME),
-                    "conversion_and_visual_mapping": str(artifact_root / CONVERSION_DIR_NAME),
-                },
-                "artifacts": {
-                    "input_rdl": _file_payload(
-                        str(artifact_root / INPUT_DIR_NAME / _safe_artifact_file_name(file_name, "uploaded_report.rdl"))
-                    ),
-                    **_artifact_payloads(result if isinstance(result, dict) else {}),
-                },
-            },
+        _write_standalone_conversion_manifest(
+            file_name=file_name,
+            output_dir=output_dir,
+            artifact_root=artifact_root,
+            result=result if isinstance(result, dict) else {},
+            stage="standalone_conversion_completed",
         )
 
     return {
         "ok": True,
         "status": "completed",
+        "warnings": preflight.get("warnings", []),
         "report_name": file_name,
         "output_dir": str(output_dir),
         "artifact_workspace": {
@@ -1786,15 +2652,21 @@ def _run_qlik_metadata_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
     output_dir_value = str(payload.get("jobs_root") or payload.get("output_dir") or "").strip()
     jobs_root = _resolve_workspace_path(output_dir_value) if output_dir_value else QLIK_JOBS_DIR
     job_id = str(payload.get("job_id") or "").strip() or _new_qlik_job_id()
+    try:
+        request_timeout_seconds = float(payload.get("request_timeout_seconds") or 30.0)
+    except (TypeError, ValueError):
+        request_timeout_seconds = 30.0
 
     common_kwargs = {
         "jobs_root": jobs_root,
         "job_id": job_id,
         "qlik_endpoint": str(payload.get("qlik_endpoint") or "ws://localhost:4848/app").strip(),
         "qlik_apps_dir": str(payload.get("qlik_apps_dir") or "").strip(),
+        "dataprep_cache_dir": str(payload.get("dataprep_cache_dir") or "").strip(),
         "qlik_user_directory": str(payload.get("qlik_user_directory") or "").strip(),
         "qlik_user_id": str(payload.get("qlik_user_id") or "").strip(),
         "qlik_session_cookie": str(payload.get("qlik_session_cookie") or "").strip(),
+        "request_timeout_seconds": request_timeout_seconds,
     }
 
     content_base64 = str(payload.get("content_base64") or payload.get("file_base64") or "").strip()
@@ -1825,6 +2697,96 @@ def _run_qlik_metadata_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         "job_dir": str(jobs_root / str(result.get("job_id", ""))),
         "result": result,
         "summary": result.get("summary", {}),
+        "visual_metadata": result.get("visual_metadata", []) if isinstance(result.get("visual_metadata"), list) else [],
+        "connection_metadata": result.get("connection_metadata", []) if isinstance(result.get("connection_metadata"), list) else [],
+        "connection_warnings": result.get("connection_warnings", []) if isinstance(result.get("connection_warnings"), list) else [],
+        "dataprep_cache_metadata": result.get("dataprep_cache_metadata", {}) if isinstance(result.get("dataprep_cache_metadata"), dict) else {},
+        "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
+        "trace_steps": result.get("trace_steps", []),
+    }
+
+
+def _run_qlik_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    output_dir_value = str(payload.get("output_dir") or "").strip()
+    jobs_root_value = str(payload.get("jobs_root") or "").strip()
+    jobs_root = _resolve_workspace_path(jobs_root_value) if jobs_root_value else QLIK_JOBS_DIR
+    job_id = str(payload.get("job_id") or "").strip() or _new_qlik_job_id()
+    job_dir = jobs_root / job_id
+    upload_dir = job_dir / "upload"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve_workspace_path(output_dir_value) if output_dir_value else job_dir / "conversion"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        request_timeout_seconds = float(payload.get("request_timeout_seconds") or 30.0)
+    except (TypeError, ValueError):
+        request_timeout_seconds = 30.0
+
+    content_base64 = str(payload.get("content_base64") or payload.get("file_base64") or "").strip()
+    if content_base64:
+        file_name = str(payload.get("file_name") or "uploaded.qvf").strip() or "uploaded.qvf"
+        stored_qvf_path = upload_dir / _safe_artifact_file_name(file_name, "uploaded.qvf")
+        stored_qvf_path.write_bytes(_decode_base64_file(content_base64))
+    else:
+        qvf_path = str(payload.get("qvf_path") or "").strip()
+        if not qvf_path:
+            raise ValueError("Upload a QVF file or provide qvf_path before generating the Tableau report.")
+        stored_qvf_path = Path(qvf_path).expanduser().resolve()
+        if not stored_qvf_path.exists():
+            raise FileNotFoundError(f"QVF file was not found: {stored_qvf_path}")
+
+    try:
+        result = run_qlik_to_twb(
+            qvf_path=stored_qvf_path,
+            output_dir=output_dir,
+            qlik_endpoint=str(payload.get("qlik_endpoint") or "ws://localhost:4848/app").strip(),
+            qlik_apps_dir=str(payload.get("qlik_apps_dir") or "").strip(),
+            dataprep_cache_dir=str(payload.get("dataprep_cache_dir") or "").strip(),
+            qlik_user_directory=str(payload.get("qlik_user_directory") or "").strip(),
+            qlik_user_id=str(payload.get("qlik_user_id") or "").strip(),
+            qlik_session_cookie=str(payload.get("qlik_session_cookie") or "").strip(),
+            request_timeout_seconds=request_timeout_seconds,
+            config_path=_resolve_config_path_value(payload.get("config_path")),
+        )
+        result["ok"] = True
+        result["job_id"] = job_id
+        result["job_dir"] = str(job_dir)
+        result["qvf_path"] = str(stored_qvf_path)
+        result["job"] = str(job_dir / "conversion_job.json")
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "failed",
+            "job_id": job_id,
+            "job_dir": str(job_dir),
+            "qvf_path": str(stored_qvf_path),
+            "output_dir": str(output_dir),
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "trace_steps": [
+                f"Qlik Tableau conversion job created ({job_id})",
+                f"Qlik Tableau conversion failed ({type(exc).__name__}: {exc})",
+            ],
+            "job": str(job_dir / "conversion_job.json"),
+        }
+
+    _write_json_artifact(job_dir / "conversion_job.json", result)
+    return {
+        "ok": bool(result.get("ok")),
+        "status": result.get("status", "completed"),
+        "job_id": job_id,
+        "job_dir": str(job_dir),
+        "output_dir": str(output_dir),
+        "app_id": result.get("app_id", ""),
+        "client": result.get("client", ""),
+        "extraction_mode": result.get("extraction_mode", ""),
+        "error": result.get("error", ""),
+        "result": result,
+        "summary": result.get("summary", {}),
+        "visual_metadata": result.get("visual_metadata", []) if isinstance(result.get("visual_metadata"), list) else [],
+        "connection_metadata": result.get("connection_metadata", []) if isinstance(result.get("connection_metadata"), list) else [],
+        "connection_warnings": result.get("connection_warnings", []) if isinstance(result.get("connection_warnings"), list) else [],
+        "dataprep_cache_metadata": result.get("dataprep_cache_metadata", {}) if isinstance(result.get("dataprep_cache_metadata"), dict) else {},
         "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
         "trace_steps": result.get("trace_steps", []),
     }
@@ -1874,7 +2836,7 @@ def _apply_rdl_editor_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("RDL edit instruction is required.")
 
     use_llm_config = bool(payload.get("use_llm_config", False))
-    config_path = Path(str(payload.get("config_path") or _preferred_config_path())) if use_llm_config else None
+    config_path = _resolve_config_path_value(payload.get("config_path")) if use_llm_config else None
     output_dir = OUTPUT_DIR / "rdl_ai_editor" / f"{_timestamp_token()}_{_safe_file_stem(file_name)}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1931,6 +2893,7 @@ POST_HANDLERS = {
     "/api/rdl/parse": _parse_rdl,
     "/api/dataset/select": _select_dataset,
     "/api/model/analyze": _analyze_model,
+    "/api/model/relationships/apply": _apply_relationship_operation,
     "/api/schema/validate": _validate_schema_endpoint,
     "/api/visual/map": _map_visual_content,
     "/api/twb/generate": _generate_twb,
@@ -1938,6 +2901,7 @@ POST_HANDLERS = {
     "/api/quality/compare": _compare_quality_endpoint,
     "/api/conversion/run": _run_conversion_endpoint,
     "/api/qlik/metadata/run": _run_qlik_metadata_endpoint,
+    "/api/qlik/convert/run": _run_qlik_conversion_endpoint,
     "/api/rdl-editor/apply": _apply_rdl_editor_endpoint,
 }
 
