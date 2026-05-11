@@ -74,6 +74,13 @@ function parseSelectItem(rawItem) {
   };
 }
 
+function sqlLiteral(value) {
+  if (value === null || value === undefined) return "NULL";
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
 function refsFromExpression(expression) {
   const refs = [];
   const pattern = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
@@ -134,10 +141,25 @@ function parseDatasetQuery(sql) {
   };
 }
 
+function flattenVisuals(visuals) {
+  const output = [];
+  const visit = (visual) => {
+    if (!visual || typeof visual !== "object") return;
+    output.push(visual);
+    if (Array.isArray(visual.children)) {
+      visual.children.forEach(visit);
+    }
+  };
+  if (Array.isArray(visuals)) {
+    visuals.forEach(visit);
+  }
+  return output;
+}
+
 function datasetForVisual(dataModel, mappingModel, visualModel, visualName) {
   const datasets = Array.isArray(dataModel?.datasets) ? dataModel.datasets : [];
   const visualToDataset = Array.isArray(mappingModel?.visual_to_dataset) ? mappingModel.visual_to_dataset : [];
-  const visuals = Array.isArray(visualModel?.visuals) ? visualModel.visuals : [];
+  const visuals = flattenVisuals(visualModel?.visuals);
   const visual = visuals.find((entry) => entry.name === visualName) || visuals.find((entry) => entry.dataset_name);
   const name =
     visualToDataset.find((entry) => entry.visual_name === (visualName || visual?.name) && entry.dataset_name)?.dataset_name ||
@@ -147,16 +169,44 @@ function datasetForVisual(dataModel, mappingModel, visualModel, visualName) {
   return datasets.find((dataset) => dataset.name === name) || datasets[0] || null;
 }
 
-function fieldsForVisual(mappingModel, visualModel, visualName) {
+function fieldsFromVisualProperties(visual) {
+  if (!visual || typeof visual !== "object") return [];
+  const propertyFields = Array.isArray(visual?.properties?.field_references)
+    ? visual.properties.field_references
+    : [];
+  const layoutFields =
+    typeof visual?.layout?.referenced_fields === "string"
+      ? visual.layout.referenced_fields.split(",").map((field) => field.trim())
+      : [];
+  const expressionFields = Array.isArray(visual?.expressions)
+    ? visual.expressions.flatMap((expression) => {
+        const refs = [];
+        const pattern = /Fields!([A-Za-z0-9_]+)\.Value/gi;
+        let match = pattern.exec(String(expression || ""));
+        while (match) {
+          refs.push(match[1]);
+          match = pattern.exec(String(expression || ""));
+        }
+        return refs;
+      })
+    : [];
+  return [...propertyFields, ...layoutFields, ...expressionFields];
+}
+
+function fieldsForVisual(mappingModel, visualModel, visualName, fieldSource = "combined") {
   const visualToFields = Array.isArray(mappingModel?.visual_to_fields) ? mappingModel.visual_to_fields : [];
-  const visuals = Array.isArray(visualModel?.visuals) ? visualModel.visuals : [];
+  const visuals = flattenVisuals(visualModel?.visuals);
   const targetVisual = visuals.find((entry) => entry.name === visualName) || visuals.find((entry) => entry.dataset_name) || {};
   const mapped = visualToFields.find((entry) => entry.visual_name === (visualName || targetVisual.name));
   const mappedFields = Array.isArray(mapped?.fields) ? mapped.fields : [];
-  const propertyFields = Array.isArray(targetVisual?.properties?.field_references)
-    ? targetVisual.properties.field_references
-    : [];
-  return new Set([...mappedFields, ...propertyFields].map((field) => String(field || "").trim()).filter(Boolean));
+  const propertyFields = fieldsFromVisualProperties(targetVisual);
+  const sourceFields =
+    fieldSource === "mapping"
+      ? mappedFields
+      : fieldSource === "visual"
+        ? propertyFields
+        : [...mappedFields, ...propertyFields];
+  return new Set(sourceFields.map((field) => String(field || "").trim()).filter(Boolean));
 }
 
 function aliasForExpression(selectItems, expression) {
@@ -178,6 +228,23 @@ function selectedItemsForVisual(parsedQuery, requestedFields) {
 
   const selected = parsedQuery.selectItems.filter((item) => requiredAliases.has(item.alias));
   return selected.length ? selected : parsedQuery.selectItems;
+}
+
+function selectItemsByAliases(parsedQuery, aliases) {
+  const expectedAliases = new Set([...aliases].map((alias) => String(alias || "").trim()).filter(Boolean));
+  return parsedQuery.selectItems.filter((item) => expectedAliases.has(item.alias));
+}
+
+function uniqueSelectItems(items) {
+  const seen = new Set();
+  const output = [];
+  for (const item of items) {
+    const key = item.alias || cleanSql(item.expression);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(item);
+  }
+  return output;
 }
 
 function aliasesFromItems(items) {
@@ -229,20 +296,98 @@ function relationshipFromJoin(join) {
   };
 }
 
-function literalFilterClause(filter) {
+function literalValueFromFilter(rawValue, fixedParameters, dataType = "") {
+  const valueText = String(rawValue || "").trim();
+  const parameterMatch = valueText.match(/^=?Parameters!([A-Za-z0-9_]+)\.Value$/i);
+  if (parameterMatch) {
+    const parameterName = parameterMatch[1];
+    if (Object.prototype.hasOwnProperty.call(fixedParameters, parameterName)) {
+      return fixedParameters[parameterName];
+    }
+    return undefined;
+  }
+
+  const stripped = valueText.replace(/^=/, "").replace(/^"|"$/g, "");
+  const normalizedDataType = String(dataType || "").toLowerCase();
+  if (/^(integer|int|float|decimal|double|number)$/i.test(normalizedDataType) && /^-?\d+(\.\d+)?$/.test(stripped)) {
+    return Number(stripped);
+  }
+  return stripped;
+}
+
+function literalFilterSpec(filter, fixedParameters = {}) {
   const expression = String(filter?.expression || "");
   const values = Array.isArray(filter?.values) ? filter.values : [];
   if (!expression || !values.length) return "";
   const fieldMatch = expression.match(/Fields!([A-Za-z0-9_]+)\.Value/i);
-  const rawValue = String(values[0] || "");
-  if (!fieldMatch || /^=Parameters!/i.test(rawValue)) return "";
-  const value = rawValue.replace(/^=/, "").replace(/^"|"$/g, "");
-  return `${fieldMatch[1]} = '${value.replace(/'/g, "''")}'`;
+  if (!fieldMatch) return null;
+  const resolvedValues = values
+    .map((value) => literalValueFromFilter(value, fixedParameters, filter?.data_type))
+    .filter((value) => value !== undefined);
+  if (!resolvedValues.length) return null;
+  return {
+    fieldAlias: fieldMatch[1],
+    operator: filter?.operator || "Equal",
+    values: resolvedValues,
+    parameterReferences: Array.isArray(filter?.parameter_references) ? filter.parameter_references : [],
+  };
 }
 
-function filterClausesFromModel(dataset) {
+function filterSpecsFromModel(dataset, fixedParameters = {}) {
   const filters = Array.isArray(dataset?.filters) ? dataset.filters : [];
-  return filters.map(literalFilterClause).filter(Boolean);
+  return filters.map((filter) => literalFilterSpec(filter, fixedParameters)).filter(Boolean);
+}
+
+function renderOuterFilter(filterSpec) {
+  const fieldRef = `__rdl.${filterSpec.fieldAlias}`;
+  const values = Array.isArray(filterSpec.values) ? filterSpec.values : [];
+  const operator = String(filterSpec.operator || "Equal").toLowerCase();
+  if (operator === "in" || values.length > 1) {
+    return `${fieldRef} IN (${values.map(sqlLiteral).join(", ")})`;
+  }
+  const value = sqlLiteral(values[0]);
+  if (operator === "notequal" || operator === "not_equal" || operator === "<>") return `${fieldRef} <> ${value}`;
+  if (operator === "greaterthan" || operator === ">") return `${fieldRef} > ${value}`;
+  if (operator === "greaterthanorequal" || operator === ">=") return `${fieldRef} >= ${value}`;
+  if (operator === "lessthan" || operator === "<") return `${fieldRef} < ${value}`;
+  if (operator === "lessthanorequal" || operator === "<=") return `${fieldRef} <= ${value}`;
+  if (operator === "like") return `${fieldRef} LIKE ${value}`;
+  return `${fieldRef} = ${value}`;
+}
+
+function renderOuterSelectItem(item) {
+  const alias = item.alias || item.expression.split(".").pop();
+  return `__rdl.${alias} AS ${alias}`;
+}
+
+function renderQuery({
+  parsedQuery,
+  selectedItems,
+  innerItems,
+  joins,
+  groupBy,
+  orderBy,
+  filterSpecs,
+}) {
+  const innerLines = [
+    `SELECT ${parsedQuery.distinct ? "DISTINCT " : ""}${innerItems.map(renderSelectItem).join(", ")}`,
+    `FROM ${renderTable(parsedQuery.baseTable)}`,
+    ...joins.map((join) => `${join.type} ${renderTable(join)} ON ${join.condition}`),
+  ];
+  if (parsedQuery.whereClauses.length) innerLines.push(`WHERE ${parsedQuery.whereClauses.join(" AND ")}`);
+  if (groupBy.length) innerLines.push(`GROUP BY ${groupBy.join(", ")}`);
+
+  if (!filterSpecs.length) {
+    if (orderBy.length) innerLines.push(`ORDER BY ${orderBy.join(", ")}`);
+    return `${innerLines.join(" ")};`;
+  }
+
+  const outerLines = [
+    `SELECT ${selectedItems.map(renderOuterSelectItem).join(", ")}`,
+    `FROM (${innerLines.join(" ")}) AS __rdl`,
+    `WHERE ${filterSpecs.map(renderOuterFilter).join(" AND ")}`,
+  ];
+  return `${outerLines.join(" ")};`;
 }
 
 export function buildActualQueryFromSemanticModel({
@@ -250,40 +395,62 @@ export function buildActualQueryFromSemanticModel({
   visualModel,
   mappingModel,
   visualName = "",
+  datasetName = "",
+  fieldSource = "combined",
+  fixedParameters = {},
+  requireFields = false,
 }) {
-  const dataset = datasetForVisual(dataModel, mappingModel, visualModel, visualName);
+  const dataset =
+    (Array.isArray(dataModel?.datasets) ? dataModel.datasets : []).find((entry) => entry.name === datasetName) ||
+    datasetForVisual(dataModel, mappingModel, visualModel, visualName);
   if (!dataset?.query) {
     throw new Error("Query Builder could not resolve a dataset query from the semantic data model.");
   }
 
   const parsedQuery = parseDatasetQuery(dataset.query);
-  const requestedFields = fieldsForVisual(mappingModel, visualModel, visualName);
+  const requestedFields = fieldsForVisual(mappingModel, visualModel, visualName, fieldSource);
+  if (requireFields && !requestedFields.size) {
+    throw new Error(`Query Builder could not resolve business fields for visual '${visualName}'.`);
+  }
   const selectedItems = selectedItemsForVisual(parsedQuery, requestedFields);
-  const groupBy = filterGroupBy(parsedQuery, selectedItems);
+  const filterSpecs = filterSpecsFromModel(dataset, fixedParameters);
+  const filterItems = selectItemsByAliases(
+    parsedQuery,
+    new Set(filterSpecs.map((filterSpec) => filterSpec.fieldAlias)),
+  );
+  const innerItems = uniqueSelectItems([...selectedItems, ...filterItems]);
+  const groupBy = filterGroupBy(parsedQuery, innerItems);
   const orderBy = filterOrderBy(parsedQuery, selectedItems);
-  const joins = buildJoinList(parsedQuery, selectedItems, groupBy, orderBy);
-  const whereClauses = [...parsedQuery.whereClauses, ...filterClausesFromModel(dataset)];
-
-  const lines = [
-    `SELECT ${parsedQuery.distinct ? "DISTINCT " : ""}${selectedItems.map(renderSelectItem).join(", ")}`,
-    `FROM ${renderTable(parsedQuery.baseTable)}`,
-    ...joins.map((join) => `${join.type} ${renderTable(join)} ON ${join.condition}`),
-  ];
-  if (whereClauses.length) lines.push(`WHERE ${whereClauses.join(" AND ")}`);
-  if (groupBy.length) lines.push(`GROUP BY ${groupBy.join(", ")}`);
-  if (orderBy.length) lines.push(`ORDER BY ${orderBy.join(", ")}`);
+  const joins = buildJoinList(parsedQuery, innerItems, groupBy, orderBy);
 
   return {
-    sql: `${lines.join(" ")};`,
+    sql: renderQuery({
+      parsedQuery,
+      selectedItems,
+      innerItems,
+      joins,
+      groupBy,
+      orderBy,
+      filterSpecs,
+    }),
     visualName: visualName || "",
     datasetName: dataset.name || "",
-    source: "data_model + visual_model + mapping_model",
+    source: `data_model + ${fieldSource === "visual" ? "visual_model" : fieldSource === "mapping" ? "mapping_model" : "visual_model + mapping_model"}`,
     selectedFields: selectedItems.map((item) => item.alias),
     dimensions: selectedItems.filter((item) => !item.aggregate).map((item) => item.alias),
     measures: selectedItems.filter((item) => item.aggregate).map((item) => item.alias),
     tables: [parsedQuery.baseTable, ...joins].map((table) => ({ table: table.table, alias: table.alias })),
     relationships: joins.map(relationshipFromJoin),
-    filters: whereClauses,
+    filters: [
+      ...parsedQuery.whereClauses,
+      ...filterSpecs.map((filterSpec) => ({
+        field: filterSpec.fieldAlias,
+        operator: filterSpec.operator,
+        values: filterSpec.values,
+        parameterReferences: filterSpec.parameterReferences,
+      })),
+    ],
+    fixedParameters,
     groupBy,
     orderBy,
   };

@@ -6281,6 +6281,8 @@ OUTPUT_TEMPLATE_PATH = OUTPUT_DIR / "template_semantic_model.twb"
 OUTPUT_TEMPLATE_COPY_PATH = OUTPUT_DIR / "template_semantic_model - Copy.twb"
 DEFAULT_TEMPLATE_PATH = ASSETS_DIR / "Semantic_model.twb"
 FALLBACK_TEMPLATE_PATH = Path.home() / "Desktop" / "Semantic_model.twb"
+TABLEAU_DATASOURCE_PROJECT_NAME = "published_datasources"
+TABLEAU_WORKBOOK_PROJECT_NAME = "published_reports"
 FLUX_PIPELINE_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 SYSTEM_PROMPT = """You are SQL Model Assistant.
@@ -6647,6 +6649,22 @@ def _init_state() -> None:
             tableau_defaults.get("project_name")
             or os.getenv("TABLEAU_PROJECT_NAME")
             or "Default"
+        ),
+    )
+    st.session_state.setdefault(
+        "sql_model_assistant_tableau_datasource_project_name",
+        str(
+            tableau_defaults.get("datasource_project_name")
+            or os.getenv("TABLEAU_DATASOURCE_PROJECT_NAME")
+            or TABLEAU_DATASOURCE_PROJECT_NAME
+        ),
+    )
+    st.session_state.setdefault(
+        "sql_model_assistant_tableau_workbook_project_name",
+        str(
+            tableau_defaults.get("workbook_project_name")
+            or os.getenv("TABLEAU_WORKBOOK_PROJECT_NAME")
+            or TABLEAU_WORKBOOK_PROJECT_NAME
         ),
     )
     st.session_state.setdefault(
@@ -7362,6 +7380,14 @@ def _render_tableau_publish_settings() -> None:
         st.session_state.sql_model_assistant_tableau_project_name,
     )
     st.session_state.setdefault(
+        "sql_model_assistant_tableau_datasource_project_name_input",
+        st.session_state.sql_model_assistant_tableau_datasource_project_name,
+    )
+    st.session_state.setdefault(
+        "sql_model_assistant_tableau_workbook_project_name_input",
+        st.session_state.sql_model_assistant_tableau_workbook_project_name,
+    )
+    st.session_state.setdefault(
         "sql_model_assistant_tableau_username_input",
         st.session_state.sql_model_assistant_tableau_username,
     )
@@ -7405,10 +7431,22 @@ def _render_tableau_publish_settings() -> None:
             placeholder="site-content-url",
         )
 
+    datasource_project_col, workbook_project_col = st.columns(2)
+    with datasource_project_col:
+        st.text_input(
+            "Datasource project",
+            key="sql_model_assistant_tableau_datasource_project_name_input",
+        )
+    with workbook_project_col:
+        st.text_input(
+            "Workbook project",
+            key="sql_model_assistant_tableau_workbook_project_name_input",
+        )
+
     project_col, user_col = st.columns(2)
     with project_col:
         st.text_input(
-            "Project",
+            "Legacy project fallback",
             key="sql_model_assistant_tableau_project_name_input",
         )
     with user_col:
@@ -7452,6 +7490,14 @@ def _render_tableau_publish_settings() -> None:
     )
     st.session_state.sql_model_assistant_tableau_project_name = str(
         st.session_state.sql_model_assistant_tableau_project_name_input or ""
+    )
+    st.session_state.sql_model_assistant_tableau_datasource_project_name = str(
+        st.session_state.sql_model_assistant_tableau_datasource_project_name_input
+        or TABLEAU_DATASOURCE_PROJECT_NAME
+    )
+    st.session_state.sql_model_assistant_tableau_workbook_project_name = str(
+        st.session_state.sql_model_assistant_tableau_workbook_project_name_input
+        or TABLEAU_WORKBOOK_PROJECT_NAME
     )
     st.session_state.sql_model_assistant_tableau_username = str(
         st.session_state.sql_model_assistant_tableau_username_input or ""
@@ -7498,6 +7544,20 @@ def _sync_tableau_settings_from_config_if_needed() -> None:
         if defaults.get("project_name"):
             st.session_state.sql_model_assistant_tableau_project_name = str(defaults["project_name"])
             st.session_state.sql_model_assistant_tableau_project_name_input = str(defaults["project_name"])
+        if defaults.get("datasource_project_name"):
+            st.session_state.sql_model_assistant_tableau_datasource_project_name = str(
+                defaults["datasource_project_name"]
+            )
+            st.session_state.sql_model_assistant_tableau_datasource_project_name_input = str(
+                defaults["datasource_project_name"]
+            )
+        if defaults.get("workbook_project_name"):
+            st.session_state.sql_model_assistant_tableau_workbook_project_name = str(
+                defaults["workbook_project_name"]
+            )
+            st.session_state.sql_model_assistant_tableau_workbook_project_name_input = str(
+                defaults["workbook_project_name"]
+            )
         if defaults.get("username"):
             st.session_state.sql_model_assistant_tableau_username = str(defaults["username"])
             st.session_state.sql_model_assistant_tableau_username_input = str(defaults["username"])
@@ -7592,6 +7652,8 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, Any]:
         "server_url",
         "site_content_url",
         "project_name",
+        "datasource_project_name",
+        "workbook_project_name",
         "source_datasource_name",
         "empty_workbook_template_path",
         "visual_source_twb_path",
@@ -7599,6 +7661,9 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, Any]:
         value = tableau_cfg.get(key)
         if isinstance(value, str) and value.strip():
             defaults[key] = value.strip()
+
+    defaults.setdefault("datasource_project_name", TABLEAU_DATASOURCE_PROJECT_NAME)
+    defaults.setdefault("workbook_project_name", TABLEAU_WORKBOOK_PROJECT_NAME)
 
     datasource_publish_mode = _tableau_datasource_publish_mode_from_config(tableau_cfg)
     defaults["datasource_publish_mode"] = datasource_publish_mode
@@ -8221,6 +8286,16 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     server_url = _tableau_normalize_server_url(raw_server_url)
     site_content_url = str(st.session_state.sql_model_assistant_tableau_site_content_url or "").strip()
     project_name = str(st.session_state.sql_model_assistant_tableau_project_name or "").strip()
+    datasource_project_name = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_datasource_project_name", "")
+        or cfg_defaults.get("datasource_project_name")
+        or TABLEAU_DATASOURCE_PROJECT_NAME
+    ).strip()
+    workbook_project_name = str(
+        getattr(st.session_state, "sql_model_assistant_tableau_workbook_project_name", "")
+        or cfg_defaults.get("workbook_project_name")
+        or TABLEAU_WORKBOOK_PROJECT_NAME
+    ).strip()
     username = str(st.session_state.sql_model_assistant_tableau_username or "").strip()
     password = str(st.session_state.sql_model_assistant_tableau_password or "")
     auth_method = str(
@@ -8278,6 +8353,12 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     if not project_name and cfg_defaults.get("project_name"):
         project_name = str(cfg_defaults.get("project_name") or "").strip()
         st.session_state.sql_model_assistant_tableau_project_name = project_name
+    if not datasource_project_name:
+        datasource_project_name = TABLEAU_DATASOURCE_PROJECT_NAME
+    if not workbook_project_name:
+        workbook_project_name = TABLEAU_WORKBOOK_PROJECT_NAME
+    st.session_state.sql_model_assistant_tableau_datasource_project_name = datasource_project_name
+    st.session_state.sql_model_assistant_tableau_workbook_project_name = workbook_project_name
     if not username and cfg_defaults.get("username"):
         username = str(cfg_defaults.get("username") or "").strip()
         st.session_state.sql_model_assistant_tableau_username = username
@@ -8339,6 +8420,8 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     saved_publish_artifacts: dict[str, str] = {}
     linked_workbook_artifact = ""
     consumer_workbook_path = ""
+    datasource_project_id = ""
+    workbook_project_id = ""
     generated_source_artifact = _tableau_copy_publish_artifact(
         source_path=generated_twb_path,
         timestamp_utc=timestamp_utc,
@@ -8409,13 +8492,18 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             pass
 
         with server.auth.sign_in(auth):
-            project_id = _tableau_resolve_project_id(
+            datasource_project_id = _tableau_resolve_project_id(
                 server=server,
                 tsc_module=TSC,
-                project_name=project_name,
+                project_name=datasource_project_name,
+            )
+            workbook_project_id = _tableau_resolve_project_id(
+                server=server,
+                tsc_module=TSC,
+                project_name=workbook_project_name,
             )
 
-            datasource_item = TSC.DatasourceItem(project_id=project_id, name=datasource_name)
+            datasource_item = TSC.DatasourceItem(project_id=datasource_project_id, name=datasource_name)
             if not publish_extract:
                 # Live datasource mode requires Tableau Bridge/private network routing.
                 datasource_item.use_remote_query_agent = True
@@ -8434,7 +8522,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                         server=server,
                         tsc_module=TSC,
                         datasource_name=datasource_name,
-                        project_id=project_id,
+                        project_id=datasource_project_id,
                     )
 
                 if recovered_datasource is not None:
@@ -8506,25 +8594,84 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             consumer_workbook_path = str(consumer_output_path)
 
             published_workbook = None
-            workbook_publish_status = "skipped_validation_pending"
+            workbook_publish_status = "pending"
             workbook_publish_error = ""
+            workbook_item = TSC.WorkbookItem(project_id=workbook_project_id, name=workbook_name)
+            try:
+                published_workbook = _tableau_publish_workbook_with_fallback(
+                    server=server,
+                    workbook_item=workbook_item,
+                    workbook_path=linked_twb_path,
+                    publish_mode=TSC.Server.PublishMode.CreateNew,
+                )
+                workbook_publish_status = "published"
+            except Exception as publish_exc:
+                message = str(publish_exc)
+                if not _tableau_should_retry_packaged_publish(message):
+                    workbook_publish_error = message
+                    if _tableau_is_permission_error(publish_exc):
+                        workbook_publish_status = "forbidden"
+                    else:
+                        raise RuntimeError(
+                            "Datasource published, but final Tableau workbook publish failed. "
+                            f"Error: {publish_exc}"
+                        ) from publish_exc
+                else:
+                    linked_twbx_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}.twbx"
+                    _tableau_package_twb_as_twbx(
+                        twb_path=linked_twb_path,
+                        twbx_path=linked_twbx_path,
+                    )
+                    try:
+                        published_workbook = _tableau_publish_workbook_with_fallback(
+                            server=server,
+                            workbook_item=workbook_item,
+                            workbook_path=linked_twbx_path,
+                            publish_mode=TSC.Server.PublishMode.CreateNew,
+                        )
+                        workbook_publish_status = "published"
+                        workbook_publish_error = ""
+                    except Exception as twbx_publish_exc:
+                        workbook_publish_error = str(twbx_publish_exc)
+                        if _tableau_is_permission_error(twbx_publish_exc):
+                            workbook_publish_status = "forbidden"
+                        else:
+                            raise RuntimeError(
+                                "Datasource published, but final Tableau workbook publish failed. "
+                                f"Error: {twbx_publish_exc}"
+                            ) from twbx_publish_exc
 
-    overall_status = "datasource_published_workbook_publish_skipped_for_validation"
+    overall_status = "published"
     if workbook_publish_status == "forbidden":
         overall_status = "datasource_published_workbook_publish_forbidden"
+    publish_message = (
+        "Tableau Cloud publish completed: "
+        f"datasource in '{datasource_project_name}' and final workbook in '{workbook_project_name}'."
+    )
+    if workbook_publish_status == "forbidden":
+        publish_message = (
+            "Datasource published to Tableau Cloud, but Tableau denied final workbook publish permissions. "
+            f"Datasource project: '{datasource_project_name}'. Workbook project: '{workbook_project_name}'."
+        )
 
     return {
         "status": overall_status,
+        "message": publish_message,
         "timestamp_utc": timestamp_utc,
         "server_url": server_url,
         "site_content_url": site_content_url,
-        "project_id": project_id,
+        "project_id": datasource_project_id,
+        "project_name": datasource_project_name,
+        "datasource_project_id": datasource_project_id,
+        "datasource_project_name": datasource_project_name,
+        "workbook_project_id": workbook_project_id,
+        "workbook_project_name": workbook_project_name,
         "datasource_publish_mode": datasource_publish_mode,
         "consumer_workbook_source_mode": linked_workbook_source_mode,
         "consumer_workbook_source_path": str(linked_workbook_source_path),
         "workbook_publish_status": workbook_publish_status,
         "workbook_publish_error": workbook_publish_error,
-        "workbook_publish_attempted": False,
+        "workbook_publish_attempted": True,
         "linked_workbook_artifact": linked_workbook_artifact,
         "consumer_workbook_path": consumer_workbook_path,
         "extract_report": extract_report or {},
@@ -9380,6 +9527,11 @@ def _build_linked_workbook_for_published_datasource(
     published_name = str(getattr(published_datasource, "name", "") or "").strip() or "published_datasource"
     content_url = str(getattr(published_datasource, "content_url", "") or "").strip() or published_name
     datasource_id = str(getattr(published_datasource, "id", "") or "").strip() or content_url
+    datasource_reference = (
+        published_name
+        or content_url
+        or datasource_id
+    )
     remote_datasource_name = published_name
 
     datasources_node = _tableau_find_first_child(root, "datasources")
@@ -9443,17 +9595,17 @@ def _build_linked_workbook_for_published_datasource(
     }
     if normalized_site:
         repository_attrs["site"] = normalized_site
-    if content_url:
+    if datasource_reference:
         repository_attrs["derived-from"] = _tableau_build_datasource_derived_from_url(
             server_url=server_url,
             site_content_url=normalized_site,
-            datasource_content_url=content_url,
+            datasource_content_url=datasource_reference,
         )
     ET.SubElement(selected, "repository-location", attrib=repository_attrs)
 
     connection_attrs = _tableau_build_sqlproxy_connection_attrs(
         server_url=server_url,
-        datasource_content_url=content_url or datasource_id or published_name,
+        datasource_content_url=datasource_reference,
         datasource_name=published_name,
     )
     connection_node = ET.SubElement(selected, "connection", attrib=connection_attrs)
@@ -9998,6 +10150,10 @@ def _tableau_is_permission_publish_error(error: Exception | str) -> bool:
     return any(hint in message for hint in permission_hints)
 
 
+def _tableau_is_permission_error(error: Exception | str) -> bool:
+    return _tableau_is_permission_publish_error(error)
+
+
 def _tableau_find_published_datasource_by_name(
     server: Any,
     tsc_module: Any,
@@ -10221,7 +10377,7 @@ def _tableau_publish_workbook_with_fallback(
                 str(workbook_path),
                 publish_mode,
                 as_job=False,
-                skip_connection_check=False,
+                skip_connection_check=True,
             )
         except TypeError:
             return server.workbooks.publish(

@@ -1,0 +1,70 @@
+{
+  "name": "regional-sales-rdl-vs-tableau-cloud",
+  "filters": {
+    "start_date": "2024-01-01",
+    "end_date": "2024-12-31",
+    "region": "Europe",
+    "category": "Bikes"
+  },
+  "rdl": {
+    "source_path": "../../backend/assets/RegionalSales.rdl",
+    "reference_png_path": "../../outputs/visual-comparison/manual-reference/reference-rdl.png",
+    "reference_pdf_path": "",
+    "export_command": "",
+    "pdf_dpi": 160
+  },
+  "tableau": {
+    "url": "https://prod-ch-a.online.tableau.com/#/site/<site>/views/<workbook>/<view>",
+    "storage_state_path": "../../.auth/tableau-storage-state.json",
+    "headless": true,
+    "viewport": {
+      "width": 1600,
+      "height": 1000
+    },
+    "dashboard_selector": "body",
+    "screenshot_clip": null,
+    "loading_selectors": [
+      ".tab-loading",
+      "[data-tb-test-id='loading-indicator']",
+      "[aria-label*='Loading']"
+    ],
+    "url_filter_params": {
+      "Start Date": "start_date",
+      "End Date": "end_date",
+      "Region": "region",
+      "Category": "category"
+    },
+    "filter_steps": [
+      {
+        "type": "wait",
+        "milliseconds": 1500
+      }
+    ],
+    "wait_after_filter_ms": 2000,
+    "wait_after_render_ms": 4000
+  },
+  "comparison": {
+    "accepted_threshold": 95,
+    "pixelmatch_threshold": 0.1,
+    "include_antialias": false,
+    "background": {
+      "r": 255,
+      "g": 255,
+      "b": 255,
+      "a": 255
+    },
+    "output_size": null,
+    "mask_rects": [
+      {
+        "name": "tableau-top-navigation",
+        "x": 0,
+        "y": 0,
+        "width": 1600,
+        "height": 92
+      }
+    ]
+  },
+  "output": {
+    "dir": "../../outputs/visual-comparison/latest"
+  }
+}

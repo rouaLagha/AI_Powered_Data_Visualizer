@@ -6,11 +6,18 @@ import Badge from "../shared/Badge.jsx";
 export default function PublicationStep({ datasourceConfig, publicationResult, onPublish }) {
   const status = String(publicationResult.status || "pending").toLowerCase();
   const isPublished = ["published", "success", "completed"].includes(status);
-  const isError = status === "error";
+  const isPartial = status.includes("datasource_published");
+  const isError = status === "error" || status.includes("failed");
   const modeLabel = datasourceConfig.connectionType === "extract" ? "Extract" : "Live TDS";
   const datasourceName = datasourceConfig.sourceDatasourceName || datasourceConfig.name || "Datasource";
-  const statusTitle = isPublished ? "Datasource published" : isError ? "Publish failed" : "Ready to publish";
-  const statusTone = isPublished ? "success" : isError ? "error" : "pending";
+  const statusTitle = isPublished
+    ? "Datasource and workbook published"
+    : isPartial
+      ? "Workbook publish needs attention"
+      : isError
+        ? "Publish failed"
+        : "Ready to publish";
+  const statusTone = isPublished ? "success" : isError || isPartial ? "error" : "pending";
 
   return (
     <Card title="10. Publish" eyebrow="Tableau Cloud" className="publication-card">
@@ -21,7 +28,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
           <p>{publicationResult.message || "Publish the prepared datasource package to Tableau Cloud."}</p>
         </div>
         <Button variant="primary" onClick={onPublish}>
-          {isPublished ? "Publish again" : "Publish datasource"}
+          {isPublished ? "Publish again" : "Publish datasource and workbook"}
         </Button>
       </div>
 
@@ -31,8 +38,12 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
           <strong>{datasourceName}</strong>
         </div>
         <div>
-          <span>Project</span>
-          <strong>{datasourceConfig.project || "Default"}</strong>
+          <span>Datasource project</span>
+          <strong>{datasourceConfig.datasourceProject || publicationResult.datasourceProject || "published_datasources"}</strong>
+        </div>
+        <div>
+          <span>Workbook project</span>
+          <strong>{datasourceConfig.workbookProject || publicationResult.workbookProject || "published_reports"}</strong>
         </div>
         <div>
           <span>Mode</span>
@@ -46,6 +57,8 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
           <div className="published-details">
             <div><span>Datasource URL</span><a href={publicationResult.url || "#"}>{publicationResult.url || "Returned by Tableau"}</a></div>
             <div><span>Datasource ID</span><code>{publicationResult.id || "Returned by Tableau"}</code></div>
+            <div><span>Workbook URL</span><a href={publicationResult.workbookUrl || "#"}>{publicationResult.workbookUrl || "Returned by Tableau"}</a></div>
+            <div><span>Workbook ID</span><code>{publicationResult.workbookId || "Returned by Tableau"}</code></div>
           </div>
         </div>
       )}

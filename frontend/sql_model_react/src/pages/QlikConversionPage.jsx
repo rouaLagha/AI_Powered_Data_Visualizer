@@ -67,6 +67,15 @@ function displayValue(value, fallback = "-") {
   return text || fallback;
 }
 
+function sheetLabel(visual, index) {
+  // Prefer an explicit sheet name when available, else construct a friendly label
+  if (visual?.sheet_name) return String(visual.sheet_name).trim();
+  if (visual?.sheet_title) return String(visual.sheet_title).trim();
+  if (visual?.sheet_id) return `Sheet ${visual.sheet_id}`;
+  // fallback to using visual title or a generic label
+  return visual?.title ? `${visual.title}` : `Unassigned`;
+}
+
 function firstArray(...values) {
   for (const value of values) {
     if (Array.isArray(value)) return value;
@@ -402,7 +411,7 @@ export default function QlikConversionPage() {
                       <div className="qlik-metadata-row" key={visual.id || `${visual.title}-${index}`}>
                         <div className="qlik-metadata-main">
                           <strong>{displayValue(visual.title || visual.id, `Visual ${index + 1}`)}</strong>
-                          <span>{displayValue(visual.type, "unknown type")} / sheet {displayValue(visual.sheet_id, "unassigned")}</span>
+                          <span className="sheet-label">{sheetLabel(visual, index)}</span>
                         </div>
                         <div className="qlik-count-pills">
                           <Badge tone="indigo">{toArray(visual.dimensions).length} dims</Badge>

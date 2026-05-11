@@ -94,62 +94,188 @@ function cleanSql(sql) {
     .trim();
 }
 
-// Real DB execution will be used instead of the in-memory DB. See `executeQuery` below.
-
 let ExpectedDB = null;
 let ActualDB = null;
 
+const sourceTableSchemas = {
+  FactResellerSales: [
+    { name: "SalesTerritoryKey", type: "INT" },
+    { name: "OrderDateKey", type: "INT" },
+    { name: "SalesAmount", type: "NUMBER" },
+    { name: "OrderQuantity", type: "INT" },
+  ],
+  DimSalesTerritory: [
+    { name: "SalesTerritoryKey", type: "INT" },
+    { name: "SalesTerritoryGroup", type: "STRING" },
+  ],
+  DimDate: [
+    { name: "DateKey", type: "INT" },
+    { name: "EnglishMonthName", type: "STRING" },
+    { name: "CalendarYear", type: "INT" },
+  ],
+  FactSalesQuota: [
+    { name: "DateKey", type: "INT" },
+    { name: "SalesAmountQuota", type: "NUMBER" },
+  ],
+};
 
-function buildTestDatabases() {
-  // Create two isolated in-memory alasql databases with identical schema and fixture data.
-  // This simulates preparing two separate test databases from the same raw source.
-  
-  // Expected DB: represents the original RDL source
+const sourceRows = {
+  FactResellerSales: [
+    [10, 20240101, 100.0, 1],
+    [10, 20240201, 200.5, 2],
+    [20, 20230101, 300.0, 3],
+    [20, 20240101, 150.0, 1],
+  ],
+  DimSalesTerritory: [
+    [10, "North America"],
+    [20, "Europe"],
+  ],
+  DimDate: [
+    [20230101, "January", 2023],
+    [20240101, "January", 2024],
+    [20240201, "February", 2024],
+  ],
+  FactSalesQuota: [
+    [20230101, 900.0],
+    [20240101, 1100.0],
+    [20240201, 1200.0],
+  ],
+};
+
+function createTableStatement(tableName, columns) {
+  return `CREATE TABLE ${tableName} (${columns.map((column) => `${column.name} ${column.type}`).join(", ")})`;
+}
+
+function insertRows(dbInstance, tableName, rows, columns) {
+  const placeholders = columns.map(() => "?").join(", ");
+  for (const row of rows) {
+    dbInstance.exec(`INSERT INTO ${tableName} VALUES (${placeholders})`, row);
+  }
+}
+
+function buildExpectedDatabase() {
+  // ExpectedDB represents the original RDL source database.
   alasql.databases.expectedDB = new alasql.Database("expectedDB");
   ExpectedDB = alasql.databases.expectedDB;
-  
-  // Actual DB: represents the generated Tableau semantic model result
+
+  for (const [tableName, columns] of Object.entries(sourceTableSchemas)) {
+    ExpectedDB.exec(createTableStatement(tableName, columns));
+    insertRows(ExpectedDB, tableName, sourceRows[tableName] || [], columns);
+  }
+}
+
+function normalizeModelTableName(tableName) {
+  return String(tableName || "")
+    .replace(/\[([^\]]+)\]/g, "$1")
+    .replace(/^dbo\./i, "")
+    .split(".")
+    .pop()
+    .trim();
+}
+
+function isSqlKeyword(value) {
+  return [
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "JOIN",
+    "ON",
+  ].includes(String(value || "").toUpperCase());
+}
+
+function collectTableAliases(sql) {
+  const aliasToTable = new Map();
+  const query = cleanSql(sql);
+  const tablePattern = /\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?/gi;
+  let match = tablePattern.exec(query);
+  while (match) {
+    const tableName = normalizeModelTableName(match[1]);
+    const alias = match[2] && !isSqlKeyword(match[2]) ? match[2] : tableName;
+    if (tableName) {
+      aliasToTable.set(alias, tableName);
+      aliasToTable.set(tableName, tableName);
+    }
+    match = tablePattern.exec(query);
+  }
+  return aliasToTable;
+}
+
+function requiredSourceTablesFromDataModel(dataModel) {
+  const required = new Map();
+  const datasets = Array.isArray(dataModel?.datasets) ? dataModel.datasets : [];
+  for (const dataset of datasets) {
+    if (!dataset?.query) continue;
+    const query = cleanSql(dataset.query);
+    const aliasToTable = collectTableAliases(query);
+    for (const tableName of aliasToTable.values()) {
+      if (!required.has(tableName)) required.set(tableName, new Set());
+    }
+
+    const refPattern = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b/g;
+    let refMatch = refPattern.exec(query);
+    while (refMatch) {
+      const tableName = aliasToTable.get(refMatch[1]);
+      if (tableName) {
+        if (!required.has(tableName)) required.set(tableName, new Set());
+        required.get(tableName).add(refMatch[2]);
+      }
+      refMatch = refPattern.exec(query);
+    }
+  }
+  return required;
+}
+
+function buildActualDatabaseFromValidatedModel(dataModel, sourceDb) {
+  // ActualDB represents the generated/validated semantic model, not a hardcoded clone.
   alasql.databases.actualDB = new alasql.Database("actualDB");
   ActualDB = alasql.databases.actualDB;
-  
-  // Define table schemas and fixture data (identical for both)
-  const createTablesStmt = [
-    "CREATE TABLE FactResellerSales (SalesTerritoryKey INT, OrderDateKey INT, SalesAmount NUMBER, OrderQuantity INT)",
-    "CREATE TABLE DimSalesTerritory (SalesTerritoryKey INT, SalesTerritoryGroup STRING)",
-    "CREATE TABLE DimDate (DateKey INT, EnglishMonthName STRING, CalendarYear INT)",
-    "CREATE TABLE FactSalesQuota (DateKey INT, SalesAmountQuota NUMBER)",
-  ];
-  
-  const insertDataStmt = [
-    ["INSERT INTO FactResellerSales VALUES (?, ?, ?, ?)", [10, 20240101, 100.0, 1]],
-    ["INSERT INTO FactResellerSales VALUES (?, ?, ?, ?)", [10, 20240201, 200.5, 2]],
-    ["INSERT INTO FactResellerSales VALUES (?, ?, ?, ?)", [20, 20230101, 300.0, 3]],
-    ["INSERT INTO FactResellerSales VALUES (?, ?, ?, ?)", [20, 20240101, 150.0, 1]],
-    ["INSERT INTO DimSalesTerritory VALUES (?, ?)", [10, "North America"]],
-    ["INSERT INTO DimSalesTerritory VALUES (?, ?)", [20, "Europe"]],
-    ["INSERT INTO DimDate VALUES (?, ?, ?)", [20230101, "January", 2023]],
-    ["INSERT INTO DimDate VALUES (?, ?, ?)", [20240101, "January", 2024]],
-    ["INSERT INTO DimDate VALUES (?, ?, ?)", [20240201, "February", 2024]],
-    ["INSERT INTO FactSalesQuota VALUES (?, ?)", [20230101, 900.0]],
-    ["INSERT INTO FactSalesQuota VALUES (?, ?)", [20240101, 1100.0]],
-    ["INSERT INTO FactSalesQuota VALUES (?, ?)", [20240201, 1200.0]],
-  ];
-  
-  // Populate ExpectedDB
-  for (const stmt of createTablesStmt) {
-    ExpectedDB.exec(stmt);
+
+  const required = requiredSourceTablesFromDataModel(dataModel);
+  const tables = [];
+  for (const [tableName, requiredColumns] of required.entries()) {
+    const sourceColumns = sourceTableSchemas[tableName];
+    if (!sourceColumns) {
+      throw new Error(`Validated data model references unknown source table '${tableName}'.`);
+    }
+
+    const selectedColumns = sourceColumns.filter((column) => requiredColumns.size === 0 || requiredColumns.has(column.name));
+    const missingColumns = [...requiredColumns].filter((columnName) => !sourceColumns.some((column) => column.name === columnName));
+    if (missingColumns.length) {
+      throw new Error(`Validated data model references unknown columns on '${tableName}': ${missingColumns.join(", ")}`);
+    }
+    if (!selectedColumns.length) {
+      throw new Error(`Validated data model resolved table '${tableName}' without any usable columns.`);
+    }
+
+    ActualDB.exec(createTableStatement(tableName, selectedColumns));
+    const columnNames = selectedColumns.map((column) => column.name);
+    const sourceRowsForTable = sourceDb.exec(`SELECT ${columnNames.join(", ")} FROM ${tableName}`);
+    insertRows(
+      ActualDB,
+      tableName,
+      sourceRowsForTable.map((row) => columnNames.map((columnName) => row[columnName])),
+      selectedColumns,
+    );
+    tables.push({
+      tableName,
+      columns: columnNames,
+      rowCount: sourceRowsForTable.length,
+      source: "validated_data_model",
+    });
   }
-  for (const [stmt, values] of insertDataStmt) {
-    ExpectedDB.exec(stmt, values);
-  }
-  
-  // Populate ActualDB (identical schema and data)
-  for (const stmt of createTablesStmt) {
-    ActualDB.exec(stmt);
-  }
-  for (const [stmt, values] of insertDataStmt) {
-    ActualDB.exec(stmt, values);
-  }
+
+  return {
+    name: "ActualDB",
+    source: "validated_data_model",
+    tableCount: tables.length,
+    tables,
+  };
 }
 
 function executeQuery(sql, dbInstance) {
@@ -239,13 +365,159 @@ async function loadJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
 }
 
-function findDataset(dataModel, mappingModel, visualModel) {
+function flattenVisuals(visuals) {
+  const output = [];
+  const visit = (visual) => {
+    if (!visual || typeof visual !== "object") return;
+    output.push(visual);
+    if (Array.isArray(visual.children)) {
+      visual.children.forEach(visit);
+    }
+  };
+  if (Array.isArray(visuals)) {
+    visuals.forEach(visit);
+  }
+  return output;
+}
+
+function visualFieldReferences(visual) {
+  const propertyFields = Array.isArray(visual?.properties?.field_references)
+    ? visual.properties.field_references
+    : [];
+  const layoutFields =
+    typeof visual?.layout?.referenced_fields === "string"
+      ? visual.layout.referenced_fields.split(",").map((field) => field.trim())
+      : [];
+  const expressionFields = Array.isArray(visual?.expressions)
+    ? visual.expressions.flatMap((expression) => {
+        const refs = [];
+        const pattern = /Fields!([A-Za-z0-9_]+)\.Value/gi;
+        let match = pattern.exec(String(expression || ""));
+        while (match) {
+          refs.push(match[1]);
+          match = pattern.exec(String(expression || ""));
+        }
+        return refs;
+      })
+    : [];
+  return [...new Set([...propertyFields, ...layoutFields, ...expressionFields].map((field) => String(field || "").trim()).filter(Boolean))];
+}
+
+function mappedFieldsForVisual(mappingModel, visualName) {
+  const visualToFields = Array.isArray(mappingModel?.visual_to_fields) ? mappingModel.visual_to_fields : [];
+  const entry = visualToFields.find((mapping) => mapping.visual_name === visualName);
+  return Array.isArray(entry?.fields)
+    ? [...new Set(entry.fields.map((field) => String(field || "").trim()).filter(Boolean))]
+    : [];
+}
+
+function datasetNameForVisual(mappingModel, visual) {
+  const visualToDataset = Array.isArray(mappingModel?.visual_to_dataset) ? mappingModel.visual_to_dataset : [];
+  return (
+    visualToDataset.find((mapping) => mapping.visual_name === visual?.name && mapping.dataset_name)?.dataset_name ||
+    visual?.dataset_name ||
+    ""
+  );
+}
+
+function businessVisualCases(dataModel, visualModel, mappingModel) {
+  const datasetsByName = new Map((Array.isArray(dataModel?.datasets) ? dataModel.datasets : []).map((dataset) => [dataset.name, dataset]));
+  const seen = new Set();
+  const cases = [];
+  for (const visual of flattenVisuals(visualModel?.visuals)) {
+    const visualName = String(visual?.name || "").trim();
+    if (!visualName || seen.has(visualName)) continue;
+    seen.add(visualName);
+
+    const datasetName = datasetNameForVisual(mappingModel, visual);
+    const dataset = datasetsByName.get(datasetName);
+    const sourceFields = visualFieldReferences(visual);
+    const mappedFields = mappedFieldsForVisual(mappingModel, visualName);
+    const hasBusinessFields = sourceFields.length > 0 || mappedFields.length > 0;
+    if (!dataset?.query || !hasBusinessFields) continue;
+
+    cases.push({
+      visualName,
+      visualType: visual.visual_type || "",
+      semanticHint: visual?.properties?.semantic_hint || "",
+      datasetName,
+      sourceFields,
+      mappedFields,
+    });
+  }
+  return cases;
+}
+
+function coerceParameterValue(value, type) {
+  const normalizedType = String(type || "").toLowerCase();
+  const text = String(value ?? "").replace(/^=/, "").replace(/^"|"$/g, "").trim();
+  if (/^(integer|int|float|decimal|double|number)$/i.test(normalizedType) && /^-?\d+(\.\d+)?$/.test(text)) {
+    return Number(text);
+  }
+  return text;
+}
+
+function firstRowValue(rows, fieldName) {
+  const firstRow = Array.isArray(rows) ? rows[0] : null;
+  if (!firstRow || typeof firstRow !== "object") return undefined;
+  if (fieldName && Object.prototype.hasOwnProperty.call(firstRow, fieldName)) {
+    return firstRow[fieldName];
+  }
+  const firstKey = Object.keys(firstRow)[0];
+  return firstKey ? firstRow[firstKey] : undefined;
+}
+
+function resolveFixedParameters(dataModel, parsedRdl, dbInstance) {
+  const datasetsByName = new Map((Array.isArray(dataModel?.datasets) ? dataModel.datasets : []).map((dataset) => [dataset.name, dataset]));
+  const parsedParameters = Array.isArray(parsedRdl?.report_parameters) ? parsedRdl.report_parameters : [];
+  const fallbackParameters = Array.isArray(dataModel?.parameters) ? dataModel.parameters : [];
+  const parameters = parsedParameters.length ? parsedParameters : fallbackParameters;
+  const values = {};
+  const details = [];
+
+  for (const parameter of parameters) {
+    const name = String(parameter?.name || "").trim();
+    if (!name) continue;
+
+    const defaultValues = Array.isArray(parameter?.default_values) ? parameter.default_values : [];
+    if (defaultValues.length) {
+      values[name] = coerceParameterValue(defaultValues[0], parameter?.type);
+      details.push({ parameter: name, value: values[name], source: "rdl_default_value" });
+      continue;
+    }
+
+    const datasetReference = parameter?.valid_values?.dataset_reference || parameter?.default_values?.dataset_reference || {};
+    const datasetName = datasetReference.dataset_name || `dsParam${name}`;
+    const valueField = datasetReference.value_field || name;
+    const dataset = datasetsByName.get(datasetName);
+    if (dataset?.query) {
+      const rows = executeQuery(dataset.query, dbInstance);
+      const resolved = firstRowValue(rows, valueField);
+      if (resolved !== undefined) {
+        values[name] = coerceParameterValue(resolved, parameter?.type);
+        details.push({ parameter: name, value: values[name], source: "first_valid_value", datasetName, valueField });
+      }
+    }
+  }
+
+  return { values, details };
+}
+
+function unresolvedFilterParameters(dataModel, fixedParameters) {
+  const unresolved = new Set();
   const datasets = Array.isArray(dataModel?.datasets) ? dataModel.datasets : [];
-  const visualEntries = Array.isArray(visualModel?.visuals) ? visualModel.visuals : [];
-  const mappings = Array.isArray(mappingModel?.visual_to_dataset) ? mappingModel.visual_to_dataset : [];
-  const mappedVisual = visualEntries.find((visual) => mappings.some((mapping) => mapping.visual_name === visual.name && mapping.dataset_name));
-  const mappedDatasetName = mappings.find((mapping) => mapping.visual_name === mappedVisual?.name && mapping.dataset_name)?.dataset_name;
-  return datasets.find((dataset) => dataset.name === mappedDatasetName) || datasets[0] || null;
+  for (const dataset of datasets) {
+    const filters = Array.isArray(dataset?.filters) ? dataset.filters : [];
+    for (const filter of filters) {
+      const references = Array.isArray(filter?.parameter_references) ? filter.parameter_references : [];
+      for (const parameterName of references) {
+        if (!Object.prototype.hasOwnProperty.call(fixedParameters, parameterName)) {
+          unresolved.add(parameterName);
+        }
+      }
+    }
+  }
+  return [...unresolved];
 }
 
 function buildScenarioQueries() {
@@ -596,38 +868,87 @@ Applique uniquement cette modification et affiche un warning si la relation est 
     const dataModel = await loadJson(conversionResult.data_model);
     const visualModel = await loadJson(conversionResult.visual_model);
     const mappingModel = await loadJson(conversionResult.mapping_model || conversionResult.mapping);
-    const dataset = findDataset(dataModel, mappingModel, visualModel);
-    if (!dataset?.query) {
-      throw new Error("Unable to resolve a dataset query from the generated data model.");
+    const parsedRdl = conversionResult.parsed_rdl ? await loadJson(conversionResult.parsed_rdl) : {};
+    buildExpectedDatabase();
+
+    const fixedParameterResult = resolveFixedParameters(dataModel, parsedRdl, ExpectedDB);
+    const missingParameters = unresolvedFilterParameters(dataModel, fixedParameterResult.values);
+    expect(missingParameters).toEqual([]);
+    const actualDatabase = buildActualDatabaseFromValidatedModel(dataModel, ExpectedDB);
+
+    const visualCases = businessVisualCases(dataModel, visualModel, mappingModel);
+    if (!visualCases.length) {
+      throw new Error("No KPI/chart/business visuals with dataset fields were found for exhaustive comparison.");
     }
 
-    const visualName = Array.isArray(visualModel?.visuals)
-      ? visualModel.visuals.find((visual) => visual.dataset_name)?.name || visualModel.visuals[0]?.name || ""
-      : "";
-    const queryBuilderResult = buildActualQueryFromSemanticModel({
-      dataModel,
-      visualModel,
-      mappingModel,
-      visualName,
-    });
-    const expectedQuery = dataset.query;
-    const actualQuery = queryBuilderResult.sql;
-    buildTestDatabases();
-    const expectedRows = executeQuery(expectedQuery, ExpectedDB);
-    const actualRows = executeQuery(actualQuery, ActualDB);
-    const comparison = compareResultSets(expectedRows, actualRows, tolerance);
-    expect(comparison.status).toBe("PASS");
+    const comparisons = [];
+    for (const visualCase of visualCases) {
+      const expectedQueryBuilder = buildActualQueryFromSemanticModel({
+        dataModel,
+        visualModel,
+        mappingModel,
+        visualName: visualCase.visualName,
+        datasetName: visualCase.datasetName,
+        fieldSource: "visual",
+        fixedParameters: fixedParameterResult.values,
+        requireFields: true,
+      });
+      const actualQueryBuilder = buildActualQueryFromSemanticModel({
+        dataModel,
+        visualModel,
+        mappingModel,
+        visualName: visualCase.visualName,
+        datasetName: visualCase.datasetName,
+        fieldSource: "mapping",
+        fixedParameters: fixedParameterResult.values,
+        requireFields: true,
+      });
+
+      const expectedRows = executeQuery(expectedQueryBuilder.sql, ExpectedDB);
+      const actualRows = executeQuery(actualQueryBuilder.sql, ActualDB);
+      const comparison = compareResultSets(expectedRows, actualRows, tolerance);
+      comparisons.push({
+        visualName: visualCase.visualName,
+        visualType: visualCase.visualType,
+        semanticHint: visualCase.semanticHint,
+        datasetName: visualCase.datasetName,
+        sourceFields: visualCase.sourceFields,
+        mappedFields: visualCase.mappedFields,
+        expectedQuery: cleanSql(expectedQueryBuilder.sql),
+        actualQuery: cleanSql(actualQueryBuilder.sql),
+        expectedRows: serializeRows(expectedRows),
+        actualRows: serializeRows(actualRows),
+        comparison,
+        expectedQueryBuilder,
+        actualQueryBuilder,
+      });
+    }
+
+    const failedComparisons = comparisons.filter((entry) => entry.comparison.status !== "PASS");
+    expect(failedComparisons).toEqual([]);
 
     report.finalComparison = {
-      result: comparison.status,
-      expectedQuery: cleanSql(expectedQuery),
-      actualQuery: cleanSql(actualQuery),
-      expectedRows: serializeRows(expectedRows),
-      actualRows: serializeRows(actualRows),
-      comparison,
-      visualName,
-      queryBuilder: queryBuilderResult,
+      result: failedComparisons.length === 0 ? "PASS" : "FAIL",
+      scope: "all mapped business visuals with dataset fields",
+      fixedParameters: fixedParameterResult.values,
+      fixedParameterDetails: fixedParameterResult.details,
+      unresolvedFilterParameters: missingParameters,
+      expectedDatabase: {
+        name: "ExpectedDB",
+        source: "rdl_source_fixture",
+        tables: Object.entries(sourceTableSchemas).map(([tableName, columns]) => ({
+          tableName,
+          columns: columns.map((column) => column.name),
+          rowCount: sourceRows[tableName]?.length || 0,
+        })),
+      },
+      actualDatabase,
+      visualCaseCount: visualCases.length,
+      passedCount: comparisons.length - failedComparisons.length,
+      failedCount: failedComparisons.length,
+      comparisons,
       artifacts: {
+        parsedRdl: conversionResult.parsed_rdl || "",
         dataModel: conversionResult.data_model || "",
         visualModel: conversionResult.visual_model || "",
         mappingModel: conversionResult.mapping_model || conversionResult.mapping || "",

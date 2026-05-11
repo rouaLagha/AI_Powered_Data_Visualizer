@@ -14,8 +14,8 @@ import PublicationStep from "./components/steps/PublicationStep.jsx";
 import ConsumerWorkbookStep from "./components/steps/ConsumerWorkbookStep.jsx";
 import QualityComparisonStep from "./components/steps/QualityComparisonStep.jsx";
 import RdlAiEditorPage from "./pages/RdlAiEditorPage.jsx";
-import RdlConversionPage from "./pages/RdlConversionPage.jsx";
 import QlikConversionPage from "./pages/QlikConversionPage.jsx";
+import TableauReportCreatorPage from "./pages/TableauReportCreatorPage.jsx";
 import {
   STATUS,
   analysisFromBackend,
@@ -136,6 +136,8 @@ function tableauPayload(config) {
     server_url: config.tableauServerUrl,
     site_content_url: config.siteContentUrl,
     project_name: config.project,
+    datasource_project_name: config.datasourceProject || config.project,
+    workbook_project_name: config.workbookProject || config.project,
     username: config.username,
     password: config.password,
     pat_name: config.patName,
@@ -147,10 +149,10 @@ function tableauPayload(config) {
 }
 
 const navItems = [
-  { id: "pipeline", label: "SQL model flow" },
-  { id: "conversion", label: "RDL to TWB" },
-  { id: "qlik", label: "Qlik metadata" },
-  { id: "editor", label: "RDL AI editor" },
+  { id: "pipeline", label: "RDL -> Tableau Conversion" },
+  { id: "qlik", label: "Qlik -> Tableau conversion" },
+  { id: "editor", label: "AI RDL report Editor" },
+  { id: "tableauCreator", label: "AI Tableau report creator" },
 ];
 
 const PANEL_WIDTH_LIMITS = {
@@ -211,6 +213,8 @@ export default function App() {
   const [datasourceConfig, setDatasourceConfig] = useState({
     name: "",
     project: "Default",
+    datasourceProject: "published_datasources",
+    workbookProject: "published_reports",
     connectionType: "live_tds",
     tableauServerUrl: "",
     siteContentUrl: "",
@@ -619,32 +623,11 @@ export default function App() {
   };
   const defaultConfigPath = backendState?.defaults?.config_path || "";
 
-  if (activePage === "conversion") {
-    return (
-      <div className="app-shell">
-        <Header
-          activeStepTitle="RDL to TWB"
-          validationStatus={validationStatus}
-          context={headerContext}
-          navItems={navItems}
-          activePage={activePage}
-          onNavigate={setActivePage}
-          showValidationBadge={false}
-        />
-        <main className="page-workspace">
-          {loading && <div className="loading-banner">{loading} in progress...</div>}
-          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
-          <RdlConversionPage defaultConfigPath={defaultConfigPath} />
-        </main>
-      </div>
-    );
-  }
-
   if (activePage === "editor") {
     return (
       <div className="app-shell">
         <Header
-          activeStepTitle="RDL AI editor"
+          activeStepTitle="AI RDL report Editor"
           validationStatus={validationStatus}
           context={headerContext}
           navItems={navItems}
@@ -665,7 +648,7 @@ export default function App() {
     return (
       <div className="app-shell">
         <Header
-          activeStepTitle="Qlik metadata"
+          activeStepTitle="Qlik -> Tableau conversion"
           validationStatus={validationStatus}
           context={headerContext}
           navItems={navItems}
@@ -677,6 +660,27 @@ export default function App() {
           {loading && <div className="loading-banner">{loading} in progress...</div>}
           {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
           <QlikConversionPage />
+        </main>
+      </div>
+    );
+  }
+
+  if (activePage === "tableauCreator") {
+    return (
+      <div className="app-shell">
+        <Header
+          activeStepTitle="AI Tableau report creator"
+          validationStatus={validationStatus}
+          context={headerContext}
+          navItems={navItems}
+          activePage={activePage}
+          onNavigate={setActivePage}
+          showValidationBadge={false}
+        />
+        <main className="page-workspace">
+          {loading && <div className="loading-banner">{loading} in progress...</div>}
+          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
+          <TableauReportCreatorPage />
         </main>
       </div>
     );

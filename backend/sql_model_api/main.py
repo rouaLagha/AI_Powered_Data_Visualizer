@@ -1942,6 +1942,8 @@ def _tableau_defaults_payload() -> dict[str, Any]:
         "server_url": str(defaults.get("server_url") or ""),
         "site_content_url": str(defaults.get("site_content_url") or ""),
         "project_name": str(defaults.get("project_name") or "Default"),
+        "datasource_project_name": str(defaults.get("datasource_project_name") or "published_datasources"),
+        "workbook_project_name": str(defaults.get("workbook_project_name") or "published_reports"),
         "source_datasource_name": str(defaults.get("source_datasource_name") or ""),
         "empty_workbook_template_path": str(defaults.get("empty_workbook_template_path") or ""),
         "visual_source_twb_path": str(defaults.get("visual_source_twb_path") or ""),
@@ -2381,6 +2383,14 @@ def _configure_streamlit_publish_state(config_path: str, overrides: dict[str, An
     st.session_state.sql_model_assistant_tableau_server_url = pick("server_url")
     st.session_state.sql_model_assistant_tableau_site_content_url = pick("site_content_url")
     st.session_state.sql_model_assistant_tableau_project_name = pick("project_name", "Default")
+    st.session_state.sql_model_assistant_tableau_datasource_project_name = pick(
+        "datasource_project_name",
+        "published_datasources",
+    )
+    st.session_state.sql_model_assistant_tableau_workbook_project_name = pick(
+        "workbook_project_name",
+        "published_reports",
+    )
     st.session_state.sql_model_assistant_tableau_username = pick("username")
     st.session_state.sql_model_assistant_tableau_password = pick("password")
     st.session_state.sql_model_assistant_tableau_pat_name = pick("pat_name")

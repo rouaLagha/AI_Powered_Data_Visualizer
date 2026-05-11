@@ -43,8 +43,12 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
           <input value={datasourceConfig.siteContentUrl} onChange={(event) => update("siteContentUrl", event.target.value)} />
         </label>
         <label>
-          Project
-          <input value={datasourceConfig.project} onChange={(event) => update("project", event.target.value)} />
+          Datasource project
+          <input value={datasourceConfig.datasourceProject} onChange={(event) => update("datasourceProject", event.target.value)} />
+        </label>
+        <label>
+          Final workbook project
+          <input value={datasourceConfig.workbookProject} onChange={(event) => update("workbookProject", event.target.value)} />
         </label>
         <label>
           Datasource name

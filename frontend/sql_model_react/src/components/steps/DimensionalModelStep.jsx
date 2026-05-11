@@ -2,11 +2,9 @@ import React from "react";
 import Card from "../shared/Card.jsx";
 import Badge from "../shared/Badge.jsx";
 import SchemaFlowFrame from "../model/SchemaFlowFrame.jsx";
-import WarningsPanel from "../model/WarningsPanel.jsx";
 
 export default function DimensionalModelStep({ model, backendModel }) {
   const tables = model.tables || [];
-  const warnings = Array.isArray(model.warnings) ? model.warnings : [];
   const factCount = tables.filter((table) => table.type === "fact").length;
   const dimensionCount = tables.filter((table) => table.type === "dimension").length;
 
@@ -49,13 +47,6 @@ export default function DimensionalModelStep({ model, backendModel }) {
             <div className="summary-row"><span>Relationships</span><strong>{model.relationships.length}</strong></div>
             <div className="summary-row"><span>Measures</span><strong>{model.measures.length}</strong></div>
           </div>
-
-          {warnings.length > 0 && (
-            <div className="schema-summary-panel">
-              <h3>Warnings</h3>
-              <WarningsPanel warnings={warnings} />
-            </div>
-          )}
         </aside>
       </div>
     </Card>

@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui"
+    "test:e2e:ui": "playwright test --ui",
+    "test:visual": "node scripts/visual-compare-rdl-tableau.mjs"
   },
   "dependencies": {
     "react": "^18.2.0",
@@ -19,6 +20,8 @@
     "@playwright/test": "^1.56.1",
     "alasql": "^4.4.5",
     "@vitejs/plugin-react": "^4.2.0",
+    "pixelmatch": "^7.1.0",
+    "pngjs": "^7.0.0",
     "vite": "^5.0.0"
   }
 }

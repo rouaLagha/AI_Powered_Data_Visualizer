@@ -542,6 +542,8 @@ export function datasourceConfigFromState(state, previous = {}) {
   return {
     name: previous.name || defaults.source_datasource_name || state?.selected_datasource_name || source.name || "",
     project: previous.project || defaults.project_name || "Default",
+    datasourceProject: previous.datasourceProject || defaults.datasource_project_name || "published_datasources",
+    workbookProject: previous.workbookProject || defaults.workbook_project_name || "published_reports",
     connectionType: previous.connectionType || defaults.datasource_publish_mode || "live_tds",
     tableauServerUrl: previous.tableauServerUrl || defaults.server_url || "",
     siteContentUrl: previous.siteContentUrl || defaults.site_content_url || "",
@@ -576,6 +578,10 @@ export function publicationResultFromState(state) {
       message: report.message || report.reason || "Tableau publish workflow completed.",
       url: report.datasource_url || report.published_datasource_url || report.datasource_content_url || "",
       id: report.datasource_id || report.published_datasource_id || "",
+      datasourceProject: report.datasource_project_name || report.project_name || "",
+      workbookProject: report.workbook_project_name || "",
+      workbookUrl: report.workbook_webpage_url || report.workbook_content_url || "",
+      workbookId: report.workbook_id || "",
     };
   }
   return {
