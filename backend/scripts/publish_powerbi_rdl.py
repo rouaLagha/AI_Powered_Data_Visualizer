@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a .rdl file to Power BI My Workspace using a user access token.
+r"""Publish a .rdl file to Power BI My Workspace using a user access token.
 
 Usage examples:
   # Ensure POWERBI_ACCESS_TOKEN is set in the environment
