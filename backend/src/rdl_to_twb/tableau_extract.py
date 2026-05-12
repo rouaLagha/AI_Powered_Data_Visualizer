@@ -144,16 +144,21 @@ def build_hyper_extract_from_catalog(
                         continue
 
                     column_defs: list[Any] = []
+                    selected_column_names: list[str] = []
                     for col in columns:
                         if not isinstance(col, dict):
                             continue
                         col_name = str(col.get("name") or "").strip()
                         if not col_name:
                             continue
-                        sql_type = _sqlserver_type_to_hyper(str(col.get("data_type") or ""), SqlType)
+                        data_type = str(col.get("data_type") or "")
+                        if _is_sqlserver_binary_type(data_type):
+                            continue
+                        sql_type = _sqlserver_type_to_hyper(data_type, SqlType)
                         nullable = bool(col.get("is_nullable", True))
                         nullability = Nullability.NULLABLE if nullable else Nullability.NOT_NULLABLE
                         column_defs.append(TableDefinition.Column(col_name, sql_type, nullability))
+                        selected_column_names.append(col_name)
 
                     if not column_defs:
                         continue
@@ -161,9 +166,10 @@ def build_hyper_extract_from_catalog(
                     table_def = TableDefinition(TableName("Extract", table_name), column_defs)
                     hyper_conn.catalog.create_table(table_def)
 
-                    query = f"SELECT * FROM {full_name}"
+                    select_list = ", ".join(_quote_sqlserver_identifier(name) for name in selected_column_names)
+                    query = f"SELECT {select_list} FROM {full_name}"
                     if isinstance(max_rows_per_table, int) and max_rows_per_table > 0:
-                        query = f"SELECT TOP {max_rows_per_table} * FROM {full_name}"
+                        query = f"SELECT TOP {max_rows_per_table} {select_list} FROM {full_name}"
 
                     with conn.cursor() as cursor:
                         cursor.execute(query)
@@ -330,6 +336,16 @@ def _sqlserver_type_to_hyper(sql_type: str, sql_type_cls: Any) -> Any:
         return sql_type_cls.bytes()
 
     return sql_type_cls.text()
+
+
+def _is_sqlserver_binary_type(sql_type: str) -> bool:
+    t = (sql_type or "").strip().lower()
+    base = t.split("(", 1)[0].strip()
+    return base in {"binary", "varbinary", "image", "rowversion", "timestamp"}
+
+
+def _quote_sqlserver_identifier(value: str) -> str:
+    return f"[{str(value or '').replace(']', ']]')}]"
 
 
 def _extract_relation_name_from_table_attr(value: Any) -> str:

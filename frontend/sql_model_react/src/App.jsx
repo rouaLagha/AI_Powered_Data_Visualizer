@@ -144,6 +144,7 @@ function tableauPayload(config) {
     pat_secret: config.patSecret,
     source_datasource_name: config.sourceDatasourceName || config.name,
     datasource_publish_mode: config.connectionType,
+    build_hyper_extract: config.connectionType === "extract",
     auth_method: config.authMode,
   };
 }

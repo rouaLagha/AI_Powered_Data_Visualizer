@@ -544,7 +544,7 @@ export function datasourceConfigFromState(state, previous = {}) {
     project: previous.project || defaults.project_name || "Default",
     datasourceProject: previous.datasourceProject || defaults.datasource_project_name || "published_datasources",
     workbookProject: previous.workbookProject || defaults.workbook_project_name || "published_reports",
-    connectionType: previous.connectionType || defaults.datasource_publish_mode || "live_tds",
+    connectionType: "live_tds",
     tableauServerUrl: previous.tableauServerUrl || defaults.server_url || "",
     siteContentUrl: previous.siteContentUrl || defaults.site_content_url || "",
     authMode: previous.authMode || defaults.auth_method || "username_password",
@@ -573,15 +573,18 @@ export function publicationResultFromState(state) {
     };
   }
   if (report.status) {
+    const sourcePublishStatus = report.source_rdl_publish_status || report.source_rdl_powerbi_publish?.status || "";
+    const baseMessage = report.message || report.reason || "Tableau publish workflow completed.";
     return {
       status: report.status,
-      message: report.message || report.reason || "Tableau publish workflow completed.",
+      message: sourcePublishStatus ? `${baseMessage} Power BI source RDL: ${sourcePublishStatus}.` : baseMessage,
       url: report.datasource_url || report.published_datasource_url || report.datasource_content_url || "",
       id: report.datasource_id || report.published_datasource_id || "",
       datasourceProject: report.datasource_project_name || report.project_name || "",
       workbookProject: report.workbook_project_name || "",
       workbookUrl: report.workbook_webpage_url || report.workbook_content_url || "",
       workbookId: report.workbook_id || "",
+      powerbiStatus: sourcePublishStatus,
     };
   }
   return {

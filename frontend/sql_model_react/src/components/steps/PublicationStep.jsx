@@ -20,7 +20,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
   const statusTone = isPublished ? "success" : isError || isPartial ? "error" : "pending";
 
   return (
-    <Card title="10. Publish" eyebrow="Tableau Cloud" className="publication-card">
+    <Card title="10. Publish" eyebrow="Power BI + Tableau Cloud" className="publication-card">
       <div className={`publication-status-panel publication-${statusTone}`}>
         <div className="publication-status-copy">
           <Badge tone={isPublished ? "green" : isError ? "red" : "indigo"}>{publicationResult.status || "pending"}</Badge>
@@ -28,7 +28,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
           <p>{publicationResult.message || "Publish the prepared datasource package to Tableau Cloud."}</p>
         </div>
         <Button variant="primary" onClick={onPublish}>
-          {isPublished ? "Publish again" : "Publish datasource and workbook"}
+          {isPublished ? "Publish again" : "Publish source and workbook"}
         </Button>
       </div>
 

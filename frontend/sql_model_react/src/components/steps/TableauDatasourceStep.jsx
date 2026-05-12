@@ -24,7 +24,6 @@ export default function TableauDatasourceStep({ datasourceConfig, setDatasourceC
           <span>Mode</span>
           <select value={datasourceConfig.connectionType} onChange={(event) => update("connectionType", event.target.value)}>
             <option value="live_tds">Live TDS</option>
-            <option value="extract">Extract</option>
           </select>
         </label>
         <div>

@@ -6266,7 +6266,11 @@ from src.rdl_ai_editor.nlp_agent import load_llm_from_config
 from src.rdl_to_twb.db_introspection import build_db_catalog, inspect_sqlserver_datasource_inventory
 from src.rdl_to_twb.pipeline import run_conversion
 from src.rdl_to_twb.rdl_parser import parse_rdl_file
-from src.rdl_to_twb.tableau_extract import build_hyper_extract_from_catalog
+from src.rdl_to_twb.tableau_extract import (
+    build_hyper_extract_from_catalog,
+    build_twbx_package,
+    rewrite_workbook_for_hyper,
+)
 from src.rdl_to_twb.twb_builder import inject_datasource_connections
 
 
@@ -8301,7 +8305,10 @@ def _first_existing_twb(candidates: list[Path]) -> Path | None:
     return None
 
 
-def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, Any]:
+def _run_tableau_cloud_publish_workflow(
+    generated_twb_path: Path,
+    timestamp_utc: str | None = None,
+) -> dict[str, Any]:
     if not generated_twb_path.exists():
         raise FileNotFoundError(f"Generated TWB file not found: {generated_twb_path}")
 
@@ -8351,8 +8358,6 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
     ).strip().lower()
     if not datasource_publish_mode:
         datasource_publish_mode = "extract" if bool(cfg_defaults.get("build_hyper_extract", False)) else "live_tds"
-    if _is_active_regionalsales_report():
-        datasource_publish_mode = "live_tds"
     publish_extract = datasource_publish_mode == "extract"
     try:
         hyper_max_rows_per_table = int(cfg_defaults.get("hyper_max_rows_per_table") or 0)
@@ -8444,10 +8449,11 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             "Install it with: pip install tableauserverclient"
         ) from exc
 
-    timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp_utc = timestamp_utc or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     datasource_name = _tableau_timestamped_name("validated_semantic_model", timestamp_utc)
     workbook_name = _tableau_timestamped_name(f"{generated_twb_path.stem}_consumer", timestamp_utc)
     extract_report: dict[str, Any] | None = None
+    workbook_extract_report: dict[str, Any] = {}
     saved_publish_artifacts: dict[str, str] = {}
     linked_workbook_artifact = ""
     consumer_workbook_path = ""
@@ -8586,38 +8592,21 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                         f"Error: {datasource_publish_exc}.{debug_detail}"
                     ) from datasource_publish_exc
 
-            linked_twb_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}.twb"
-            _build_linked_workbook_for_published_datasource(
-                source_twb_path=linked_workbook_source_path,
-                output_twb_path=linked_twb_path,
-                published_datasource=published_datasource,
-                server_url=server_url,
-                site_content_url=site_content_url,
-                source_datasource_name=linked_workbook_source_datasource_name,
-            )
-
-            if visual_source_twb_path is not None:
-                visualized_linked_twb_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}_with_visuals.twb"
-                _tableau_clone_linked_workbook_with_visual_content(
-                    linked_workbook_path=linked_twb_path,
-                    visual_source_twb_path=visual_source_twb_path,
-                    output_twb_path=visualized_linked_twb_path,
-                    preferred_datasource_name=linked_workbook_source_datasource_name,
-                )
-                linked_twb_path = visualized_linked_twb_path
-
-            _tableau_finalize_linked_workbook_datasource_schema(
-                workbook_path=linked_twb_path,
-                preferred_datasource_name=linked_workbook_source_datasource_name,
+            workbook_publish_path, workbook_extract_report = _build_extract_workbook_package_for_publish(
+                source_twb_path=generated_twb_path,
+                output_dir=tmp_dir,
+                workbook_name=workbook_name,
+                hyper_max_rows_per_table=hyper_max_rows_per_table or None,
             )
 
             linked_workbook_artifact = _tableau_copy_publish_artifact(
-                source_path=linked_twb_path,
+                source_path=workbook_publish_path,
                 timestamp_utc=timestamp_utc,
-                label="linked_workbook_for_tableau_cloud",
+                label="extract_workbook_twbx_for_tableau_cloud",
             )
             if linked_workbook_artifact:
                 saved_publish_artifacts["linked_workbook"] = linked_workbook_artifact
+                saved_publish_artifacts["extract_workbook"] = linked_workbook_artifact
 
             consumer_output_override = str(
                 getattr(st.session_state, "sql_model_assistant_tableau_consumer_output_path", "") or ""
@@ -8625,10 +8614,12 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             consumer_output_path = (
                 Path(consumer_output_override).expanduser()
                 if consumer_output_override
-                else OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final.twb"
+                else OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final{workbook_publish_path.suffix}"
             )
+            if consumer_output_path.suffix.lower() != workbook_publish_path.suffix.lower():
+                consumer_output_path = consumer_output_path.with_suffix(workbook_publish_path.suffix)
             consumer_output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(linked_twb_path, consumer_output_path)
+            shutil.copy2(workbook_publish_path, consumer_output_path)
             consumer_workbook_path = str(consumer_output_path)
 
             published_workbook = None
@@ -8639,7 +8630,7 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                 published_workbook = _tableau_publish_workbook_with_fallback(
                     server=server,
                     workbook_item=workbook_item,
-                    workbook_path=linked_twb_path,
+                    workbook_path=workbook_publish_path,
                     publish_mode=TSC.Server.PublishMode.CreateNew,
                 )
                 workbook_publish_status = "published"
@@ -8655,16 +8646,11 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
                             f"Error: {publish_exc}"
                         ) from publish_exc
                 else:
-                    linked_twbx_path = tmp_dir / f"{_tableau_safe_name(workbook_name)}.twbx"
-                    _tableau_package_twb_as_twbx(
-                        twb_path=linked_twb_path,
-                        twbx_path=linked_twbx_path,
-                    )
                     try:
                         published_workbook = _tableau_publish_workbook_with_fallback(
                             server=server,
                             workbook_item=workbook_item,
-                            workbook_path=linked_twbx_path,
+                            workbook_path=workbook_publish_path,
                             publish_mode=TSC.Server.PublishMode.CreateNew,
                         )
                         workbook_publish_status = "published"
@@ -8710,9 +8696,11 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
         "workbook_publish_status": workbook_publish_status,
         "workbook_publish_error": workbook_publish_error,
         "workbook_publish_attempted": True,
+        "workbook_publish_mode": "extract_twbx",
         "linked_workbook_artifact": linked_workbook_artifact,
         "consumer_workbook_path": consumer_workbook_path,
         "extract_report": extract_report or {},
+        "workbook_extract_report": workbook_extract_report,
         "saved_publish_artifacts": saved_publish_artifacts,
         "source_datasource_name": resolved_source_datasource_name,
         "datasource_name": getattr(published_datasource, "name", datasource_name),
@@ -8826,6 +8814,67 @@ def _build_extract_datasource_package_for_publish(
     return extract_tdsx_path, selected_name, extract_report
 
 
+def _build_extract_workbook_package_for_publish(
+    source_twb_path: Path,
+    output_dir: Path,
+    workbook_name: str,
+    hyper_max_rows_per_table: int | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    publish_context = st.session_state.get("sql_model_assistant_tableau_publish_context", {})
+    if not isinstance(publish_context, dict):
+        raise ValueError(
+            "Missing SQL Model Assistant publish context for workbook extract mode. "
+            "Regenerate the TWB in this session before publishing the final workbook."
+        )
+
+    data_source = publish_context.get("data_source")
+    db_catalog = publish_context.get("db_catalog")
+    if not isinstance(data_source, dict) or not data_source:
+        raise ValueError("Workbook extract publish requires datasource metadata from the current run.")
+    if not isinstance(db_catalog, dict):
+        raise ValueError(
+            "Workbook extract publish requires DB catalog metadata. "
+            "Make sure schema validation/TWB generation succeeded with DB introspection."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = _tableau_safe_name(workbook_name)
+    hyper_path = output_dir / f"{safe_name}_workbook.hyper"
+    extract_report = build_hyper_extract_from_catalog(
+        output_hyper_path=hyper_path,
+        data_sources=[data_source],
+        db_catalog=db_catalog,
+        max_rows_per_table=hyper_max_rows_per_table,
+    )
+    if str(extract_report.get("status", "")).strip().lower() != "created":
+        reason = str(extract_report.get("reason") or extract_report.get("error") or "unknown error").strip()
+        raise RuntimeError(f"Failed to build extract for final workbook publish: {reason}")
+
+    extract_twb_path = output_dir / f"{safe_name}_extract.twb"
+    rewrite_report = rewrite_workbook_for_hyper(
+        source_twb_path=source_twb_path,
+        output_twb_path=extract_twb_path,
+        hyper_relative_path=f"Data/Extracts/{hyper_path.name}",
+    )
+    _tableau_remove_unsupported_extract_fields_from_workbook(extract_twb_path)
+
+    extract_twbx_path = output_dir / f"{safe_name}.twbx"
+    package_report = build_twbx_package(
+        twb_path=extract_twb_path,
+        output_twbx_path=extract_twbx_path,
+        hyper_path=hyper_path,
+    )
+
+    return extract_twbx_path, {
+        **extract_report,
+        "status": "created",
+        "workbook_rewrite": rewrite_report,
+        "twbx_package": package_report,
+        "publish_input_path": str(extract_twbx_path),
+        "workbook_publish_mode": "extract_twbx",
+    }
+
+
 def _build_live_datasource_tds_for_publish(
     source_twb_path: Path,
     output_dir: Path,
@@ -8889,12 +8938,112 @@ def _tableau_rewrite_datasource_tds_for_hyper_extract(
             relation_node.set("connection", renamed_connections[connection_name])
         relation_node.set("table", f"[Extract].[{relation_name}]")
 
+    _tableau_remove_unsupported_extract_fields(root)
     _tableau_upsert_extract_metadata(root)
     _tableau_reorder_datasource_children(root)
 
     output_tds_path.parent.mkdir(parents=True, exist_ok=True)
     output_tds_path.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
     return output_tds_path
+
+
+def _tableau_remove_unsupported_extract_fields_from_workbook(workbook_path: Path) -> None:
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"Workbook not found for extract cleanup: {workbook_path}")
+
+    root = ET.fromstring(workbook_path.read_text(encoding="utf-8"))
+    _tableau_strip_namespaces(root)
+
+    datasources_node = _tableau_find_first_child(root, "datasources")
+    if datasources_node is not None:
+        for datasource_node in list(datasources_node):
+            if _tableau_local_name(datasource_node.tag) == "datasource":
+                _tableau_remove_unsupported_extract_fields(datasource_node)
+
+    workbook_path.write_bytes(ET.tostring(root, encoding="utf-8", xml_declaration=True))
+
+
+def _tableau_remove_unsupported_extract_fields(datasource_node: ET.Element) -> None:
+    unsupported_names = _tableau_extract_unsupported_field_names(datasource_node)
+    if not unsupported_names:
+        return
+
+    connection_node = _tableau_find_first_child(datasource_node, "connection")
+    metadata_node = _tableau_find_first_child(connection_node, "metadata-records") if connection_node is not None else None
+    if metadata_node is not None:
+        for record_node in list(metadata_node):
+            if _tableau_local_name(record_node.tag) != "metadata-record":
+                continue
+            local_name = _tableau_child_text(record_node, "local-name")
+            remote_name = _tableau_child_text(record_node, "remote-name")
+            parent_name = _tableau_child_text(record_node, "parent-name")
+            full_remote = f"{parent_name}.{remote_name}" if parent_name and remote_name else ""
+            if local_name in unsupported_names or remote_name in unsupported_names or full_remote in unsupported_names:
+                metadata_node.remove(record_node)
+
+    cols_node = _tableau_find_first_child(connection_node, "cols") if connection_node is not None else None
+    if cols_node is not None:
+        for map_node in list(cols_node):
+            if _tableau_local_name(map_node.tag) != "map":
+                continue
+            key = str(map_node.attrib.get("key") or "").strip()
+            value = str(map_node.attrib.get("value") or "").strip()
+            if key in unsupported_names or value in unsupported_names:
+                cols_node.remove(map_node)
+
+    for child in list(datasource_node):
+        local_name = _tableau_local_name(child.tag)
+        if local_name == "column" and str(child.attrib.get("name") or "").strip() in unsupported_names:
+            datasource_node.remove(child)
+        elif local_name == "column-instance" and str(child.attrib.get("column") or "").strip() in unsupported_names:
+            datasource_node.remove(child)
+
+
+def _tableau_extract_unsupported_field_names(datasource_node: ET.Element) -> set[str]:
+    unsupported: set[str] = set()
+    connection_node = _tableau_find_first_child(datasource_node, "connection")
+    metadata_node = _tableau_find_first_child(connection_node, "metadata-records") if connection_node is not None else None
+    if metadata_node is None:
+        return unsupported
+
+    for record_node in list(metadata_node):
+        if _tableau_local_name(record_node.tag) != "metadata-record":
+            continue
+        if not _tableau_metadata_record_is_binary(record_node):
+            continue
+        local_name = _tableau_child_text(record_node, "local-name")
+        remote_name = _tableau_child_text(record_node, "remote-name")
+        parent_name = _tableau_child_text(record_node, "parent-name")
+        if local_name:
+            unsupported.add(local_name)
+        if remote_name:
+            unsupported.add(remote_name)
+        if parent_name and remote_name:
+            unsupported.add(f"{parent_name}.{remote_name}")
+    return unsupported
+
+
+def _tableau_metadata_record_is_binary(record_node: ET.Element) -> bool:
+    binary_tokens = {"binary", "varbinary", "image", "rowversion", "sql_c_binary", "sql_binary", "sql_varbinary"}
+    remote_type = _tableau_child_text(record_node, "remote-type").strip()
+    if remote_type == "128":
+        return True
+    attributes_node = _tableau_find_first_child(record_node, "attributes")
+    if attributes_node is None:
+        return False
+    for attribute_node in list(attributes_node):
+        if _tableau_local_name(attribute_node.tag) != "attribute":
+            continue
+        raw = str(attribute_node.text or "").strip().strip('"').lower()
+        normalized = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        if normalized in binary_tokens:
+            return True
+    return False
+
+
+def _tableau_child_text(parent: ET.Element, child_name: str) -> str:
+    child = _tableau_find_first_child(parent, child_name)
+    return str(child.text or "").strip() if child is not None else ""
 
 
 def _tableau_upsert_extract_metadata(datasource_node: ET.Element) -> ET.Element:

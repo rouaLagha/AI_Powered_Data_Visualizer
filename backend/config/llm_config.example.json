@@ -22,8 +22,8 @@
   },
   "tableau_server": {
     "enabled": true,
-    "server_url": "https://prod-ch-a.online.tableau.com",
-    "site_content_url": "maissahadded-db044b3da5",
+    "server_url": "https://your-pod.online.tableau.com",
+    "site_content_url": "your-site-content-url",
     "project_name": "Default",
     "datasource_project_name": "published_datasources",
     "workbook_project_name": "published_reports",
@@ -35,8 +35,8 @@
     "publish_mode": "overwrite",
     "file_format": "auto",
     "auth_type": "username_password",
-    "username": "maissa.hadded@talan.com",
-    "password": "Roualagha111@",
+    "username": "env:TABLEAU_USERNAME",
+    "password": "env:TABLEAU_PASSWORD",
     "skip_connection_check": false,
     "as_job": false,
     "fail_on_error": false,
@@ -45,6 +45,17 @@
     "desktop_rpa_timeout_seconds": 180,
     "desktop_rpa_publish_wait_seconds": 240,
     "desktop_rpa_launch_settle_seconds": 4
+  },
+  "powerbi_service": {
+    "enabled": false,
+    "workspace_id": "env:POWERBI_WORKSPACE_ID",
+    "tenant_id": "env:POWERBI_TENANT_ID",
+    "client_id": "env:POWERBI_CLIENT_ID",
+    "client_secret": "env:POWERBI_CLIENT_SECRET",
+    "access_token": "env:POWERBI_ACCESS_TOKEN",
+    "name_conflict": "Abort",
+    "timeout_seconds": 300,
+    "fail_on_error": false
   },
   "tableau_server01": {
     "enabled": false,
@@ -70,7 +81,7 @@
     "fail_on_error": false,
     "source_datasource_name": "",
     "empty_workbook_template_path": "",
-    "visual_source_twb_path": "outputs/sql_model_assistant_flux1/RegionalSales/converted_report.twb",
+    "visual_source_twb_path": "",
     "desktop_rpa_enabled": false,
     "desktop_rpa_tableau_exe": "env:TABLEAU_PUBLIC_EXE",
     "desktop_rpa_email": "env:TABLEAU_EMAIL",

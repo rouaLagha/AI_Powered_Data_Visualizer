@@ -43,6 +43,7 @@ from src.rdl_to_twb.db_introspection import (
 from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agent, validate_patch
 from src.rdl_ai_editor.logging_utils import write_patch_log
 from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
+from src.rdl_to_twb.powerbi_publisher import publish_rdl_if_configured
 from src.qlik_to_twb.metadata_pipeline import run_qlik_metadata_job, run_uploaded_qlik_metadata_job
 from src.qlik_to_twb.pipeline import run_qlik_to_twb
 from sql_model_assistant_app import (
@@ -126,6 +127,8 @@ def _initial_app_state() -> dict[str, Any]:
         "visual_model_twb_error": "",
         "visual_model_source_path": "",
         "publish_context": {},
+        "powerbi_publish_report": {},
+        "powerbi_publish_error": "",
         "publish_report": {},
         "publish_error": "",
         "consumer_workbook_path": "",
@@ -228,6 +231,32 @@ def _resolve_config_path_value(path_value: str | Path | None = None) -> Path:
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path.resolve()
+
+
+def _load_json_config_payload(path_value: str | Path | None = None) -> dict[str, Any]:
+    config_path = _resolve_config_path_value(path_value)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _powerbi_service_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    payload = _load_json_config_payload(config_path)
+    for key in ["powerbi_service", "power_bi_service", "powerbi", "power_bi"]:
+        candidate = payload.get(key) if isinstance(payload, dict) else None
+        if isinstance(candidate, dict):
+            return dict(candidate)
+    return {}
+
+
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+    return bool(value)
 
 
 def _file_payload(path_value: str) -> dict[str, Any]:
@@ -396,6 +425,8 @@ def _write_artifact_manifest(stage: str) -> None:
         "data_model_twb_to_publish": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
         "final_workbook_visual_source": _file_payload(str(APP_STATE.get("visual_model_source_path") or "")),
         "data_model_with_mapped_visuals_twb": _file_payload(str(APP_STATE.get("visual_model_twb_path") or "")),
+        "powerbi_publish_report": _artifact_file_payload(PUBLISH_DIR_NAME, "powerbi_publish_report.json"),
+        "tableau_publish_report": _artifact_file_payload(PUBLISH_DIR_NAME, "publish_report.json"),
         "consumer_workbook": _consumer_workbook_payload(),
     }
     if _debug_artifacts_enabled():
@@ -467,6 +498,57 @@ def _write_input_artifacts(file_name: str, content: str, report: dict[str, Any])
     selected_sql = str(APP_STATE.get("sql_query") or "").strip()
     if selected_sql:
         (input_dir / "selected_dataset.sql").write_text(selected_sql, encoding="utf-8")
+
+
+def _source_rdl_artifact_path_for_publish() -> Path:
+    file_name = str(APP_STATE.get("report_name") or "uploaded_report.rdl")
+    artifact_root = _artifact_run_dir(create=False)
+    if artifact_root is not None:
+        candidate = artifact_root / INPUT_DIR_NAME / _safe_artifact_file_name(file_name, "uploaded_report.rdl")
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    content = str(APP_STATE.get("rdl_content") or "")
+    if not content.strip():
+        raise ValueError("RDL source content is missing. Upload the RDL before publishing.")
+    input_dir = _artifact_subdir(INPUT_DIR_NAME, create=True)
+    fallback_path = input_dir / _safe_artifact_file_name(file_name, "uploaded_report.rdl")
+    fallback_path.write_text(content, encoding="utf-8")
+    return fallback_path
+
+
+def _publish_powerbi_source_rdl(config_path: str | Path, timestamp_utc: str) -> dict[str, Any]:
+    powerbi_config = _powerbi_service_config(config_path)
+    try:
+        report = publish_rdl_if_configured(
+            rdl_path=_source_rdl_artifact_path_for_publish(),
+            powerbi_config=powerbi_config,
+            timestamp_utc=timestamp_utc,
+            report_name=str(APP_STATE.get("report_name") or ""),
+        )
+    except Exception as exc:
+        report = {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "timestamp_utc": timestamp_utc,
+        }
+
+    APP_STATE["powerbi_publish_report"] = report
+    APP_STATE["powerbi_publish_error"] = (
+        str(report.get("error") or report.get("reason") or "")
+        if str(report.get("status") or "").lower() == "failed"
+        else ""
+    )
+
+    if (
+        str(report.get("status") or "").lower() == "failed"
+        and isinstance(powerbi_config, dict)
+        and _truthy_config_value(powerbi_config.get("fail_on_error", False))
+    ):
+        raise RuntimeError(APP_STATE["powerbi_publish_error"] or "Power BI Service RDL publish failed.")
+
+    return report
 
 
 def _write_data_verification_artifacts(stage: str) -> None:
@@ -589,16 +671,24 @@ def _write_final_workbook_generation_report(
 
 def _write_publish_artifacts(stage: str) -> None:
     publish_dir = _artifact_subdir(PUBLISH_DIR_NAME, create=True)
-    if _debug_artifacts_enabled():
-        _write_json_artifact(
-            publish_dir / "publish_report.json",
-            {
-                "stage": stage,
-                "updated_at": _timestamp_token(),
-                "publish_report": APP_STATE.get("publish_report", {}),
-                "publish_error": APP_STATE.get("publish_error", ""),
-            },
-        )
+    payload = {
+        "stage": stage,
+        "updated_at": _timestamp_token(),
+        "powerbi_publish_report": APP_STATE.get("powerbi_publish_report", {}),
+        "powerbi_publish_error": APP_STATE.get("powerbi_publish_error", ""),
+        "tableau_publish_report": APP_STATE.get("publish_report", {}),
+        "tableau_publish_error": APP_STATE.get("publish_error", ""),
+    }
+    _write_json_artifact(publish_dir / "publish_report.json", payload)
+    _write_json_artifact(
+        publish_dir / "powerbi_publish_report.json",
+        {
+            "stage": stage,
+            "updated_at": payload["updated_at"],
+            "publish_report": APP_STATE.get("powerbi_publish_report", {}),
+            "publish_error": APP_STATE.get("powerbi_publish_error", ""),
+        },
+    )
     consumer_path = _consumer_workbook_path_value()
     copied_consumer = _copy_artifact_to_dir(consumer_path, publish_dir)
     if copied_consumer:
@@ -1941,6 +2031,12 @@ def _apply_relationship_operation(payload: dict[str, Any]) -> dict[str, Any]:
         APP_STATE["validated_model"] = {}
         APP_STATE["generated_twb_path"] = ""
         _clear_visual_conversion_state(cancel_running=True)
+        APP_STATE["powerbi_publish_report"] = {}
+        APP_STATE["powerbi_publish_error"] = ""
+        APP_STATE["publish_report"] = {}
+        APP_STATE["publish_error"] = ""
+        APP_STATE["consumer_workbook_path"] = ""
+        APP_STATE["quality_comparison"] = {}
         _write_data_verification_artifacts("relationship_operation_applied")
         _write_semantic_model_artifacts("relationship_operation_applied")
         _write_artifact_manifest("relationship_operation_applied")
@@ -1967,7 +2063,7 @@ def _tableau_defaults_payload() -> dict[str, Any]:
         "source_datasource_name": str(defaults.get("source_datasource_name") or ""),
         "empty_workbook_template_path": str(defaults.get("empty_workbook_template_path") or ""),
         "visual_source_twb_path": str(defaults.get("visual_source_twb_path") or ""),
-        "datasource_publish_mode": str(defaults.get("datasource_publish_mode") or ""),
+        "datasource_publish_mode": "live_tds",
         "auth_method": str(defaults.get("auth_method") or "username_password"),
         "username": str(defaults.get("username") or ""),
         "pat_name": str(defaults.get("pat_name") or ""),
@@ -2118,6 +2214,8 @@ def _state_snapshot() -> dict[str, Any]:
         "visual_model_twb": _visual_model_twb_payload(),
         "generated_twb_name": APP_STATE.get("generated_twb_name", DATA_MODEL_TWB_NAME),
         "publish_context_summary": _publish_context_summary(),
+        "powerbi_publish_report": APP_STATE.get("powerbi_publish_report", {}),
+        "powerbi_publish_error": APP_STATE.get("powerbi_publish_error", ""),
         "publish_report": APP_STATE.get("publish_report", {}),
         "publish_error": APP_STATE.get("publish_error", ""),
         "consumer_workbook": _consumer_workbook_payload(),
@@ -2177,6 +2275,8 @@ def _parse_rdl(payload: dict[str, Any]) -> dict[str, Any]:
             "visual_model_twb_error": "",
             "visual_model_source_path": "",
             "publish_context": {},
+            "powerbi_publish_report": {},
+            "powerbi_publish_error": "",
             "publish_report": {},
             "publish_error": "",
             "consumer_workbook_path": "",
@@ -2214,6 +2314,8 @@ def _select_dataset(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
     _clear_visual_conversion_state(cancel_running=True)
     APP_STATE["publish_context"] = {}
+    APP_STATE["powerbi_publish_report"] = {}
+    APP_STATE["powerbi_publish_error"] = ""
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
@@ -2268,6 +2370,8 @@ def _analyze_model(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
     _clear_visual_conversion_state(cancel_running=True)
     APP_STATE["publish_context"] = {}
+    APP_STATE["powerbi_publish_report"] = {}
+    APP_STATE["powerbi_publish_error"] = ""
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
@@ -2317,6 +2421,8 @@ def _map_visual_content(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["generated_twb_path"] = ""
     APP_STATE["generated_twb_name"] = DATA_MODEL_TWB_NAME
     APP_STATE["publish_context"] = {}
+    APP_STATE["powerbi_publish_report"] = {}
+    APP_STATE["powerbi_publish_error"] = ""
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
@@ -2369,6 +2475,8 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["generated_twb_path"] = str(output_path)
     APP_STATE["generated_twb_name"] = output_name
     APP_STATE["publish_context"] = publish_context
+    APP_STATE["powerbi_publish_report"] = {}
+    APP_STATE["powerbi_publish_error"] = ""
     APP_STATE["publish_report"] = {}
     APP_STATE["publish_error"] = ""
     APP_STATE["consumer_workbook_path"] = ""
@@ -2379,10 +2487,43 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     return _state_snapshot()
 
 
-def _configure_tableau_publish_artifact_paths() -> None:
+def _tableau_final_workbook_path_for_publish() -> Path:
+    final_path_value = str(APP_STATE.get("visual_model_twb_path") or "").strip()
+    if not final_path_value:
+        error = str(APP_STATE.get("visual_model_twb_error") or "").strip()
+        detail = f" Last generation error: {error}" if error else ""
+        raise ValueError(
+            "Generate the final Tableau workbook with mapped visuals before publishing "
+            f"({FINAL_WORKBOOK_TWB_NAME}).{detail}"
+        )
+
+    final_path = Path(final_path_value)
+    if not final_path.is_absolute():
+        final_path = PROJECT_ROOT / final_path
+    try:
+        final_path = final_path.resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError(f"Final Tableau workbook not found: {final_path}") from exc
+    if final_path.suffix.lower() != ".twb":
+        raise ValueError(f"Final Tableau workbook must be a .twb file: {final_path}")
+    return final_path
+
+
+def _tableau_live_publish_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    forced = dict(overrides) if isinstance(overrides, dict) else {}
+    forced["datasource_publish_mode"] = "live_tds"
+    forced["build_hyper_extract"] = False
+    return forced
+
+
+def _configure_tableau_publish_artifact_paths(publish_workbook_path: Path | None = None) -> None:
     publish_dir = _artifact_subdir(PUBLISH_DIR_NAME, create=True)
-    generated_name = _safe_output_twb_name(str(APP_STATE.get("generated_twb_name") or DATA_MODEL_TWB_NAME))
-    consumer_name = f"{Path(generated_name).stem}_consumer_final.twb"
+    generated_name = (
+        _safe_output_twb_name(publish_workbook_path.name)
+        if publish_workbook_path is not None
+        else _safe_output_twb_name(str(APP_STATE.get("generated_twb_name") or DATA_MODEL_TWB_NAME))
+    )
+    consumer_name = f"{Path(generated_name).stem}_consumer_final.twbx"
     st.session_state.sql_model_assistant_tableau_publish_artifact_dir = str(publish_dir / "artifacts")
     st.session_state.sql_model_assistant_tableau_publish_work_dir = str(publish_dir / "work")
     st.session_state.sql_model_assistant_tableau_consumer_output_path = str(publish_dir / consumer_name)
@@ -2434,15 +2575,20 @@ def _configure_streamlit_publish_state(config_path: str, overrides: dict[str, An
 
 
 def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
-    generated_path = str(APP_STATE.get("generated_twb_path") or "")
-    if not generated_path:
-        raise ValueError("Generate the TWB before publishing.")
+    final_workbook_path = _tableau_final_workbook_path_for_publish()
     config_path = str(_resolve_config_path_value(payload.get("config_path")))
-    overrides = payload.get("tableau", {})
-    _configure_streamlit_publish_state(config_path, overrides if isinstance(overrides, dict) else {})
-    _configure_tableau_publish_artifact_paths()
+    timestamp_utc = _timestamp_token()
+    overrides = _tableau_live_publish_overrides(payload.get("tableau", {}))
     try:
-        report = _run_tableau_cloud_publish_workflow(Path(generated_path))
+        powerbi_report = _publish_powerbi_source_rdl(config_path, timestamp_utc)
+        _configure_streamlit_publish_state(config_path, overrides)
+        _configure_tableau_publish_artifact_paths(final_workbook_path)
+        report = _run_tableau_cloud_publish_workflow(final_workbook_path, timestamp_utc=timestamp_utc)
+        report["source_rdl_powerbi_publish"] = powerbi_report
+        report["source_rdl_publish_status"] = str(powerbi_report.get("status") or "")
+        report["published_final_workbook_path"] = str(final_workbook_path)
+        report["published_final_workbook_name"] = final_workbook_path.name
+        report["datasource_publish_mode"] = "live_tds"
         APP_STATE["publish_report"] = report
         APP_STATE["publish_error"] = ""
         APP_STATE["consumer_workbook_path"] = str(report.get("consumer_workbook_path") or "")
@@ -2450,8 +2596,19 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
         _write_publish_artifacts("published_to_tableau")
         _write_artifact_manifest("published_to_tableau")
     except Exception as exc:
-        APP_STATE["publish_report"] = {}
-        APP_STATE["publish_error"] = _tableau_format_user_publish_failure(exc)
+        APP_STATE["publish_report"] = {
+            "status": "failed",
+            "timestamp_utc": timestamp_utc,
+            "source_rdl_powerbi_publish": APP_STATE.get("powerbi_publish_report", {}),
+            "published_final_workbook_path": str(final_workbook_path),
+            "datasource_publish_mode": "live_tds",
+        }
+        error_text = str(exc or "").strip()
+        APP_STATE["publish_error"] = (
+            error_text
+            if error_text.lower().startswith("power bi")
+            else _tableau_format_user_publish_failure(exc)
+        )
         APP_STATE["consumer_workbook_path"] = ""
         APP_STATE["quality_comparison"] = {}
         _write_publish_artifacts("tableau_publish_failed")
