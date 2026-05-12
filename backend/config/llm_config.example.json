@@ -47,7 +47,7 @@
     "desktop_rpa_launch_settle_seconds": 4
   },
   "powerbi_service": {
-    "enabled": false,
+    "enabled": true,
     "workspace_id": "env:POWERBI_WORKSPACE_ID",
     "tenant_id": "env:POWERBI_TENANT_ID",
     "client_id": "env:POWERBI_CLIENT_ID",

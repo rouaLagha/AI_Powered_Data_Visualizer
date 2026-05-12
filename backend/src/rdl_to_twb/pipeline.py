@@ -19,6 +19,8 @@ from .tableau_extract import (
     rewrite_workbook_for_hyper,
 )
 from .tableau_publisher import publish_workbook_if_configured
+from .powerbi_publisher import publish_rdl_if_configured
+from datetime import datetime, timezone
 from .twb_builder import (
     inject_datasource_connections,
     inject_semantic_bindings,
@@ -438,14 +440,47 @@ def run_conversion(
             "workbook_path": str(publish_input_path),
         }
 
+    # Power BI publish (publish source RDL to My Workspace if configured)
+    powerbi_cfg = cfg.get("powerbi_service") if isinstance(cfg, dict) else None
+    powerbi_publish_report: dict = {"status": "skipped", "reason": "powerbi_service publishing is disabled"}
+    if isinstance(powerbi_cfg, dict) and bool(powerbi_cfg.get("enabled", False)):
+        timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        try:
+            powerbi_publish_report = publish_rdl_if_configured(
+                rdl_path=rdl_path,
+                powerbi_config=powerbi_cfg,
+                timestamp_utc=timestamp_utc,
+                report_name=str(parsed_payload.get("report_name") or ""),
+            )
+            status = str(powerbi_publish_report.get("status") or "").lower()
+            if status == "published":
+                pipeline_trace.append("Power BI publish succeeded")
+            elif status == "skipped":
+                pipeline_trace.append("Power BI publish skipped")
+            else:
+                pipeline_trace.append(f"Power BI publish status: {powerbi_publish_report.get('status')}")
+        except Exception as exc:
+            powerbi_publish_report = {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            pipeline_trace.append(f"Power BI publish failed ({type(exc).__name__}: {exc})")
+
     if write_debug_artifacts:
         _write_json(output_dir / "tableau_extract_report.json", tableau_extract_report)
         _write_json(output_dir / "tableau_publish_report.json", tableau_publish_report)
         _write_json(output_dir / "tableau_rpa_publish_report.json", tableau_rpa_report)
+        # Power BI publish report (if attempted)
+        try:
+            _write_json(output_dir / "powerbi_publish_report.json", powerbi_publish_report)
+        except Exception:
+            pass
         _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
 
     result = {
         "twb": str(twb_path),
+        "powerbi_publish_report_data": powerbi_publish_report,
         "trace_steps": pipeline_trace,
         "validation_issues": issues,
         "tableau_extract_report_data": tableau_extract_report,
@@ -468,6 +503,7 @@ def run_conversion(
                 "tableau_extract_report": str(output_dir / "tableau_extract_report.json"),
                 "tableau_publish_report": str(output_dir / "tableau_publish_report.json"),
                 "tableau_rpa_publish_report": str(output_dir / "tableau_rpa_publish_report.json"),
+                "powerbi_publish_report": str(output_dir / "powerbi_publish_report.json"),
                 "pipeline_trace": str(output_dir / "pipeline_trace.json"),
             }
         )

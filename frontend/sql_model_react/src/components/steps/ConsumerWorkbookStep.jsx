@@ -11,7 +11,7 @@ export default function ConsumerWorkbookStep({
   onStartNew,
 }) {
   return (
-    <Card title="11. Final workbook" eyebrow="Consumer artifact" className="consumer-workbook-card">
+    <Card title="11. Connected workbook" eyebrow="Download artifact" className="consumer-workbook-card">
       {consumerWorkbook.generated ? (
         <div className="consumer-success">
           <Badge tone="green">Workbook ready</Badge>
@@ -21,7 +21,7 @@ export default function ConsumerWorkbookStep({
           </div>
         </div>
       ) : (
-        <div className="empty-state">Complete publication, then check the generated workbook artifact.</div>
+        <div className="empty-state">Complete publication, then check the generated connected workbook artifact.</div>
       )}
 
       <div className="button-row">

@@ -18,15 +18,17 @@ def generate_twb_xml(
     mapping: dict,
     twb_xsd_summary: dict,
     output_xml_path: str | Path,
+    write_artifact: bool = True,
 ) -> str:
     prompt = build_xml_user_prompt(data_model, visual_model, mapping, twb_xsd_summary)
     raw_response = llm.chat(XML_SYSTEM_PROMPT, prompt)
     raw_xml = _extract_workbook_xml(raw_response)
     _validate_workbook_xml(raw_xml)
 
-    output_xml_path = Path(output_xml_path)
-    output_xml_path.parent.mkdir(parents=True, exist_ok=True)
-    output_xml_path.write_text(raw_xml, encoding="utf-8")
+    if write_artifact:
+        output_xml_path = Path(output_xml_path)
+        output_xml_path.parent.mkdir(parents=True, exist_ok=True)
+        output_xml_path.write_text(raw_xml, encoding="utf-8")
 
     return raw_xml
 

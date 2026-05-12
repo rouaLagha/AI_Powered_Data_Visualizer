@@ -18,6 +18,7 @@ def generate_semantic_models(
     rdl_xsd_summary: dict,
     twb_xsd_summary: dict,
     output_dir: str | Path,
+    write_artifacts: bool = True,
 ) -> tuple[dict, dict, dict]:
     prompt = build_semantic_user_prompt(parsed_rdl, rdl_xsd_summary, twb_xsd_summary)
     raw = ""
@@ -42,39 +43,40 @@ def generate_semantic_models(
     visual_model = payload["visual_model"]
     mapping = payload["mapping"]
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if write_artifacts:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    (output_dir / "agent1_raw_response.txt").write_text(raw, encoding="utf-8")
-    (output_dir / "semantic_generation_report.json").write_text(
-        json.dumps(
-            {
-                "llm_error": llm_error,
-                "fallback_used": fallback_used,
-                "llm_payload_non_empty": {
-                    "data_model": _has_data_model_content(normalized_payload["data_model"]),
-                    "visual_model": _has_visual_model_content(normalized_payload["visual_model"]),
-                    "mapping": _has_mapping_content(normalized_payload["mapping"]),
+        (output_dir / "agent1_raw_response.txt").write_text(raw, encoding="utf-8")
+        (output_dir / "semantic_generation_report.json").write_text(
+            json.dumps(
+                {
+                    "llm_error": llm_error,
+                    "fallback_used": fallback_used,
+                    "llm_payload_non_empty": {
+                        "data_model": _has_data_model_content(normalized_payload["data_model"]),
+                        "visual_model": _has_visual_model_content(normalized_payload["visual_model"]),
+                        "mapping": _has_mapping_content(normalized_payload["mapping"]),
+                    },
                 },
-            },
-            indent=2,
-            ensure_ascii=True,
-        ),
-        encoding="utf-8",
-    )
+                indent=2,
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
 
-    (output_dir / "data_model.json").write_text(
-        json.dumps(data_model, indent=2, ensure_ascii=True), encoding="utf-8"
-    )
-    (output_dir / "visual_model.json").write_text(
-        json.dumps(visual_model, indent=2, ensure_ascii=True), encoding="utf-8"
-    )
-    (output_dir / "mapping.json").write_text(
-        json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
-    )
-    (output_dir / "mapping_model.json").write_text(
-        json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
-    )
+        (output_dir / "data_model.json").write_text(
+            json.dumps(data_model, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
+        (output_dir / "visual_model.json").write_text(
+            json.dumps(visual_model, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
+        (output_dir / "mapping.json").write_text(
+            json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
+        (output_dir / "mapping_model.json").write_text(
+            json.dumps(mapping, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
 
     return data_model, visual_model, mapping
 

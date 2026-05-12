@@ -8451,11 +8451,16 @@ def _run_tableau_cloud_publish_workflow(
 
     timestamp_utc = timestamp_utc or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     datasource_name = _tableau_timestamped_name("validated_semantic_model", timestamp_utc)
-    workbook_name = _tableau_timestamped_name(f"{generated_twb_path.stem}_consumer", timestamp_utc)
+    workbook_name = _tableau_timestamped_name(generated_twb_path.stem, timestamp_utc)
+    consumer_workbook_name = _tableau_timestamped_name(
+        f"{generated_twb_path.stem}_connected_to_published_datasource",
+        timestamp_utc,
+    )
     extract_report: dict[str, Any] | None = None
     workbook_extract_report: dict[str, Any] = {}
     saved_publish_artifacts: dict[str, str] = {}
     linked_workbook_artifact = ""
+    extract_workbook_artifact = ""
     consumer_workbook_path = ""
     datasource_project_id = ""
     workbook_project_id = ""
@@ -8592,21 +8597,24 @@ def _run_tableau_cloud_publish_workflow(
                         f"Error: {datasource_publish_exc}.{debug_detail}"
                     ) from datasource_publish_exc
 
-            workbook_publish_path, workbook_extract_report = _build_extract_workbook_package_for_publish(
+            linked_workbook_path = tmp_dir / f"{_tableau_safe_name(consumer_workbook_name)}.twb"
+            _build_linked_workbook_for_published_datasource(
                 source_twb_path=generated_twb_path,
-                output_dir=tmp_dir,
-                workbook_name=workbook_name,
-                hyper_max_rows_per_table=hyper_max_rows_per_table or None,
+                output_twb_path=linked_workbook_path,
+                published_datasource=published_datasource,
+                server_url=server_url,
+                site_content_url=site_content_url,
+                source_datasource_name=linked_workbook_source_datasource_name,
             )
 
             linked_workbook_artifact = _tableau_copy_publish_artifact(
-                source_path=workbook_publish_path,
+                source_path=linked_workbook_path,
                 timestamp_utc=timestamp_utc,
-                label="extract_workbook_twbx_for_tableau_cloud",
+                label="consumer_workbook_linked_to_published_datasource",
             )
             if linked_workbook_artifact:
                 saved_publish_artifacts["linked_workbook"] = linked_workbook_artifact
-                saved_publish_artifacts["extract_workbook"] = linked_workbook_artifact
+                saved_publish_artifacts["consumer_workbook"] = linked_workbook_artifact
 
             consumer_output_override = str(
                 getattr(st.session_state, "sql_model_assistant_tableau_consumer_output_path", "") or ""
@@ -8614,13 +8622,29 @@ def _run_tableau_cloud_publish_workflow(
             consumer_output_path = (
                 Path(consumer_output_override).expanduser()
                 if consumer_output_override
-                else OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final{workbook_publish_path.suffix}"
+                else OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final.twb"
             )
-            if consumer_output_path.suffix.lower() != workbook_publish_path.suffix.lower():
-                consumer_output_path = consumer_output_path.with_suffix(workbook_publish_path.suffix)
+            if consumer_output_path.suffix.lower() != linked_workbook_path.suffix.lower():
+                consumer_output_path = consumer_output_path.with_suffix(linked_workbook_path.suffix)
             consumer_output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(workbook_publish_path, consumer_output_path)
+            shutil.copy2(linked_workbook_path, consumer_output_path)
             consumer_workbook_path = str(consumer_output_path)
+
+            workbook_publish_path, workbook_extract_report = _build_extract_workbook_package_for_publish(
+                source_twb_path=generated_twb_path,
+                output_dir=tmp_dir,
+                workbook_name=workbook_name,
+                hyper_max_rows_per_table=hyper_max_rows_per_table or None,
+            )
+
+            extract_workbook_artifact = _tableau_copy_publish_artifact(
+                source_path=workbook_publish_path,
+                timestamp_utc=timestamp_utc,
+                label="extract_workbook_twbx_for_tableau_cloud",
+            )
+            if extract_workbook_artifact:
+                saved_publish_artifacts["extract_workbook"] = extract_workbook_artifact
+                saved_publish_artifacts["published_workbook_package"] = extract_workbook_artifact
 
             published_workbook = None
             workbook_publish_status = "pending"
@@ -8670,7 +8694,8 @@ def _run_tableau_cloud_publish_workflow(
         overall_status = "datasource_published_workbook_publish_forbidden"
     publish_message = (
         "Tableau Cloud publish completed: "
-        f"datasource in '{datasource_project_name}' and final workbook in '{workbook_project_name}'."
+        f"datasource in '{datasource_project_name}' and final workbook in '{workbook_project_name}'. "
+        "A connected consumer workbook was generated for download and was not published."
     )
     if workbook_publish_status == "forbidden":
         publish_message = (
@@ -8697,7 +8722,10 @@ def _run_tableau_cloud_publish_workflow(
         "workbook_publish_error": workbook_publish_error,
         "workbook_publish_attempted": True,
         "workbook_publish_mode": "extract_twbx",
+        "consumer_workbook_publish_status": "not_published",
+        "consumer_workbook_publish_attempted": False,
         "linked_workbook_artifact": linked_workbook_artifact,
+        "extract_workbook_artifact": extract_workbook_artifact,
         "consumer_workbook_path": consumer_workbook_path,
         "extract_report": extract_report or {},
         "workbook_extract_report": workbook_extract_report,

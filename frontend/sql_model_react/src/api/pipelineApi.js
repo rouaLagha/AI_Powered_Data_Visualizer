@@ -61,8 +61,8 @@ export const pipelineDefinitions = [
   },
   {
     id: "consumer-workbook",
-    title: "Workbook",
-    description: "Create the workbook connected to the published datasource.",
+    title: "Connected workbook",
+    description: "Create the downloadable workbook connected to the published datasource.",
   },
   {
     id: "quality-comparison",

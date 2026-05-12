@@ -11,7 +11,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
   const modeLabel = datasourceConfig.connectionType === "extract" ? "Extract" : "Live TDS";
   const datasourceName = datasourceConfig.sourceDatasourceName || datasourceConfig.name || "Datasource";
   const statusTitle = isPublished
-    ? "Datasource and workbook published"
+    ? "RDL, datasource and final workbook published"
     : isPartial
       ? "Workbook publish needs attention"
       : isError
@@ -25,7 +25,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
         <div className="publication-status-copy">
           <Badge tone={isPublished ? "green" : isError ? "red" : "indigo"}>{publicationResult.status || "pending"}</Badge>
           <h3>{statusTitle}</h3>
-          <p>{publicationResult.message || "Publish the prepared datasource package to Tableau Cloud."}</p>
+          <p>{publicationResult.message || "Publish the source RDL, prepared datasource, and final workbook."}</p>
         </div>
         <Button variant="primary" onClick={onPublish}>
           {isPublished ? "Publish again" : "Publish source and workbook"}
@@ -53,7 +53,7 @@ export default function PublicationStep({ datasourceConfig, publicationResult, o
 
       {isPublished && (
         <div className="publication-result-card">
-          <h3>Published artifact</h3>
+          <h3>Published artifacts</h3>
           <div className="published-details">
             <div><span>Datasource URL</span><a href={publicationResult.url || "#"}>{publicationResult.url || "Returned by Tableau"}</a></div>
             <div><span>Datasource ID</span><code>{publicationResult.id || "Returned by Tableau"}</code></div>

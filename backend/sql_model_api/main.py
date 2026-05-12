@@ -517,7 +517,11 @@ def _source_rdl_artifact_path_for_publish() -> Path:
     return fallback_path
 
 
-def _publish_powerbi_source_rdl(config_path: str | Path, timestamp_utc: str) -> dict[str, Any]:
+def _publish_powerbi_source_rdl(
+    config_path: str | Path,
+    timestamp_utc: str,
+    require_publish: bool = False,
+) -> dict[str, Any]:
     powerbi_config = _powerbi_service_config(config_path)
     try:
         report = publish_rdl_if_configured(
@@ -537,9 +541,18 @@ def _publish_powerbi_source_rdl(config_path: str | Path, timestamp_utc: str) -> 
     APP_STATE["powerbi_publish_report"] = report
     APP_STATE["powerbi_publish_error"] = (
         str(report.get("error") or report.get("reason") or "")
-        if str(report.get("status") or "").lower() == "failed"
+        if str(report.get("status") or "").lower() in {"failed", "skipped"}
         else ""
     )
+
+    if require_publish and str(report.get("status") or "").lower() != "published":
+        detail = (
+            APP_STATE["powerbi_publish_error"]
+            or "Enable powerbi_service and provide credentials."
+        )
+        raise RuntimeError(
+            f"Power BI Service RDL publish did not complete: {detail}"
+        )
 
     if (
         str(report.get("status") or "").lower() == "failed"
@@ -2523,7 +2536,7 @@ def _configure_tableau_publish_artifact_paths(publish_workbook_path: Path | None
         if publish_workbook_path is not None
         else _safe_output_twb_name(str(APP_STATE.get("generated_twb_name") or DATA_MODEL_TWB_NAME))
     )
-    consumer_name = f"{Path(generated_name).stem}_consumer_final.twbx"
+    consumer_name = f"{Path(generated_name).stem}_connected_to_published_datasource.twb"
     st.session_state.sql_model_assistant_tableau_publish_artifact_dir = str(publish_dir / "artifacts")
     st.session_state.sql_model_assistant_tableau_publish_work_dir = str(publish_dir / "work")
     st.session_state.sql_model_assistant_tableau_consumer_output_path = str(publish_dir / consumer_name)
@@ -2580,7 +2593,7 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
     timestamp_utc = _timestamp_token()
     overrides = _tableau_live_publish_overrides(payload.get("tableau", {}))
     try:
-        powerbi_report = _publish_powerbi_source_rdl(config_path, timestamp_utc)
+        powerbi_report = _publish_powerbi_source_rdl(config_path, timestamp_utc, require_publish=True)
         _configure_streamlit_publish_state(config_path, overrides)
         _configure_tableau_publish_artifact_paths(final_workbook_path)
         report = _run_tableau_cloud_publish_workflow(final_workbook_path, timestamp_utc=timestamp_utc)
