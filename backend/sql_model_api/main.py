@@ -55,7 +55,6 @@ from sql_model_assistant_app import (
     _find_dataset_by_name,
     _find_datasource_for_dataset,
     _generate_response,
-    _generate_twb_from_validated_model,
     _load_tableau_publish_defaults,
     _load_template_xml,
     _pick_default_dataset_name,
@@ -83,7 +82,7 @@ REGIONALSALES_VISUAL_TEMPLATE_NAME = "converted_report_perfect.twb"
 INPUT_DIR_NAME = "00_input_report"
 DATA_VERIFICATION_DIR_NAME = "01_data_verification"
 SEMANTIC_MODEL_DIR_NAME = "02_semantic_model"
-CONVERSION_DIR_NAME = "03_conversion_and_visual_mapping"
+VISUAL_MAPPING_DIR_NAME = "03_visual_mapping"
 DATA_MODEL_DIR_NAME = "04_data_model_to_publish"
 FINAL_WORKBOOK_DIR_NAME = "05_final_workbook_with_visuals"
 PUBLISH_DIR_NAME = "06_tableau_publish"
@@ -365,7 +364,7 @@ def _artifact_workspace_payload() -> dict[str, Any]:
             "input_report": _directory_payload(str(run_dir / INPUT_DIR_NAME)),
             "data_verification": _directory_payload(str(run_dir / DATA_VERIFICATION_DIR_NAME)),
             "semantic_model": _directory_payload(str(run_dir / SEMANTIC_MODEL_DIR_NAME)),
-            "conversion_and_visual_mapping": _directory_payload(str(run_dir / CONVERSION_DIR_NAME)),
+            "visual_mapping": _directory_payload(str(run_dir / VISUAL_MAPPING_DIR_NAME)),
             "data_model_to_publish": _directory_payload(str(run_dir / DATA_MODEL_DIR_NAME)),
             "final_workbook_with_visuals": _directory_payload(str(run_dir / FINAL_WORKBOOK_DIR_NAME)),
             "tableau_publish": _directory_payload(str(run_dir / PUBLISH_DIR_NAME)),
@@ -387,6 +386,40 @@ def _write_artifact_manifest(stage: str) -> None:
         return
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     run_dir = _artifact_run_dir(create=False)
+    artifacts = {
+        "input_rdl": _artifact_file_payload(
+            INPUT_DIR_NAME,
+            _safe_artifact_file_name(str(APP_STATE.get("report_name") or "uploaded_report.rdl"), "uploaded_report.rdl"),
+        ),
+        "selected_dataset_sql": _artifact_file_payload(INPUT_DIR_NAME, "selected_dataset.sql"),
+        "visual_content_mapping_twb": _file_payload(str(APP_STATE.get("visual_conversion_path") or "")),
+        "data_model_twb_to_publish": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
+        "final_workbook_visual_source": _file_payload(str(APP_STATE.get("visual_model_source_path") or "")),
+        "data_model_with_mapped_visuals_twb": _file_payload(str(APP_STATE.get("visual_model_twb_path") or "")),
+        "consumer_workbook": _consumer_workbook_payload(),
+    }
+    if _debug_artifacts_enabled():
+        artifacts.update(
+            {
+                "parsed_report": _artifact_file_payload(INPUT_DIR_NAME, "parsed_report.json"),
+                "data_verification_summary": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "data_verification_summary.json"),
+                "datasource_inventory": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "datasource_inventory.json"),
+                "latest_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "latest_semantic_model.json"),
+                "validated_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "validated_semantic_model.json"),
+                "data_model_template_twb": _file_payload(str(APP_STATE.get("data_model_template_path") or "")),
+                "data_model_template_copy": _artifact_file_payload(DATA_MODEL_DIR_NAME, "source_template_used.twb"),
+                "final_workbook_visual_source_copy": _artifact_file_payload(FINAL_WORKBOOK_DIR_NAME, "visual_source_used.twb"),
+                "data_model_generation_report": _artifact_file_payload(DATA_MODEL_DIR_NAME, "data_model_generation_report.json"),
+                "visual_mapping_trace": _artifact_file_payload(VISUAL_MAPPING_DIR_NAME, "pipeline_trace.json"),
+                "visual_mapping_validation_report": _artifact_file_payload(VISUAL_MAPPING_DIR_NAME, "validation_report.json"),
+                "final_workbook_generation_report": _artifact_file_payload(
+                    FINAL_WORKBOOK_DIR_NAME,
+                    "final_workbook_generation_report.json",
+                ),
+                "tableau_publish_report": _artifact_file_payload(PUBLISH_DIR_NAME, "publish_report.json"),
+                "quality_comparison": _artifact_file_payload(QUALITY_DIR_NAME, "quality_comparison.json"),
+            }
+        )
     payload = {
         "stage": stage,
         "updated_at": _timestamp_token(),
@@ -394,42 +427,12 @@ def _write_artifact_manifest(stage: str) -> None:
         "selected_dataset_name": str(APP_STATE.get("selected_dataset_name") or ""),
         "selected_datasource_name": str(APP_STATE.get("selected_datasource_name") or ""),
         "artifact_root": str(run_dir or ""),
-        "artifacts": {
-            "input_rdl": _artifact_file_payload(
-                INPUT_DIR_NAME,
-                _safe_artifact_file_name(str(APP_STATE.get("report_name") or "uploaded_report.rdl"), "uploaded_report.rdl"),
-            ),
-            "parsed_report": _artifact_file_payload(INPUT_DIR_NAME, "parsed_report.json"),
-            "selected_dataset_sql": _artifact_file_payload(INPUT_DIR_NAME, "selected_dataset.sql"),
-            "data_verification_summary": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "data_verification_summary.json"),
-            "datasource_inventory": _artifact_file_payload(DATA_VERIFICATION_DIR_NAME, "datasource_inventory.json"),
-            "latest_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "latest_semantic_model.json"),
-            "validated_semantic_model": _artifact_file_payload(SEMANTIC_MODEL_DIR_NAME, "validated_semantic_model.json"),
-            "data_model_template_twb": _file_payload(str(APP_STATE.get("data_model_template_path") or "")),
-            "data_model_template_copy": _artifact_file_payload(DATA_MODEL_DIR_NAME, "source_template_used.twb"),
-            "data_model_generation_report": _artifact_file_payload(DATA_MODEL_DIR_NAME, "data_model_generation_report.json"),
-            "conversion_trace": _artifact_file_payload(CONVERSION_DIR_NAME, "pipeline_trace.json"),
-            "conversion_validation_report": _artifact_file_payload(CONVERSION_DIR_NAME, "validation_report.json"),
-            "visual_content_mapping_twb": _file_payload(str(APP_STATE.get("visual_conversion_path") or "")),
-            "data_model_twb_to_publish": _file_payload(str(APP_STATE.get("generated_twb_path") or "")),
-            "final_workbook_visual_source": _file_payload(str(APP_STATE.get("visual_model_source_path") or "")),
-            "final_workbook_visual_source_copy": _artifact_file_payload(FINAL_WORKBOOK_DIR_NAME, "visual_source_used.twb"),
-            "data_model_with_mapped_visuals_twb": _file_payload(
-                str(APP_STATE.get("visual_model_twb_path") or "")
-            ),
-            "final_workbook_generation_report": _artifact_file_payload(
-                FINAL_WORKBOOK_DIR_NAME,
-                "final_workbook_generation_report.json",
-            ),
-            "tableau_publish_report": _artifact_file_payload(PUBLISH_DIR_NAME, "publish_report.json"),
-            "consumer_workbook": _consumer_workbook_payload(),
-            "quality_comparison": _artifact_file_payload(QUALITY_DIR_NAME, "quality_comparison.json"),
-        },
+        "artifacts": artifacts,
         "layout": {
             "input_report": str((run_dir or Path()) / INPUT_DIR_NAME),
             "data_verification": str((run_dir or Path()) / DATA_VERIFICATION_DIR_NAME),
             "semantic_model": str((run_dir or Path()) / SEMANTIC_MODEL_DIR_NAME),
-            "conversion_and_visual_mapping": str((run_dir or Path()) / CONVERSION_DIR_NAME),
+            "visual_mapping": str((run_dir or Path()) / VISUAL_MAPPING_DIR_NAME),
             "data_model_to_publish": str((run_dir or Path()) / DATA_MODEL_DIR_NAME),
             "final_workbook_with_visuals": str((run_dir or Path()) / FINAL_WORKBOOK_DIR_NAME),
             "tableau_publish": str((run_dir or Path()) / PUBLISH_DIR_NAME),
@@ -445,18 +448,30 @@ def _write_json_artifact(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+def _debug_artifacts_enabled() -> bool:
+    raw = str(
+        os.getenv("RDL_TO_TWB_ARTIFACT_MODE")
+        or os.getenv("RDL_TO_TWB_DEBUG_ARTIFACTS")
+        or "runtime"
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "debug", "full", "legacy"}
+
+
 def _write_input_artifacts(file_name: str, content: str, report: dict[str, Any]) -> None:
     input_dir = _artifact_subdir(INPUT_DIR_NAME, create=True)
     input_path = input_dir / _safe_artifact_file_name(file_name, "uploaded_report.rdl")
     input_path.write_text(content, encoding="utf-8")
-    _write_json_artifact(input_dir / "parsed_report.json", report if isinstance(report, dict) else {})
-    _write_json_artifact(input_dir / "report_summary.json", _summarize_report(report if isinstance(report, dict) else {}))
+    if _debug_artifacts_enabled():
+        _write_json_artifact(input_dir / "parsed_report.json", report if isinstance(report, dict) else {})
+        _write_json_artifact(input_dir / "report_summary.json", _summarize_report(report if isinstance(report, dict) else {}))
     selected_sql = str(APP_STATE.get("sql_query") or "").strip()
     if selected_sql:
         (input_dir / "selected_dataset.sql").write_text(selected_sql, encoding="utf-8")
 
 
 def _write_data_verification_artifacts(stage: str) -> None:
+    if not _debug_artifacts_enabled():
+        return
     verification_dir = _artifact_subdir(DATA_VERIFICATION_DIR_NAME, create=True)
     datasource, dataset = _selected_context()
     database_context = _database_context(datasource, dataset)
@@ -478,6 +493,8 @@ def _write_data_verification_artifacts(stage: str) -> None:
 
 
 def _write_semantic_model_artifacts(stage: str) -> None:
+    if not _debug_artifacts_enabled():
+        return
     model_dir = _artifact_subdir(SEMANTIC_MODEL_DIR_NAME, create=True)
     payload = {
         "stage": stage,
@@ -511,42 +528,22 @@ def _copy_artifact_to_dir(source_value: str, target_dir: Path, target_name: str 
     return str(target_path)
 
 
-def _is_reference_data_model_template(template_path: str) -> bool:
-    if not template_path:
-        return False
-    try:
-        resolved = Path(template_path).expanduser()
-        if not resolved.is_absolute():
-            resolved = PROJECT_ROOT / resolved
-        resolved = resolved.resolve(strict=True)
-    except OSError:
-        resolved = Path(template_path)
-
-    try:
-        reference = REFERENCE_DATA_MODEL_TEMPLATE_PATH.resolve(strict=True)
-        if resolved == reference:
-            return True
-    except OSError:
-        pass
-
-    return "generated_source_twb_validated_semantic_model" in _safe_file_stem(str(resolved)).lower()
-
-
 def _write_data_model_generation_report(
     template_path: str,
     output_path: Path,
     template_copy_path: str,
     preserve_template_exposed_columns: bool,
 ) -> None:
+    if not _debug_artifacts_enabled():
+        return
     _write_json_artifact(
         output_path.parent / "data_model_generation_report.json",
         {
             "stage": "data_model_twb_generated",
             "updated_at": _timestamp_token(),
             "structure_policy": (
-                "The publish-ready data model TWB is generated from the reference XML structure "
-                "of 20260429T155801Z_generated_source_twb_validated_semantic_model.twb, then updated "
-                "with the validated semantic model."
+                "The publish-ready data model TWB is cloned from the selected Tableau template "
+                "so the vetted relationship graph is preserved."
             ),
             "reference_template": str(REFERENCE_DATA_MODEL_TEMPLATE_PATH),
             "template_used": str(template_path or ""),
@@ -567,6 +564,8 @@ def _write_final_workbook_generation_report(
     preferred_datasource_name: str,
     regional_sales_visual_override: bool,
 ) -> None:
+    if not _debug_artifacts_enabled():
+        return
     _write_json_artifact(
         output_twb_path.parent / "final_workbook_generation_report.json",
         {
@@ -579,9 +578,10 @@ def _write_final_workbook_generation_report(
             "preferred_datasource_name": preferred_datasource_name,
             "final_workbook": str(output_twb_path),
             "policy": (
-                "The final workbook is cloned from the publish-ready data model TWB, then visual "
-                "sections are copied from the selected visual source. For RegionalSales.rdl the "
-                "visual source is converted_report_perfect.twb."
+                "For RegionalSales.rdl the final workbook is copied directly from "
+                "outputs/converted_report_perfect.twb. For other reports, the final workbook is "
+                "cloned from the publish-ready data model TWB, then visual sections are copied "
+                "from the selected visual source."
             ),
         },
     )
@@ -589,15 +589,16 @@ def _write_final_workbook_generation_report(
 
 def _write_publish_artifacts(stage: str) -> None:
     publish_dir = _artifact_subdir(PUBLISH_DIR_NAME, create=True)
-    _write_json_artifact(
-        publish_dir / "publish_report.json",
-        {
-            "stage": stage,
-            "updated_at": _timestamp_token(),
-            "publish_report": APP_STATE.get("publish_report", {}),
-            "publish_error": APP_STATE.get("publish_error", ""),
-        },
-    )
+    if _debug_artifacts_enabled():
+        _write_json_artifact(
+            publish_dir / "publish_report.json",
+            {
+                "stage": stage,
+                "updated_at": _timestamp_token(),
+                "publish_report": APP_STATE.get("publish_report", {}),
+                "publish_error": APP_STATE.get("publish_error", ""),
+            },
+        )
     consumer_path = _consumer_workbook_path_value()
     copied_consumer = _copy_artifact_to_dir(consumer_path, publish_dir)
     if copied_consumer:
@@ -605,6 +606,8 @@ def _write_publish_artifacts(stage: str) -> None:
 
 
 def _write_quality_artifacts(stage: str) -> None:
+    if not _debug_artifacts_enabled():
+        return
     quality_dir = _artifact_subdir(QUALITY_DIR_NAME, create=True)
     _write_json_artifact(
         quality_dir / "quality_comparison.json",
@@ -629,7 +632,7 @@ def _artifact_payloads(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _standalone_conversion_artifact_root(output_dir: Path, artifact_root: Path | None) -> Path | None:
     if artifact_root is not None:
         return artifact_root
-    if output_dir.name == CONVERSION_DIR_NAME:
+    if output_dir.name == VISUAL_MAPPING_DIR_NAME:
         return output_dir.parent
     return None
 
@@ -660,7 +663,7 @@ def _write_standalone_conversion_manifest(
             "warnings": warnings or [],
             "layout": {
                 "input_report": str(root / INPUT_DIR_NAME),
-                "conversion_and_visual_mapping": str(root / CONVERSION_DIR_NAME),
+                "visual_mapping": str(root / VISUAL_MAPPING_DIR_NAME),
             },
             "artifacts": {
                 "input_rdl": _file_payload(str(root / INPUT_DIR_NAME / _safe_artifact_file_name(file_name, "uploaded_report.rdl"))),
@@ -681,28 +684,33 @@ def _write_blocked_conversion_artifacts(
     trace_steps: list[str],
     parsed_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    write_debug = _debug_artifacts_enabled()
+    if write_debug:
+        output_dir.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {
         "status": status,
         "error": error,
-        "data_validation_report": str(output_dir / "data_validation_report.json"),
-        "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+        "warnings": warnings,
+        "trace_steps": trace_steps,
     }
-    if parsed_report is not None:
+    if write_debug and parsed_report is not None:
         parsed_path = output_dir / "parsed_rdl.json"
         _write_json_artifact(parsed_path, parsed_report)
         result["parsed_rdl"] = str(parsed_path)
 
-    _write_json_artifact(
-        output_dir / "data_validation_report.json",
-        {
-            "status": status,
-            "report_name": file_name,
-            "error": error,
-            "warnings": warnings,
-        },
-    )
-    _write_json_artifact(output_dir / "pipeline_trace.json", {"steps": trace_steps})
+    if write_debug:
+        result["data_validation_report"] = str(output_dir / "data_validation_report.json")
+        result["pipeline_trace"] = str(output_dir / "pipeline_trace.json")
+        _write_json_artifact(
+            output_dir / "data_validation_report.json",
+            {
+                "status": status,
+                "report_name": file_name,
+                "error": error,
+                "warnings": warnings,
+            },
+        )
+        _write_json_artifact(output_dir / "pipeline_trace.json", {"steps": trace_steps})
     _write_standalone_conversion_manifest(
         file_name=file_name,
         output_dir=output_dir,
@@ -832,7 +840,8 @@ def _rdl_conversion_preflight(
         "query_dataset_count": len(query_datasets),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_artifact(output_dir / "data_validation_report.json", validation_report)
+    if _debug_artifacts_enabled():
+        _write_json_artifact(output_dir / "data_validation_report.json", validation_report)
     return {"ready": True, "status": "passed", "warnings": [], "trace_steps": [*trace_steps, "Data verification passed"]}
 
 
@@ -863,20 +872,16 @@ def _is_regionalsales_report() -> bool:
 
 
 def _regional_sales_visual_source_path() -> Path | None:
-    candidates: list[Path] = []
+    candidates: list[Path] = [
+        OUTPUT_DIR / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+        PROJECT_ROOT / "outputs" / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+        PROJECT_ROOT / REGIONALSALES_VISUAL_TEMPLATE_NAME,
+    ]
 
     env_override = str(os.getenv(REGIONALSALES_VISUAL_TEMPLATE_ENV) or "").strip()
     if env_override:
         requested = Path(env_override).expanduser()
         candidates.append(requested if requested.is_absolute() else PROJECT_ROOT / requested)
-
-    candidates.extend(
-        [
-            OUTPUT_DIR / REGIONALSALES_VISUAL_TEMPLATE_NAME,
-            PROJECT_ROOT / "outputs" / REGIONALSALES_VISUAL_TEMPLATE_NAME,
-            PROJECT_ROOT / REGIONALSALES_VISUAL_TEMPLATE_NAME,
-        ]
-    )
 
     seen: set[str] = set()
     for candidate in candidates:
@@ -913,7 +918,7 @@ def _resolve_final_visual_source_path() -> tuple[Path | None, bool]:
 
 
 def _visual_conversion_output_dir(file_name: str) -> Path:
-    return _artifact_subdir(CONVERSION_DIR_NAME, create=True)
+    return _artifact_subdir(VISUAL_MAPPING_DIR_NAME, create=True)
 
 
 def _canonical_visual_workbook_path(visual_twb_path: str, output_dir: Path) -> str:
@@ -924,10 +929,15 @@ def _canonical_visual_workbook_path(visual_twb_path: str, output_dir: Path) -> s
     if not source_path.is_file():
         raise RuntimeError(f"Visual content mapping did not produce a readable TWB: {source_path}")
 
-    target_path = output_dir / VISUAL_MAPPING_TWB_NAME
+    target_path = (output_dir / VISUAL_MAPPING_TWB_NAME).resolve(strict=False)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    if source_path != target_path.resolve(strict=False):
-        shutil.copy2(source_path, target_path)
+    if source_path != target_path:
+        if source_path.parent == target_path.parent:
+            if target_path.exists():
+                target_path.unlink()
+            source_path.replace(target_path)
+        else:
+            shutil.copy2(source_path, target_path)
     return str(target_path)
 
 
@@ -955,6 +965,7 @@ def _run_visual_conversion_job(
             output_dir=output_dir,
             config_path=Path(str(config_path or _preferred_config_path())),
             publish_enabled=False,
+            artifact_mode="debug" if _debug_artifacts_enabled() else "runtime",
         )
     finally:
         if temp_path is not None:
@@ -964,6 +975,8 @@ def _run_visual_conversion_job(
     if not visual_twb_path:
         raise RuntimeError("Visual content mapping completed without producing a TWB artifact.")
     visual_twb_path = _canonical_visual_workbook_path(visual_twb_path, output_dir)
+    if isinstance(result, dict):
+        result["twb"] = visual_twb_path
 
     return {
         "visual_workbook_path": visual_twb_path,
@@ -1065,15 +1078,22 @@ def _build_local_visual_model_twb(
     output_path = _artifact_subdir(FINAL_WORKBOOK_DIR_NAME, create=True) / FINAL_WORKBOOK_TWB_NAME
     data_source = publish_context.get("data_source", {}) if isinstance(publish_context, dict) else {}
     preferred_datasource_name = str(data_source.get("name", "") or "").strip() if isinstance(data_source, dict) else ""
-    visual_source_copy_path = _copy_artifact_to_dir(str(visual_path), output_path.parent, "visual_source_used.twb")
+    visual_source_copy_path = (
+        _copy_artifact_to_dir(str(visual_path), output_path.parent, "visual_source_used.twb")
+        if _debug_artifacts_enabled()
+        else ""
+    )
 
     try:
-        _tableau_clone_linked_workbook_with_visual_content(
-            linked_workbook_path=semantic_twb_path,
-            visual_source_twb_path=visual_path,
-            output_twb_path=output_path,
-            preferred_datasource_name=preferred_datasource_name,
-        )
+        if regional_sales_visual_override:
+            shutil.copy2(visual_path, output_path)
+        else:
+            _tableau_clone_linked_workbook_with_visual_content(
+                linked_workbook_path=semantic_twb_path,
+                visual_source_twb_path=visual_path,
+                output_twb_path=output_path,
+                preferred_datasource_name=preferred_datasource_name,
+            )
     except Exception as exc:
         APP_STATE["visual_model_twb_path"] = ""
         APP_STATE["visual_model_twb_error"] = str(exc)
@@ -2322,22 +2342,16 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["data_model_template_path"] = template_path
     output_name = _safe_output_twb_name(str(payload.get("output_name") or DATA_MODEL_TWB_NAME))
     template_xml = _load_template_xml(None, template_path)
-    preserve_template_exposed_columns = _is_reference_data_model_template(template_path)
-    generated_xml = (
-        template_xml
-        if preserve_template_exposed_columns
-        else _generate_twb_from_validated_model(
-            template_xml=template_xml,
-            data_source=datasource,
-            dataset=dataset,
-            validated_model=validated_model,
-            preserve_template_exposed_columns=False,
-        )
-    )
+    preserve_template_exposed_columns = True
+    generated_xml = template_xml
     output_path = _artifact_subdir(DATA_MODEL_DIR_NAME, create=True) / output_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(generated_xml, encoding="utf-8")
-    template_copy_path = _copy_artifact_to_dir(template_path, output_path.parent, "source_template_used.twb")
+    template_copy_path = (
+        _copy_artifact_to_dir(template_path, output_path.parent, "source_template_used.twb")
+        if _debug_artifacts_enabled()
+        else ""
+    )
     _write_data_model_generation_report(
         template_path,
         output_path,
@@ -2363,6 +2377,15 @@ def _generate_twb(payload: dict[str, Any]) -> dict[str, Any]:
     _write_semantic_model_artifacts("twb_artifacts_generated")
     _write_artifact_manifest("twb_artifacts_generated")
     return _state_snapshot()
+
+
+def _configure_tableau_publish_artifact_paths() -> None:
+    publish_dir = _artifact_subdir(PUBLISH_DIR_NAME, create=True)
+    generated_name = _safe_output_twb_name(str(APP_STATE.get("generated_twb_name") or DATA_MODEL_TWB_NAME))
+    consumer_name = f"{Path(generated_name).stem}_consumer_final.twb"
+    st.session_state.sql_model_assistant_tableau_publish_artifact_dir = str(publish_dir / "artifacts")
+    st.session_state.sql_model_assistant_tableau_publish_work_dir = str(publish_dir / "work")
+    st.session_state.sql_model_assistant_tableau_consumer_output_path = str(publish_dir / consumer_name)
 
 
 def _configure_streamlit_publish_state(config_path: str, overrides: dict[str, Any] | None = None) -> None:
@@ -2417,6 +2440,7 @@ def _publish_tableau(payload: dict[str, Any]) -> dict[str, Any]:
     config_path = str(_resolve_config_path_value(payload.get("config_path")))
     overrides = payload.get("tableau", {})
     _configure_streamlit_publish_state(config_path, overrides if isinstance(overrides, dict) else {})
+    _configure_tableau_publish_artifact_paths()
     try:
         report = _run_tableau_cloud_publish_workflow(Path(generated_path))
         APP_STATE["publish_report"] = report
@@ -2566,19 +2590,20 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         output_dir = _resolve_workspace_path(output_dir_value)
     else:
         artifact_root = _new_artifact_run_dir(file_name)
-        output_dir = artifact_root / CONVERSION_DIR_NAME
+        output_dir = artifact_root / VISUAL_MAPPING_DIR_NAME
         input_dir = artifact_root / INPUT_DIR_NAME
         input_dir.mkdir(parents=True, exist_ok=True)
         (input_dir / _safe_artifact_file_name(file_name, "uploaded_report.rdl")).write_text(content, encoding="utf-8")
-        _write_json_artifact(
-            input_dir / "conversion_request.json",
-            {
-                "report_name": file_name,
-                "created_at": _timestamp_token(),
-                "publish_enabled": bool(payload.get("publish_enabled", False)),
-                "config_path": str(_resolve_config_path_value(payload.get("config_path"))),
-            },
-        )
+        if _debug_artifacts_enabled():
+            _write_json_artifact(
+                input_dir / "conversion_request.json",
+                {
+                    "report_name": file_name,
+                    "created_at": _timestamp_token(),
+                    "publish_enabled": bool(payload.get("publish_enabled", False)),
+                    "config_path": str(_resolve_config_path_value(payload.get("config_path"))),
+                },
+            )
 
     preflight = _rdl_conversion_preflight(
         file_name=file_name,
@@ -2617,14 +2642,19 @@ def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
             output_dir=output_dir,
             config_path=_resolve_config_path_value(payload.get("config_path")),
             publish_enabled=bool(payload.get("publish_enabled", False)),
+            artifact_mode="debug" if _debug_artifacts_enabled() else "runtime",
         )
+        if isinstance(result, dict) and isinstance(result.get("twb"), str):
+            result["twb"] = _canonical_visual_workbook_path(result["twb"], output_dir)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
-    trace_steps: list[str] = []
+    trace_steps = result.get("trace_steps", []) if isinstance(result, dict) else []
+    if not isinstance(trace_steps, list):
+        trace_steps = []
     trace_path = result.get("pipeline_trace") if isinstance(result, dict) else None
-    if isinstance(trace_path, str):
+    if not trace_steps and isinstance(trace_path, str):
         try:
             trace_payload = json.loads(Path(trace_path).read_text(encoding="utf-8"))
             raw_steps = trace_payload.get("steps", []) if isinstance(trace_payload, dict) else []

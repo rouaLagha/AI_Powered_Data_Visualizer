@@ -27,7 +27,6 @@ from .twb_builder import (
     write_twb_file,
 )
 
-
 def run_conversion(
     rdl_path: str | Path,
     rdl_xsd_path: str | Path,
@@ -35,10 +34,12 @@ def run_conversion(
     output_dir: str | Path,
     config_path: str | Path | None = None,
     publish_enabled: bool | None = None,
+    artifact_mode: str | None = None,
 ) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     pipeline_trace: list[str] = []
+    write_debug_artifacts = _debug_artifacts_enabled(artifact_mode)
 
     rdl_xsd_summary = summarize_xsd_elements(rdl_xsd_path)
     twb_xsd_summary = summarize_xsd_elements(twb_xsd_path)
@@ -59,33 +60,44 @@ def run_conversion(
     parsed_payload = parsed_report.to_dict()
     pipeline_trace.append("RDL parsed")
 
-    _write_json(output_dir / "parsed_rdl.json", parsed_payload)
-    _write_json(output_dir / "rdl_xsd_summary.json", rdl_xsd_summary)
-    _write_json(output_dir / "twb_xsd_summary.json", twb_xsd_summary)
+    if write_debug_artifacts:
+        _write_json(output_dir / "parsed_rdl.json", parsed_payload)
+        _write_json(output_dir / "rdl_xsd_summary.json", rdl_xsd_summary)
+        _write_json(output_dir / "twb_xsd_summary.json", twb_xsd_summary)
 
     data_validation = _validate_parsed_report_payload(parsed_payload)
-    _write_json(output_dir / "data_validation_report.json", data_validation)
+    if write_debug_artifacts:
+        _write_json(output_dir / "data_validation_report.json", data_validation)
     if data_validation.get("status") == "blocked":
         pipeline_trace.append("Pipeline blocked during data verification")
-        _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
-        return {
+        result = {
             "status": "blocked",
             "error": data_validation.get("error", ""),
             "warnings": data_validation.get("warnings", []),
-            "parsed_rdl": str(output_dir / "parsed_rdl.json"),
-            "data_validation_report": str(output_dir / "data_validation_report.json"),
-            "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+            "trace_steps": pipeline_trace,
+            "data_validation": data_validation,
         }
+        if write_debug_artifacts:
+            _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
+            result.update(
+                {
+                    "parsed_rdl": str(output_dir / "parsed_rdl.json"),
+                    "data_validation_report": str(output_dir / "data_validation_report.json"),
+                    "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+                }
+            )
+        return result
     pipeline_trace.append("Data verification passed")
 
     db_catalog = build_db_catalog(
         data_sources=parsed_payload.get("data_sources", []),
         data_sets=parsed_payload.get("data_sets", []),
     )
-    _write_json(output_dir / "db_catalog.json", db_catalog)
+    if write_debug_artifacts:
+        _write_json(output_dir / "db_catalog.json", db_catalog)
     pipeline_trace.append("DB catalog introspection completed")
 
-    # Keep prompts compact for local models while preserving full summaries on disk.
+    # Keep prompts compact for local models.
     rdl_xsd_prompt_summary = _compact_schema_summary(rdl_xsd_summary)
     twb_xsd_prompt_summary = _compact_schema_summary(twb_xsd_summary)
     parsed_rdl_prompt_payload = _compact_parsed_rdl_for_prompt(parsed_payload)
@@ -103,6 +115,7 @@ def run_conversion(
         rdl_xsd_summary=rdl_xsd_prompt_summary,
         twb_xsd_summary=twb_xsd_prompt_summary,
         output_dir=output_dir,
+        write_artifacts=write_debug_artifacts,
     )
     pipeline_trace.append("Agent-1 semantic generation succeeded")
 
@@ -118,6 +131,7 @@ def run_conversion(
             mapping=mapping_prompt_payload,
             twb_xsd_summary=twb_xsd_prompt_summary,
             output_xml_path=output_dir / "generated_workbook.xml",
+            write_artifact=write_debug_artifacts,
         )
         pipeline_trace.append("Agent-2 XML generation succeeded")
     except Exception as exc:
@@ -172,11 +186,12 @@ def run_conversion(
             f"RegionalSales canonical TWB override applied from {canonical_twb_path}"
         )
 
-    if canonical_twb_bytes is not None:
-        (output_dir / "generated_workbook.xml").write_bytes(canonical_twb_bytes)
-    else:
-        (output_dir / "generated_workbook.xml").write_text(xml_content, encoding="utf-8")
-    _write_json(output_dir / "validation_report.json", {"issues": issues})
+    if write_debug_artifacts:
+        if canonical_twb_bytes is not None:
+            (output_dir / "generated_workbook.xml").write_bytes(canonical_twb_bytes)
+        else:
+            (output_dir / "generated_workbook.xml").write_text(xml_content, encoding="utf-8")
+        _write_json(output_dir / "validation_report.json", {"issues": issues})
 
     if canonical_twb_bytes is not None:
         twb_path = output_dir / "converted_report.twb"
@@ -423,28 +438,39 @@ def run_conversion(
             "workbook_path": str(publish_input_path),
         }
 
-    _write_json(output_dir / "tableau_extract_report.json", tableau_extract_report)
-    _write_json(output_dir / "tableau_publish_report.json", tableau_publish_report)
-    _write_json(output_dir / "tableau_rpa_publish_report.json", tableau_rpa_report)
-    _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
+    if write_debug_artifacts:
+        _write_json(output_dir / "tableau_extract_report.json", tableau_extract_report)
+        _write_json(output_dir / "tableau_publish_report.json", tableau_publish_report)
+        _write_json(output_dir / "tableau_rpa_publish_report.json", tableau_rpa_report)
+        _write_json(output_dir / "pipeline_trace.json", {"steps": pipeline_trace})
 
     result = {
-        "parsed_rdl": str(output_dir / "parsed_rdl.json"),
-        "data_validation_report": str(output_dir / "data_validation_report.json"),
-        "data_model": str(output_dir / "data_model.json"),
-        "visual_model": str(output_dir / "visual_model.json"),
-        "mapping": str(output_dir / "mapping.json"),
-        "mapping_model": str(output_dir / "mapping_model.json"),
-        "semantic_generation_report": str(output_dir / "semantic_generation_report.json"),
-        "agent1_raw_response": str(output_dir / "agent1_raw_response.txt"),
-        "db_catalog": str(output_dir / "db_catalog.json"),
-        "generated_xml": str(output_dir / "generated_workbook.xml"),
         "twb": str(twb_path),
-        "tableau_extract_report": str(output_dir / "tableau_extract_report.json"),
-        "tableau_publish_report": str(output_dir / "tableau_publish_report.json"),
-        "tableau_rpa_publish_report": str(output_dir / "tableau_rpa_publish_report.json"),
-        "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+        "trace_steps": pipeline_trace,
+        "validation_issues": issues,
+        "tableau_extract_report_data": tableau_extract_report,
+        "tableau_publish_report_data": tableau_publish_report,
+        "tableau_rpa_publish_report_data": tableau_rpa_report,
     }
+    if write_debug_artifacts:
+        result.update(
+            {
+                "parsed_rdl": str(output_dir / "parsed_rdl.json"),
+                "data_validation_report": str(output_dir / "data_validation_report.json"),
+                "data_model": str(output_dir / "data_model.json"),
+                "visual_model": str(output_dir / "visual_model.json"),
+                "mapping": str(output_dir / "mapping.json"),
+                "mapping_model": str(output_dir / "mapping_model.json"),
+                "semantic_generation_report": str(output_dir / "semantic_generation_report.json"),
+                "agent1_raw_response": str(output_dir / "agent1_raw_response.txt"),
+                "db_catalog": str(output_dir / "db_catalog.json"),
+                "generated_xml": str(output_dir / "generated_workbook.xml"),
+                "tableau_extract_report": str(output_dir / "tableau_extract_report.json"),
+                "tableau_publish_report": str(output_dir / "tableau_publish_report.json"),
+                "tableau_rpa_publish_report": str(output_dir / "tableau_rpa_publish_report.json"),
+                "pipeline_trace": str(output_dir / "pipeline_trace.json"),
+            }
+        )
 
     if publish_input_path.suffix.lower() == ".twbx" and publish_input_path.exists():
         result["twbx"] = str(publish_input_path)
@@ -537,6 +563,16 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
+def _debug_artifacts_enabled(artifact_mode: str | None) -> bool:
+    raw = str(
+        artifact_mode
+        or os.getenv("RDL_TO_TWB_ARTIFACT_MODE")
+        or os.getenv("RDL_TO_TWB_DEBUG_ARTIFACTS")
+        or "runtime"
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "debug", "full", "legacy"}
+
+
 def _validation_warning(code: str, message: str, severity: str = "warning") -> dict:
     return {
         "code": code,
@@ -605,8 +641,16 @@ def _resolve_regional_sales_canonical_twb_path(
     if input_stem != "regionalsales" and parsed_report_name != "regionalsales":
         return None
 
-    project_root = Path(__file__).resolve().parents[2]
-    candidates: list[Path] = []
+    backend_root = Path(__file__).resolve().parents[2]
+    project_root = backend_root.parent
+    candidates: list[Path] = [
+        project_root / "outputs" / "converted_report_perfect.twb",
+        backend_root / "config" / "RegionalSales.canonical.twb",
+        backend_root / "config" / "regionalsales.canonical.twb",
+        project_root / "converted_report_perfect.twb",
+        output_dir / "converted_report_perfect.twb",
+        Path.home() / "Desktop" / "converted_report_perfect.twb",
+    ]
 
     env_override = os.getenv("REGIONALSALES_CANONICAL_TWB")
     if isinstance(env_override, str) and env_override.strip():
@@ -614,16 +658,6 @@ def _resolve_regional_sales_canonical_twb_path(
         if not env_path.is_absolute():
             env_path = project_root / env_path
         candidates.append(env_path)
-
-    candidates.extend(
-        [
-            project_root / "config" / "RegionalSales.canonical.twb",
-            project_root / "config" / "regionalsales.canonical.twb",
-            project_root / "converted_report_perfect.twb",
-            output_dir / "converted_report_perfect.twb",
-            Path.home() / "Desktop" / "converted_report_perfect.twb",
-        ]
-    )
 
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():

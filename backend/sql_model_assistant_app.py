@@ -6274,6 +6274,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT_DIR.parent
 ASSETS_DIR = ROOT_DIR / "assets"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
+RDL_TO_TWB_OUTPUT_DIR = OUTPUT_DIR / "rdl_to_twb"
+RDL_TO_TWB_INPUT_DIR_NAME = "00_input_report"
+RDL_TO_TWB_VISUAL_MAPPING_DIR_NAME = "03_visual_mapping"
+RDL_TO_TWB_VISUAL_MAPPING_TWB_NAME = "visual_content_mapped.twb"
 SQL_ASSISTANT_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.tableau_cloud_sql_assistant.json"
 DEFAULT_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.json"
 FALLBACK_LLM_CONFIG = ROOT_DIR / "config" / "llm_config.example.json"
@@ -7133,7 +7137,33 @@ def _resolve_existing_sql_assistant_llm_config_path(llm_config_path: str) -> Pat
 def _flux1_output_dir_for_rdl(file_name: str) -> Path:
     report_stem = Path(str(file_name or "uploaded_report.rdl")).stem or "uploaded_report"
     safe_report_name = _tableau_safe_name(report_stem)
-    return OUTPUT_DIR / "sql_model_assistant_flux1" / safe_report_name
+    timestamp_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return RDL_TO_TWB_OUTPUT_DIR / f"{timestamp_utc}_{safe_report_name}" / RDL_TO_TWB_VISUAL_MAPPING_DIR_NAME
+
+
+def _flux1_input_report_path(output_dir: Path, file_name: str) -> Path:
+    run_dir = output_dir.parent if output_dir.name == RDL_TO_TWB_VISUAL_MAPPING_DIR_NAME else output_dir
+    input_dir = run_dir / RDL_TO_TWB_INPUT_DIR_NAME
+    input_dir.mkdir(parents=True, exist_ok=True)
+    return input_dir / _tableau_safe_name(Path(str(file_name or "uploaded_report.rdl")).name)
+
+
+def _flux1_canonical_visual_workbook_path(visual_workbook_path: str, output_dir: Path) -> str:
+    source_path = Path(visual_workbook_path)
+    if not source_path.is_absolute():
+        source_path = PROJECT_ROOT / source_path
+    source_path = source_path.resolve(strict=True)
+
+    target_path = (output_dir / RDL_TO_TWB_VISUAL_MAPPING_TWB_NAME).resolve(strict=False)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path != target_path:
+        if source_path.parent == target_path.parent:
+            if target_path.exists():
+                target_path.unlink()
+            source_path.replace(target_path)
+        else:
+            shutil.copy2(source_path, target_path)
+    return str(target_path)
 
 
 def _run_flux1_visual_migration(
@@ -7147,6 +7177,7 @@ def _run_flux1_visual_migration(
     suffix = Path(str(file_name or "uploaded_report.rdl")).suffix or ".rdl"
     output_dir = _flux1_output_dir_for_rdl(file_name)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _flux1_input_report_path(output_dir, file_name).write_bytes(rdl_payload)
     temp_rdl_path: Path | None = None
 
     try:
@@ -7161,6 +7192,7 @@ def _run_flux1_visual_migration(
             output_dir=output_dir,
             config_path=_resolve_existing_sql_assistant_llm_config_path(llm_config_path),
             publish_enabled=False,
+            artifact_mode=os.getenv("RDL_TO_TWB_ARTIFACT_MODE") or "runtime",
         )
     finally:
         if temp_rdl_path is not None and temp_rdl_path.exists():
@@ -7169,6 +7201,9 @@ def _run_flux1_visual_migration(
     visual_workbook_path = str(result.get("twb") or "").strip()
     if not visual_workbook_path:
         raise RuntimeError("Flux 1 completed without producing a visual workbook.")
+    visual_workbook_path = _flux1_canonical_visual_workbook_path(visual_workbook_path, output_dir)
+    if isinstance(result, dict):
+        result["twb"] = visual_workbook_path
 
     return {
         "visual_workbook_path": visual_workbook_path,
@@ -8235,18 +8270,14 @@ def _regional_sales_semantic_workbook_candidates() -> list[Path]:
 
 
 def _regional_sales_visual_workbook_candidates() -> list[Path]:
-    candidates: list[Path] = []
+    candidates: list[Path] = [
+        OUTPUT_DIR / "converted_report_perfect.twb",
+        PROJECT_ROOT / "outputs" / "converted_report_perfect.twb",
+        PROJECT_ROOT / "converted_report_perfect.twb",
+    ]
     env_override = str(os.getenv("REGIONALSALES_VISUAL_TWB") or "").strip()
     if env_override:
         candidates.append(Path(env_override).expanduser())
-
-    candidates.extend(
-        [
-            OUTPUT_DIR / "converted_report_perfect.twb",
-            PROJECT_ROOT / "outputs" / "converted_report_perfect.twb",
-            PROJECT_ROOT / "converted_report_perfect.twb",
-        ]
-    )
     return candidates
 
 
@@ -8588,7 +8619,14 @@ def _run_tableau_cloud_publish_workflow(generated_twb_path: Path) -> dict[str, A
             if linked_workbook_artifact:
                 saved_publish_artifacts["linked_workbook"] = linked_workbook_artifact
 
-            consumer_output_path = OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final.twb"
+            consumer_output_override = str(
+                getattr(st.session_state, "sql_model_assistant_tableau_consumer_output_path", "") or ""
+            ).strip()
+            consumer_output_path = (
+                Path(consumer_output_override).expanduser()
+                if consumer_output_override
+                else OUTPUT_DIR / f"{_tableau_safe_name(generated_twb_path.stem)}_consumer_final.twb"
+            )
             consumer_output_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(linked_twb_path, consumer_output_path)
             consumer_workbook_path = str(consumer_output_path)
@@ -10325,6 +10363,16 @@ def _tableau_resolve_generated_source_content_path(source_path: Path, label: str
     return max(candidates, key=_tableau_semantic_template_structure_score)
 
 
+def _tableau_publish_artifact_dir(output_folder_name: str) -> Path:
+    override = str(getattr(st.session_state, "sql_model_assistant_tableau_publish_artifact_dir", "") or "").strip()
+    if override:
+        base_dir = Path(override).expanduser()
+        if output_folder_name == "tableau_publish_debug":
+            return base_dir / "debug"
+        return base_dir
+    return OUTPUT_DIR / output_folder_name
+
+
 def _tableau_copy_publish_artifact(
     source_path: Path,
     timestamp_utc: str,
@@ -10336,7 +10384,7 @@ def _tableau_copy_publish_artifact(
             return ""
 
         content_source_path = _tableau_resolve_generated_source_content_path(source_path, label)
-        artifact_dir = OUTPUT_DIR / output_folder_name
+        artifact_dir = _tableau_publish_artifact_dir(output_folder_name)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_name = (
             f"{_tableau_safe_name(timestamp_utc)}_"
@@ -10611,7 +10659,8 @@ class _TableauPublishWorkDirectory:
         self.path: Path | None = None
 
     def __enter__(self) -> Path:
-        root = OUTPUT_DIR / "tableau_publish_work"
+        root_override = str(getattr(st.session_state, "sql_model_assistant_tableau_publish_work_dir", "") or "").strip()
+        root = Path(root_override).expanduser() if root_override else OUTPUT_DIR / "tableau_publish_work"
         root.mkdir(parents=True, exist_ok=True)
         safe_timestamp = _tableau_safe_name(self.timestamp_utc)
         self.path = root / f"{safe_timestamp}_{uuid.uuid4().hex[:8]}"
