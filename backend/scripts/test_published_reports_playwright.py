@@ -1919,7 +1919,9 @@ def _pairwise_vision_prompt(source_name: str, target_name: str, scenario: dict[s
         "Pay special attention to scaled axes and measure values read from the curve. If an axis or visual uses units such "
         "as K, M, B, thousands, millions, or billions, keep raw_value exactly as displayed and set value to the normalized "
         "business value. For example, raw_value '~6.1M' must have value 6100000, and raw_value '~4B' must have value "
-        "4000000000. If no K/M/B suffix or explicit unit is visible, do not apply an implicit multiplier. "
+        "4000000000. If no K/M/B suffix or explicit unit is visible, do not apply an implicit multiplier, except for "
+        "the source RDL chart measure scale: SalesAmount values read from the RDL curve are x1000 and "
+        "SalesAmountQuota values read from the RDL curve are x100. "
         "For line/bar charts, prefer points like {category: 'March', measure: 'Sales', axis: 'left', series: 'Sales', "
         "raw_value: '$5.2M', value: 5200000}; this means x=March, measure=Sales, axis=left, y=5200000. "
         "Use the same unit/format convention for equivalent measures in both reports whenever the screenshots expose it. "
@@ -3746,6 +3748,9 @@ def _chart_point_scaled_value(visual: dict[str, Any], point: dict[str, Any]) -> 
     binding = _axis_binding_for_point(visual, point)
     multiplier = _unit_multiplier(binding.get("unit") if binding else "")
     numeric_value = float(value)
+    rdl_multiplier = _rdl_chart_measure_multiplier(visual, point, binding)
+    if rdl_multiplier != 1.0:
+        return _apply_chart_measure_multiplier(numeric_value, raw_value, rdl_multiplier)
     if multiplier != 1.0 and abs(numeric_value) < 10000:
         return numeric_value * multiplier
     return numeric_value
@@ -3768,16 +3773,55 @@ def _chart_point_axis_position(visual: dict[str, Any], point: dict[str, Any]) ->
     return (value - min_value) / (max_value - min_value)
 
 
-def _rdl_chart_axis_k_multiplier_applies(visual: dict[str, Any], point: dict[str, Any], raw_value: str = "") -> bool:
+def _apply_chart_measure_multiplier(numeric_value: float, raw_value: str, multiplier: float) -> float:
+    raw_numeric = _parse_numeric_value(raw_value)
+    if raw_numeric is None:
+        return numeric_value * multiplier
+    scaled_raw = float(raw_numeric) * multiplier
+    if _numeric_delta_percent(numeric_value, scaled_raw) <= 1.0:
+        return numeric_value
+    if _numeric_delta_percent(numeric_value, float(raw_numeric)) <= 1.0:
+        return scaled_raw
+    return numeric_value * multiplier
+
+
+def _rdl_chart_measure_multiplier(
+    visual: dict[str, Any],
+    point: dict[str, Any],
+    binding: dict[str, str] | None = None,
+) -> float:
+    if not _is_rdl_report_visual(visual):
+        return 1.0
+    names = _rdl_chart_measure_names(visual, point, binding or {})
+    compact_names = [_normalize_key(name).replace(" ", "") for name in names if _normalize_key(name)]
+    for compact in compact_names:
+        if compact in {"salesamountquota", "quota"} or compact.endswith("salesamountquota"):
+            return 100.0
+    for compact in compact_names:
+        if compact in {"salesamount", "sales"} or compact.endswith("salesamount"):
+            return 1_000.0
+    return 1.0
+
+
+def _rdl_chart_measure_names(
+    visual: dict[str, Any],
+    point: dict[str, Any],
+    binding: dict[str, str],
+) -> list[str]:
+    names = [
+        _value_to_str(point.get("measure")),
+        _value_to_str(point.get("series")),
+        _value_to_str(binding.get("measure")),
+    ]
+    visual_measures = visual.get("measures") if isinstance(visual.get("measures"), list) else []
+    if len(visual_measures) == 1:
+        names.append(_value_to_str(visual_measures[0]))
+    return [name for name in names if name]
+
+
+def _is_rdl_report_visual(visual: dict[str, Any]) -> bool:
     report = _normalize_key(visual.get("report") or visual.get("report_name") or visual.get("source_report"))
-    if not any(token in report.split() for token in ["powerbi", "rdl", "paginated"]):
-        return False
-    if _canonical_axis_name(point.get("axis")) == "x":
-        return False
-    raw_text = _value_to_str(raw_value or point.get("raw_value"))
-    if re.search(r"\d\s*[kmbKMB]\b", raw_text):
-        return False
-    return True
+    return any(token in report.split() for token in ["powerbi", "rdl", "paginated"])
 
 
 def _chart_axis_scale_multiplier(visual: dict[str, Any], point: dict[str, Any]) -> float:
@@ -4004,8 +4048,10 @@ def _chart_point_match_score(source_point: dict[str, Any], target_point: dict[st
 
 def _chart_point_public(point: dict[str, Any], visual: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized_value = None
+    value_multiplier = 1.0
     if isinstance(visual, dict):
         normalized_value = _chart_point_scaled_value(visual, point)
+        value_multiplier = _rdl_chart_measure_multiplier(visual, point, _axis_binding_for_point(visual, point))
     display_value = _chart_point_display_value(point, visual)
     payload = {
         "category": point.get("category", ""),
@@ -4022,6 +4068,8 @@ def _chart_point_public(point: dict[str, Any], visual: dict[str, Any] | None = N
     }
     if normalized_value is not None:
         payload["normalized_value"] = normalized_value
+    if value_multiplier != 1.0:
+        payload["value_multiplier"] = value_multiplier
     return payload
 
 
