@@ -184,6 +184,8 @@ def main() -> None:
             "tableau_extract_report",
             "tableau_publish_report",
             "tableau_rpa_publish_report",
+            "powerbi_publish_report",
+            "published_report_test_report",
             "pipeline_trace",
         ]
         for label in file_keys:

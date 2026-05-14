@@ -57,6 +57,43 @@
     "timeout_seconds": 300,
     "fail_on_error": false
   },
+  "published_report_test": {
+    "enabled": true,
+    "timeout_seconds": 1800,
+    "powerbi": {
+      "storage_state_path": "env:POWERBI_PLAYWRIGHT_STORAGE_STATE"
+    },
+    "tableau": {
+      "storage_state_path": "env:TABLEAU_PLAYWRIGHT_STORAGE_STATE"
+    },
+    "screenshot_tests": {
+      "enabled": true,
+      "min_similarity_percent": 85,
+      "report_content_crop": {
+        "top_ratio": 0,
+        "bottom_ratio": 0,
+        "left_ratio": 0,
+        "right_ratio": 0
+      }
+    },
+    "data_tests": {
+      "enabled": true,
+      "numeric_tolerance_percent": 1.0,
+      "minor_delta_tolerance_percent": 5.0,
+      "strict_missing_values": false,
+      "required_kpis": ["orders", "sales", "quota", "variance"],
+      "required_chart_categories": ["March", "June", "September"],
+      "screenshot_ocr": {
+        "enabled": true,
+        "psm": "6"
+      },
+      "screenshot_vision": {
+        "enabled": true,
+        "pair_comparison": true,
+        "agent": "vision_agent"
+      }
+    }
+  },
   "tableau_server01": {
     "enabled": false,
     "server_url": "https://your-tableau-server",

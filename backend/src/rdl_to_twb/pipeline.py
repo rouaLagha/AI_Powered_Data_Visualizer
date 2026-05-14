@@ -19,7 +19,7 @@ from .tableau_extract import (
     rewrite_workbook_for_hyper,
 )
 from .tableau_publisher import publish_workbook_if_configured
-from .powerbi_publisher import publish_rdl_if_configured
+from .powerbi_publisher import publish_rdl_if_configured, _optional_str
 from datetime import datetime, timezone
 from .twb_builder import (
     inject_datasource_connections,
@@ -28,6 +28,44 @@ from .twb_builder import (
     validate_twb_structure,
     write_twb_file,
 )
+from typing import Any
+
+
+def run_published_report_tests(
+    output_dir: str | Path,
+    parsed_rdl_payload: dict,
+    tableau_publish_result: dict,
+    powerbi_publish_result: dict,
+    config_path: str | Path | None = None,
+) -> dict:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = {}
+    if config_path:
+        cfg = _load_config(config_path)
+
+    tableau_cfg = cfg.get("tableau_server") if isinstance(cfg, dict) else None
+    powerbi_cfg = cfg.get("powerbi_service") if isinstance(cfg, dict) else None
+
+    result = _run_published_report_tests(
+        output_dir=output_dir,
+        parsed_payload=parsed_rdl_payload,
+        tableau_publish_report=tableau_publish_result,
+        powerbi_publish_report=powerbi_publish_result,
+        tableau_cfg=tableau_cfg if isinstance(tableau_cfg, dict) else None,
+        powerbi_cfg=powerbi_cfg if isinstance(powerbi_cfg, dict) else None,
+        config_root=cfg,
+        config_path=Path(config_path) if config_path else None,
+    )
+
+    try:
+        _write_json(output_dir / "published_report_test_report.json", result)
+    except Exception:
+        pass
+
+    return result
+
 
 def run_conversion(
     rdl_path: str | Path,
@@ -592,7 +630,7 @@ def _build_deterministic_seed_twb_xml(data_model: dict, visual_model: dict) -> s
 
 
 def _load_config(config_path: str | Path) -> dict:
-    return json.loads(Path(config_path).read_text(encoding="utf-8"))
+    return json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -617,6 +655,456 @@ def _validation_warning(code: str, message: str, severity: str = "warning") -> d
         "stage": "data_verification",
         "message": message,
     }
+
+
+def _published_report_test_enabled(cfg: dict) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    test_cfg = cfg.get("published_report_test")
+    if isinstance(test_cfg, dict) and "enabled" in test_cfg:
+        return bool(test_cfg.get("enabled"))
+    return True
+
+
+def _run_published_report_tests(
+    output_dir: Path,
+    parsed_payload: dict,
+    tableau_publish_report: dict,
+    powerbi_publish_report: dict,
+    tableau_cfg: dict | None,
+    powerbi_cfg: dict | None,
+    config_root: dict,
+    config_path: Path | None = None,
+) -> dict:
+    scenario = _build_published_report_test_scenario(
+        parsed_payload=parsed_payload,
+        tableau_publish_report=tableau_publish_report,
+        powerbi_publish_report=powerbi_publish_report,
+        tableau_cfg=tableau_cfg,
+        powerbi_cfg=powerbi_cfg,
+        config_root=config_root,
+        output_dir=output_dir,
+        config_path=config_path,
+    )
+
+    if scenario.get("status") == "skipped":
+        return scenario
+
+    scenario_path = output_dir / "published_report_test_scenario.json"
+    _write_json(scenario_path, scenario)
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "test_published_reports_playwright.py"
+    command = [sys.executable, str(script_path), "--scenario", str(scenario_path)]
+
+    timeout_seconds = _safe_positive_int((config_root.get("published_report_test") or {}).get("timeout_seconds"))
+    effective_timeout_seconds = timeout_seconds or 1800
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(script_path.parent),
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "failed",
+            "scenario_path": str(scenario_path),
+            "command": command,
+            "returncode": None,
+            "stdout": _subprocess_output_text(exc.stdout),
+            "stderr": _subprocess_output_text(exc.stderr),
+            "error_type": "TimeoutExpired",
+            "error": f"Published report Playwright tests timed out after {effective_timeout_seconds} seconds.",
+        }
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    payload: dict[str, Any] = {}
+    if stdout:
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = {"status": "failed", "error": "Playwright runner did not return JSON.", "stdout": stdout}
+
+    if completed.returncode == 0 and payload.get("status") == "passed":
+        payload["scenario_path"] = str(scenario_path)
+        payload["command"] = command
+        payload["stderr"] = stderr
+        return payload
+
+    if isinstance(payload, dict) and payload:
+        payload.setdefault("status", "failed")
+        payload["scenario_path"] = str(scenario_path)
+        payload["command"] = command
+        payload["returncode"] = completed.returncode
+        payload["stderr"] = stderr
+        payload["error"] = _published_report_test_error(payload)
+        return payload
+
+    return {
+        "status": "failed",
+        "scenario_path": str(scenario_path),
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "error": _published_report_test_error(payload)
+        if isinstance(payload, dict)
+        else "Published report Playwright tests failed.",
+    }
+
+
+def _published_report_test_error(payload: dict[str, Any]) -> str:
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    data_tests = payload.get("data_tests")
+    if isinstance(data_tests, dict) and str(data_tests.get("status") or "").lower() == "failed":
+        summary = _optional_str(data_tests.get("summary"))
+        return f"Published report data validation failed: {summary or 'one or more data checks failed.'}"
+    screenshot_tests = payload.get("screenshot_tests")
+    if isinstance(screenshot_tests, dict) and str(screenshot_tests.get("status") or "").lower() == "failed":
+        comparison = screenshot_tests.get("secondary_visual_check") or screenshot_tests.get("comparison")
+        comparison_error = ""
+        if isinstance(comparison, dict):
+            comparison_error = _optional_str(comparison.get("error") or comparison.get("reason"))
+        return f"Published report screenshot validation failed: {comparison_error or 'one or more screenshot checks failed.'}"
+    reports = payload.get("reports")
+    if isinstance(reports, dict):
+        messages = []
+        for report_name, report in reports.items():
+            if not isinstance(report, dict) or str(report.get("status") or "").lower() == "passed":
+                continue
+            report_error = report.get("error")
+            if isinstance(report_error, str) and report_error.strip():
+                messages.append(f"{report_name}: {report_error.strip()}")
+        if messages:
+            return "; ".join(messages)
+    return "Published report Playwright tests failed."
+
+
+def _subprocess_output_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _build_published_report_test_scenario(
+    parsed_payload: dict,
+    tableau_publish_report: dict,
+    powerbi_publish_report: dict,
+    tableau_cfg: dict | None,
+    powerbi_cfg: dict | None,
+    config_root: dict,
+    output_dir: Path,
+    config_path: Path | None = None,
+) -> dict:
+    test_cfg = config_root.get("published_report_test") if isinstance(config_root, dict) else None
+    configured_filters = {}
+    if isinstance(test_cfg, dict) and isinstance(test_cfg.get("filters"), dict):
+        configured_filters.update(test_cfg.get("filters"))
+
+    report_parameters = parsed_payload.get("report_parameters", []) if isinstance(parsed_payload, dict) else []
+    configured_filters.update(_report_parameter_defaults(report_parameters))
+
+    tableau_url = _optional_str(
+        tableau_publish_report.get("workbook_webpage_url")
+        or tableau_publish_report.get("workbook_content_url")
+        or tableau_publish_report.get("workbook_url")
+    )
+    powerbi_url = _optional_str(
+        powerbi_publish_report.get("report_web_url")
+        or (powerbi_publish_report.get("response") or {}).get("webUrl")
+        or powerbi_publish_report.get("report_url")
+    )
+
+    if not tableau_url or not powerbi_url:
+        return {
+            "status": "skipped",
+            "reason": "Missing published report URL(s) for Playwright testing",
+            "tableau_url": tableau_url or "",
+            "powerbi_url": powerbi_url or "",
+        }
+
+    powerbi_storage_state_path = _published_report_storage_state_path(test_cfg, "powerbi", powerbi_cfg)
+    tableau_storage_state_path = _published_report_storage_state_path(test_cfg, "tableau", tableau_cfg)
+    powerbi_prefer_user_data_dir = _published_report_prefer_user_data_dir(test_cfg, "powerbi")
+    tableau_prefer_user_data_dir = _published_report_prefer_user_data_dir(test_cfg, "tableau")
+
+    scenario: dict[str, Any] = {
+        "status": "ready",
+        "output": {"dir": str(output_dir / "published_report_tests")},
+        "filters": configured_filters,
+        "reports": {
+            "powerbi": {
+                "url": powerbi_url,
+                "screenshot_name": "powerbi_report.png",
+                "full_page": True,
+                "wait_after_render_ms": 2000,
+                "url_filter_params": {f"rp:{name}": name for name in configured_filters},
+                "storage_state_path": "" if powerbi_prefer_user_data_dir else powerbi_storage_state_path,
+                "user_data_dir": (
+                    _published_report_user_data_dir(test_cfg, "powerbi")
+                    if powerbi_prefer_user_data_dir or not powerbi_storage_state_path
+                    else ""
+                ),
+                "prefer_user_data_dir": powerbi_prefer_user_data_dir,
+            },
+            "tableau": {
+                "url": tableau_url,
+                "screenshot_name": "tableau_report.png",
+                "full_page": True,
+                "wait_after_render_ms": 2000,
+                "filter_steps": _published_report_filter_steps(test_cfg, report_name="tableau"),
+                "storage_state_path": "" if tableau_prefer_user_data_dir else tableau_storage_state_path,
+                "user_data_dir": (
+                    _published_report_user_data_dir(test_cfg, "tableau")
+                    if tableau_prefer_user_data_dir or not tableau_storage_state_path
+                    else ""
+                ),
+                "prefer_user_data_dir": tableau_prefer_user_data_dir,
+            },
+        },
+    }
+    if config_path is not None:
+        scenario["llm_config_path"] = str(config_path)
+
+    screenshot_tests = _published_report_screenshot_test_options(test_cfg)
+    if screenshot_tests:
+        scenario["screenshot_tests"] = screenshot_tests
+
+    data_tests = _published_report_data_test_options(test_cfg)
+    if data_tests:
+        scenario["data_tests"] = data_tests
+
+    tableau_view_name = _published_report_text_option(
+        test_cfg,
+        "tableau",
+        ["view_name", "dashboard_name", "tableau_view_name", "sheet_name"],
+    )
+    if tableau_view_name:
+        scenario["reports"]["tableau"]["view_name"] = tableau_view_name
+
+    tableau_ready_texts = _published_report_list_option(test_cfg, "tableau", "ready_texts")
+    if tableau_ready_texts:
+        scenario["reports"]["tableau"]["ready_texts"] = tableau_ready_texts
+
+    powerbi_ready_texts = _published_report_list_option(test_cfg, "powerbi", "ready_texts")
+    if powerbi_ready_texts:
+        scenario["reports"]["powerbi"]["ready_texts"] = powerbi_ready_texts
+
+    powerbi_steps = _published_report_filter_steps(test_cfg, report_name="powerbi")
+    if powerbi_steps:
+        scenario["reports"]["powerbi"]["filter_steps"] = powerbi_steps
+    elif isinstance(test_cfg, dict) and isinstance(test_cfg.get("powerbi_filter_steps"), list):
+        scenario["reports"]["powerbi"]["filter_steps"] = test_cfg.get("powerbi_filter_steps")
+
+    tableau_steps = scenario["reports"]["tableau"].get("filter_steps")
+    if not tableau_steps and isinstance(test_cfg, dict) and isinstance(test_cfg.get("tableau_filter_steps"), list):
+        scenario["reports"]["tableau"]["filter_steps"] = test_cfg.get("tableau_filter_steps")
+
+    return scenario
+
+
+def _published_report_filter_steps(test_cfg: dict | None, report_name: str) -> list[dict]:
+    if not isinstance(test_cfg, dict):
+        return []
+    report_cfg = test_cfg.get(report_name)
+    if isinstance(report_cfg, dict) and isinstance(report_cfg.get("filter_steps"), list):
+        return [step for step in report_cfg.get("filter_steps") if isinstance(step, dict)]
+    return []
+
+
+def _published_report_text_option(test_cfg: dict | None, report_name: str, keys: list[str]) -> str:
+    if not isinstance(test_cfg, dict):
+        return ""
+    report_cfg = test_cfg.get(report_name)
+    for key in keys:
+        if isinstance(report_cfg, dict):
+            value = _optional_str(report_cfg.get(key))
+            if value:
+                return value
+        value = _optional_str(test_cfg.get(f"{report_name}_{key}"))
+        if value:
+            return value
+    return ""
+
+
+def _published_report_list_option(test_cfg: dict | None, report_name: str, key: str) -> list[str]:
+    if not isinstance(test_cfg, dict):
+        return []
+    report_cfg = test_cfg.get(report_name)
+    candidates = []
+    if isinstance(report_cfg, dict):
+        candidates.append(report_cfg.get(key))
+    candidates.append(test_cfg.get(f"{report_name}_{key}"))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            values = [_optional_str(item) for item in candidate]
+            values = [item for item in values if item]
+            if values:
+                return values
+    return []
+
+
+def _published_report_screenshot_test_options(test_cfg: dict | None) -> dict[str, Any]:
+    if not isinstance(test_cfg, dict):
+        return {}
+    options = test_cfg.get("screenshot_tests")
+    if not isinstance(options, dict):
+        return {}
+    allowed_keys = {
+        "enabled",
+        "source_report",
+        "target_report",
+        "min_width",
+        "min_height",
+        "min_non_white_ratio",
+        "min_stddev",
+        "comparison_width",
+        "comparison_height",
+        "min_similarity_percent",
+        "report_content_crop",
+        "content_crop",
+    }
+    return {key: value for key, value in options.items() if key in allowed_keys}
+
+
+def _published_report_data_test_options(test_cfg: dict | None) -> dict[str, Any]:
+    if not isinstance(test_cfg, dict):
+        return {}
+    options = test_cfg.get("data_tests")
+    if not isinstance(options, dict):
+        return {}
+    allowed_keys = {
+        "enabled",
+        "source_report",
+        "target_report",
+        "numeric_tolerance_percent",
+        "minor_delta_tolerance_percent",
+        "strict_missing_values",
+        "required_kpis",
+        "required_chart_categories",
+        "screenshot_ocr",
+        "screenshot_vision",
+    }
+    return {key: value for key, value in options.items() if key in allowed_keys}
+
+
+def _published_report_prefer_user_data_dir(test_cfg: dict | None, report_name: str) -> bool:
+    if not isinstance(test_cfg, dict):
+        return False
+    report_cfg = test_cfg.get(report_name)
+    candidates = []
+    if isinstance(report_cfg, dict):
+        candidates.extend([report_cfg.get("prefer_user_data_dir"), report_cfg.get("prefer_profile")])
+    candidates.extend(
+        [
+            test_cfg.get(f"{report_name}_prefer_user_data_dir"),
+            test_cfg.get(f"{report_name}_prefer_profile"),
+        ]
+    )
+    return any(_truthy_value(candidate) for candidate in candidates)
+
+
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _published_report_storage_state_path(
+    test_cfg: dict | None,
+    report_name: str,
+    service_cfg: dict | None,
+) -> str:
+    report_cfg = test_cfg.get(report_name) if isinstance(test_cfg, dict) else None
+    candidates = []
+    if isinstance(report_cfg, dict):
+        candidates.append(report_cfg.get("storage_state_path"))
+    if isinstance(test_cfg, dict):
+        candidates.append(test_cfg.get(f"{report_name}_storage_state_path"))
+    if isinstance(service_cfg, dict):
+        candidates.append(service_cfg.get("storage_state_path"))
+    candidates.extend(
+        [
+            os.getenv(f"{report_name.upper()}_PLAYWRIGHT_STORAGE_STATE"),
+            os.getenv(f"PUBLISHED_REPORT_{report_name.upper()}_STORAGE_STATE"),
+            Path(__file__).resolve().parents[3] / ".auth" / f"{report_name}-storage-state.json",
+            Path(__file__).resolve().parents[3] / ".auth" / f"{report_name}_storage_state.json",
+        ]
+    )
+
+    for candidate in candidates:
+        path_value = _resolve_optional_env_value(candidate)
+        if path_value:
+            return path_value
+    return ""
+
+
+def _resolve_optional_env_value(value: Any) -> str:
+    text = _optional_str(value)
+    if not text:
+        return ""
+    if text.lower().startswith("env:"):
+        env_name = text.split(":", 1)[1].strip()
+        return _optional_str(os.getenv(env_name)) if env_name else ""
+    return text
+
+
+def _published_report_user_data_dir(test_cfg: dict | None, report_name: str) -> str:
+    report_cfg = test_cfg.get(report_name) if isinstance(test_cfg, dict) else None
+    candidates = []
+    if isinstance(report_cfg, dict):
+        candidates.extend([report_cfg.get("user_data_dir"), report_cfg.get("profile_dir")])
+    if isinstance(test_cfg, dict):
+        candidates.extend(
+            [
+                test_cfg.get(f"{report_name}_user_data_dir"),
+                test_cfg.get(f"{report_name}_profile_dir"),
+            ]
+        )
+    candidates.extend(
+        [
+            os.getenv(f"{report_name.upper()}_PLAYWRIGHT_USER_DATA_DIR"),
+            os.getenv(f"PUBLISHED_REPORT_{report_name.upper()}_USER_DATA_DIR"),
+            Path(__file__).resolve().parents[3] / ".auth" / f"{report_name}-profile",
+            Path(__file__).resolve().parents[3] / ".auth" / f"{report_name}_profile",
+        ]
+    )
+
+    for candidate in candidates:
+        path_value = _resolve_optional_env_value(candidate)
+        if path_value and Path(path_value).exists():
+            return path_value
+    return ""
+
+
+def _report_parameter_defaults(report_parameters: object) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if not isinstance(report_parameters, list):
+        return result
+    for parameter in report_parameters:
+        if not isinstance(parameter, dict):
+            continue
+        name = _optional_str(parameter.get("name"))
+        if not name:
+            continue
+        defaults = parameter.get("default_values")
+        if isinstance(defaults, list) and defaults:
+            normalized = [_optional_str(value) for value in defaults]
+            normalized = [value for value in normalized if value]
+            if normalized:
+                result[name] = normalized if len(normalized) > 1 else normalized[0]
+    return result
 
 
 def _validate_parsed_report_payload(parsed_payload: dict) -> dict:

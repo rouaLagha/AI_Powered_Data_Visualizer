@@ -13,3 +13,4 @@ frontend/**/playwright-report/
 frontend/**/test-results/
 frontend/sql_model_react/e2e/reports/
 backend/config/llm_config.json
+.auth/

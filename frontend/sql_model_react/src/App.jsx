@@ -233,6 +233,7 @@ export default function App() {
   const [publicationResult, setPublicationResult] = useState(publicationResultFromState({}));
   const [consumerWorkbook, setConsumerWorkbook] = useState({ generated: false, name: "", downloadUrl: "" });
   const [qualityComparison, setQualityComparison] = useState(emptyQualityComparison);
+  const [publishedReportTest, setPublishedReportTest] = useState({});
 
   function applyBackendState(state) {
     setBackendState(state);
@@ -262,6 +263,7 @@ export default function App() {
     setPublicationResult(publicationResultFromState(state));
     setConsumerWorkbook(consumerWorkbookFromState(state));
     setQualityComparison(qualityComparisonFromState(state));
+    setPublishedReportTest(state.published_report_test_report || {});
   }
 
   function syncPipelineToState(state) {
@@ -357,6 +359,7 @@ export default function App() {
     setPublicationResult(publicationResultFromState({}));
     setConsumerWorkbook({ generated: false, name: "", downloadUrl: "" });
     setQualityComparison(emptyQualityComparison);
+    setPublishedReportTest({});
   }
 
   async function parseUploadedRdl() {
@@ -587,6 +590,7 @@ export default function App() {
         return (
           <QualityComparisonStep
             qualityComparison={qualityComparison}
+            publishedReportTest={publishedReportTest}
             onRunComparison={runQualityComparison}
             loading={Boolean(loading)}
             loadingText={loading}
@@ -615,6 +619,7 @@ export default function App() {
     publicationResult,
     consumerWorkbook,
     qualityComparison,
+    publishedReportTest,
   ]);
 
   const headerContext = {

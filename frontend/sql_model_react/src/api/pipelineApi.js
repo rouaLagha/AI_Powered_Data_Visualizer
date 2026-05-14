@@ -107,6 +107,7 @@ export const emptyQualityComparison = {
   globalScore: 0,
   summary: "",
   metrics: [],
+  details: {},
 };
 
 function apiUrl(path) {
@@ -700,5 +701,6 @@ export function qualityComparisonFromState(state) {
     globalScore,
     summary: comparison.summary || comparison.message || "",
     metrics,
+    details: comparison.details || comparison.sections || {},
   };
 }

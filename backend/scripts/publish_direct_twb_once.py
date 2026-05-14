@@ -27,7 +27,7 @@ def main() -> int:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
 
-    config_payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    config_payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     tableau_cfg = config_payload.get("tableau_cloud")
     if not isinstance(tableau_cfg, dict):
         raise ValueError("Missing tableau_cloud config.")

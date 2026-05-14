@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-from pathlib import Path
 import re
+import time
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -105,6 +106,23 @@ def publish_rdl_if_configured(
         }
 
     payload = _json_or_text(response_body)
+    report_details: dict[str, Any] = {}
+    import_id = _optional_str(payload.get("id") if isinstance(payload, dict) else None)
+    if import_id and 200 <= status_code < 300:
+        report_details = _fetch_import_details(
+            token=token,
+            import_id=import_id,
+            workspace_id=workspace_id,
+            timeout_seconds=timeout_seconds,
+            poll_timeout_seconds=_safe_timeout(powerbi_config.get("import_poll_timeout_seconds"), default=120),
+            poll_interval_seconds=_safe_timeout(powerbi_config.get("import_poll_interval_seconds"), default=5),
+        )
+
+    report_web_url, report_embed_url, report_id = _extract_report_links(report_details)
+    import_state = _optional_str((report_details or {}).get("importState")) if isinstance(report_details, dict) else None
+    if not import_state and isinstance(payload, dict):
+        import_state = _optional_str(payload.get("importState"))
+
     return {
         "status": "published" if 200 <= status_code < 300 else "failed",
         "http_status": status_code,
@@ -113,6 +131,12 @@ def publish_rdl_if_configured(
         "rdl_path": str(path),
         "timestamp_utc": timestamp_utc,
         "response": payload,
+        "import_id": import_id or "",
+        "import_state": import_state or "",
+        "report_id": report_id or "",
+        "report_web_url": report_web_url or "",
+        "report_embed_url": report_embed_url or "",
+        "report_details": report_details,
     }
 
 
@@ -159,6 +183,56 @@ def _resolve_access_token(cfg: dict[str, Any]) -> str:
     if not token:
         raise RuntimeError("Power BI token response did not include access_token.")
     return token
+
+
+def _fetch_import_details(
+    token: str,
+    import_id: str,
+    workspace_id: str | None,
+    timeout_seconds: int,
+    poll_timeout_seconds: int,
+    poll_interval_seconds: int,
+) -> dict[str, Any]:
+    endpoint = f"{POWERBI_API_ROOT}/imports/{import_id}"
+    if workspace_id:
+        endpoint = f"{POWERBI_API_ROOT}/groups/{workspace_id}/imports/{import_id}"
+
+    deadline = time.monotonic() + max(1, poll_timeout_seconds)
+    request = Request(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+
+    last_payload: dict[str, Any] = {}
+    while True:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            last_payload = _json_or_text(response.read().decode("utf-8", errors="replace")) if hasattr(response, "read") else {}
+        state = _optional_str(last_payload.get("importState") if isinstance(last_payload, dict) else None, default="")
+        if state.lower() in {"succeeded", "failed", "partiallysucceeded"}:
+            return last_payload
+        if time.monotonic() >= deadline:
+            return last_payload
+        time.sleep(max(1, poll_interval_seconds))
+
+
+def _extract_report_links(payload: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    reports = payload.get("reports") if isinstance(payload, dict) else None
+    if not isinstance(reports, list):
+        return None, None, None
+
+    for item in reports:
+        if not isinstance(item, dict):
+            continue
+        web_url = _optional_str(item.get("webUrl"))
+        embed_url = _optional_str(item.get("embedUrl"))
+        report_id = _optional_str(item.get("id"))
+        if web_url or embed_url or report_id:
+            return web_url, embed_url, report_id
+    return None, None, None
 
 
 def _multipart_body(

@@ -43,7 +43,7 @@ def load_llm_from_config(config_path: str | Path) -> LLMClient:
     if not cfg_path.exists() or not cfg_path.is_file():
         raise FileNotFoundError(f"LLM config not found: {cfg_path}")
 
-    payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    payload = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict) or "agent1" not in payload:
         raise ValueError("LLM config must contain an 'agent1' section.")
 

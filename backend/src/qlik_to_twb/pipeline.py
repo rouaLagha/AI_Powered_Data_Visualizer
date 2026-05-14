@@ -171,7 +171,7 @@ def _load_mapping_llm(config_path: str | Path | None) -> LLMClient:
     if config_path is None or not str(config_path).strip():
         raise ValueError("config_path is required for Qlik to Tableau LLM mapping.")
 
-    cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    cfg = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
     agent_cfg = cfg.get("qlik_mapping_agent") or cfg.get("agent1")
     if not isinstance(agent_cfg, dict):
         raise ValueError("LLM config must include 'qlik_mapping_agent' or 'agent1'.")
@@ -182,7 +182,7 @@ def _load_twb_llm(config_path: str | Path | None) -> LLMClient:
     if config_path is None or not str(config_path).strip():
         raise ValueError("config_path is required for Qlik TWB XML generation.")
 
-    cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    cfg = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
     agent_cfg = (
         cfg.get("qlik_twb_agent")
         or cfg.get("tableau_xml_agent")

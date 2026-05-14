@@ -7670,7 +7670,7 @@ def _load_tableau_publish_defaults(config_path: str) -> dict[str, Any]:
         return defaults
 
     try:
-        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        payload = json.loads(resolved_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return defaults
 

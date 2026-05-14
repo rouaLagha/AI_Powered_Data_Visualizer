@@ -44,6 +44,9 @@ from src.rdl_ai_editor import apply_patch_to_rdl, load_llm_from_config, nlp_agen
 from src.rdl_ai_editor.logging_utils import write_patch_log
 from src.rdl_to_twb.pipeline import run_conversion as run_full_conversion
 from src.rdl_to_twb.powerbi_publisher import publish_rdl_if_configured
+from src.rdl_to_twb.pipeline import (
+    run_published_report_tests,
+)
 from src.qlik_to_twb.metadata_pipeline import run_qlik_metadata_job, run_uploaded_qlik_metadata_job
 from src.qlik_to_twb.pipeline import run_qlik_to_twb
 from sql_model_assistant_app import (
@@ -133,6 +136,7 @@ def _initial_app_state() -> dict[str, Any]:
         "publish_error": "",
         "consumer_workbook_path": "",
         "quality_comparison": {},
+        "published_report_test_report": {},
         "database_inventory_cache": {},
     }
 
@@ -236,7 +240,7 @@ def _resolve_config_path_value(path_value: str | Path | None = None) -> Path:
 def _load_json_config_payload(path_value: str | Path | None = None) -> dict[str, Any]:
     config_path = _resolve_config_path_value(path_value)
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -2233,6 +2237,7 @@ def _state_snapshot() -> dict[str, Any]:
         "publish_error": APP_STATE.get("publish_error", ""),
         "consumer_workbook": _consumer_workbook_payload(),
         "quality_comparison": APP_STATE.get("quality_comparison", {}),
+        "published_report_test_report": APP_STATE.get("published_report_test_report", {}),
         "defaults": {
             "config_path": str(_preferred_config_path()),
             "template_path": _resolve_template_path_value(""),
@@ -2686,36 +2691,52 @@ def _build_quality_comparison() -> dict[str, Any]:
     if not generated_twb.get("exists"):
         raise ValueError("Generate the Tableau workbook before running quality comparison.")
 
-    data_sets = report.get("data_sets", [])
-    visuals = report.get("visuals", [])
-    data_set_count = len(data_sets) if isinstance(data_sets, list) else 0
-    visual_count = len(visuals) if isinstance(visuals, list) else 0
-    sql_query = str(APP_STATE.get("sql_query") or "").strip()
-    fact_count = _model_fact_count(model)
-    dimension_count = _model_dimension_count(model)
-    measure_count = _model_measure_count(model)
-    relationship_count = _model_relationship_count(model)
+    report_profile = _semantic_report_profile(report)
+    model_profile = _semantic_model_profile(model)
+
+    parameter_comparison = _compare_semantic_collection(
+        label="Parameters",
+        source_items=report_profile["parameters"],
+        target_items=model_profile["parameters"],
+        signature_fn=_parameter_signature,
+        tolerance_percent=0.0,
+    )
+    dataset_comparison = _compare_semantic_collection(
+        label="Datasets",
+        source_items=report_profile["datasets"],
+        target_items=model_profile["datasets"],
+        signature_fn=_dataset_signature,
+        tolerance_percent=15.0,
+    )
+    visual_comparison = _compare_semantic_collection(
+        label="Visuals",
+        source_items=report_profile["visuals"],
+        target_items=model_profile["visuals"],
+        signature_fn=_visual_signature,
+        tolerance_percent=20.0,
+    )
+    mapping_comparison = _compare_mapping_alignment(report_profile, model_profile)
 
     metrics = [
         _quality_metric(
-            "Dataset extraction",
-            100 if data_set_count and sql_query else 55,
-            f"{data_set_count} dataset(s) extracted; SQL {'available' if sql_query else 'missing'}.",
+            "Parameter fidelity",
+            parameter_comparison["score"],
+            parameter_comparison["summary"],
         ),
         _quality_metric(
-            "SQL table coverage",
-            100 if fact_count and dimension_count else 65,
-            f"{fact_count} fact table(s) and {dimension_count} dimension table(s) detected from the selected SQL.",
+            "Dataset fidelity",
+            dataset_comparison["score"],
+            dataset_comparison["summary"],
         ),
         _quality_metric(
-            "Measures coverage",
-            100 if measure_count else 60,
-            f"{measure_count} measure(s) available in the semantic model.",
+            "Visual semantic fidelity",
+            visual_comparison["score"],
+            visual_comparison["summary"],
         ),
         _quality_metric(
-            "Relationship coverage",
-            100 if relationship_count else 60,
-            f"{relationship_count} relationship(s) mapped into the Tableau model.",
+            "Mapping fidelity",
+            mapping_comparison["score"],
+            mapping_comparison["summary"],
         ),
         _quality_metric(
             "Tableau artifact readiness",
@@ -2727,27 +2748,541 @@ def _build_quality_comparison() -> dict[str, Any]:
             100 if consumer_workbook.get("exists") else 88,
             f"Consumer workbook artifact: {consumer_workbook.get('name') or 'not linked yet'}.",
         ),
-        _quality_metric(
-            "Visual mapping fidelity",
-            92 if visual_count else 86,
-            f"{visual_count} RDL visual node(s) considered against the generated Tableau workbook.",
-        ),
     ]
-    global_score = _clamp_quality_score(sum(metric["score"] for metric in metrics) / len(metrics))
+    semantic_metrics = metrics[:4]
+    global_score = _clamp_quality_score(sum(metric["score"] for metric in semantic_metrics) / len(semantic_metrics))
     return {
         "executed": True,
         "status": "completed",
         "global_score": global_score,
-        "summary": "Quality comparison completed between the parsed RDL structure and generated Tableau artifacts.",
+        "summary": "Quality comparison matched report semantics against generated Tableau semantics without using layout position as the primary signal.",
         "metrics": metrics,
+        "details": {
+            "parameter_comparison": parameter_comparison,
+            "dataset_comparison": dataset_comparison,
+            "visual_comparison": visual_comparison,
+            "mapping_comparison": mapping_comparison,
+        },
     }
+
+
+def _semantic_report_profile(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "parameters": [_parameter_signature(parameter) for parameter in _as_list(report.get("report_parameters"))],
+        "datasets": [_dataset_signature(dataset) for dataset in _as_list(report.get("data_sets"))],
+        "visuals": [_visual_signature(visual) for visual in _flatten_semantic_visuals(_as_list(report.get("visuals")))],
+    }
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _normalize_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _value_to_str(value).lower()).strip()
+
+
+def _clamp_unit_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _semantic_model_profile(model: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    data_model = model.get("data_model") if isinstance(model.get("data_model"), dict) else model
+    visual_model = model.get("visual_model") if isinstance(model.get("visual_model"), dict) else model
+    mapping = model.get("mapping") if isinstance(model.get("mapping"), dict) else {}
+
+    parameters = _as_list(data_model.get("parameters"))
+    datasets = _as_list(data_model.get("datasets"))
+    visuals = _as_list(visual_model.get("visuals"))
+    if not visuals:
+        visuals = _as_list(visual_model.get("sheets"))
+
+    return {
+        "parameters": [_parameter_signature(parameter) for parameter in parameters],
+        "datasets": [_dataset_signature(dataset) for dataset in datasets],
+        "visuals": [_visual_signature(visual) for visual in _flatten_semantic_visuals(visuals)],
+        "mapping": _mapping_signature(mapping),
+    }
+
+
+def _flatten_semantic_visuals(visuals: list[Any]) -> list[dict[str, Any]]:
+    flattened: list[dict[str, Any]] = []
+    for visual in visuals:
+        if not isinstance(visual, dict):
+            continue
+        flattened.append(visual)
+        children = visual.get("children")
+        if isinstance(children, list) and children:
+            flattened.extend(_flatten_semantic_visuals(children))
+    return flattened
+
+
+def _parameter_signature(parameter: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": _value_to_str(parameter.get("name")),
+        "type": _value_to_str(parameter.get("type")),
+        "nullable": parameter.get("nullable"),
+        "multi_value": parameter.get("multi_value"),
+    }
+
+
+def _dataset_signature(dataset: dict[str, Any]) -> dict[str, Any]:
+    fields = []
+    for field in _as_list(dataset.get("fields")):
+        if not isinstance(field, dict):
+            continue
+        fields.append(
+            {
+                "name": _value_to_str(field.get("name")),
+                "data_field": _value_to_str(field.get("data_field")),
+                "type_name": _value_to_str(field.get("type_name")),
+            }
+        )
+    return {
+        "name": _value_to_str(dataset.get("name")),
+        "data_source_name": _value_to_str(dataset.get("data_source_name")),
+        "query": _normalize_query_text(dataset.get("query")),
+        "fields": fields,
+        "query_parameters": _as_list(dataset.get("query_parameters")),
+        "filters": _as_list(dataset.get("filters")),
+        "sort_expressions": _as_list(dataset.get("sort_expressions")),
+    }
+
+
+def _visual_signature(visual: dict[str, Any]) -> dict[str, Any]:
+    properties = visual.get("properties") if isinstance(visual.get("properties"), dict) else {}
+    chart = properties.get("chart") if isinstance(properties.get("chart"), dict) else {}
+    tablix = properties.get("tablix") if isinstance(properties.get("tablix"), dict) else {}
+    field_refs = _as_list(properties.get("field_references"))
+    parameter_refs = _as_list(properties.get("parameter_references"))
+    expressions = _as_list(visual.get("expressions"))
+
+    return {
+        "name": _value_to_str(visual.get("name")),
+        "visual_type": _value_to_str(visual.get("visual_type")),
+        "dataset_name": _value_to_str(visual.get("dataset_name")),
+        "semantic_hint": _value_to_str(properties.get("semantic_hint")),
+        "field_refs": [_value_to_str(item) for item in field_refs if _value_to_str(item)],
+        "parameter_refs": [_value_to_str(item) for item in parameter_refs if _value_to_str(item)],
+        "expressions": [_normalize_expression_text(item) for item in expressions if _value_to_str(item)],
+        "chart": {
+            "category_expressions": _as_list(chart.get("category_expressions")),
+            "category_labels": _as_list(chart.get("category_labels")),
+            "series_names": _as_list(chart.get("series_names")),
+            "value_expressions": _as_list(chart.get("value_expressions")),
+            "titles": _as_list(chart.get("titles")),
+            "resolved_chart_type": _value_to_str(chart.get("resolved_chart_type")),
+        },
+        "tablix": {
+            "row_groups": _as_list(tablix.get("row_groups")),
+            "column_groups": _as_list(tablix.get("column_groups")),
+            "cell_expressions": _as_list(tablix.get("cell_expressions")),
+        },
+    }
+
+
+def _mapping_signature(mapping: dict[str, Any]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for key in ["visual_to_dataset", "visual_to_fields", "parameter_usage"]:
+        for item in _as_list(mapping.get(key)):
+            if isinstance(item, dict):
+                payload.append({"kind": key, **item})
+    return payload
+
+
+def _compare_semantic_collection(
+    label: str,
+    source_items: list[dict[str, Any]],
+    target_items: list[dict[str, Any]],
+    signature_fn,
+    tolerance_percent: float,
+) -> dict[str, Any]:
+    matches, unmatched_source, unmatched_target = _match_semantic_items(source_items, target_items, signature_fn)
+    pair_details = []
+    passed_pairs = 0
+    for source_item, target_item, similarity in matches:
+        delta_percent = round((1 - similarity) * 100, 2)
+        item_passed = delta_percent <= tolerance_percent
+        if item_passed:
+            passed_pairs += 1
+        pair_details.append(
+            {
+                "source": source_item,
+                "target": target_item,
+                "similarity_percent": round(similarity * 100, 2),
+                "delta_percent": delta_percent,
+                "passed": item_passed,
+            }
+        )
+
+    total_items = max(len(source_items), len(target_items), 1)
+    matched_total = len(matches)
+    coverage_percent = (matched_total / total_items) * 100
+    precision_loss = len(unmatched_target) / total_items * 100
+    recall_loss = len(unmatched_source) / total_items * 100
+    average_match_percent = (sum(item["similarity_percent"] for item in pair_details) / len(pair_details)) if pair_details else 0.0
+    score = _clamp_quality_score(max(0.0, average_match_percent - max(precision_loss, recall_loss)))
+    summary = (
+        f"{matched_total}/{total_items} matched semantic {label.lower()} items; "
+        f"{len(unmatched_source)} missing in generated model; {len(unmatched_target)} extra in generated model."
+    )
+    return {
+        "label": label,
+        "score": score,
+        "summary": summary,
+        "coverage_percent": round(coverage_percent, 2),
+        "average_match_percent": round(average_match_percent, 2),
+        "tolerance_percent": tolerance_percent,
+        "matched_items": pair_details,
+        "missing_in_target": unmatched_source,
+        "extra_in_target": unmatched_target,
+    }
+
+
+def _match_semantic_items(
+    source_items: list[dict[str, Any]],
+    target_items: list[dict[str, Any]],
+    signature_fn,
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any], float]], list[dict[str, Any]], list[dict[str, Any]]]:
+    remaining_targets = list(target_items)
+    matches: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+    unmatched_source: list[dict[str, Any]] = []
+
+    for source_item in source_items:
+        best_index = -1
+        best_similarity = 0.0
+        for index, target_item in enumerate(remaining_targets):
+            similarity = _semantic_similarity(signature_fn(source_item), signature_fn(target_item))
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_index = index
+
+        if best_index < 0 or best_similarity < 0.35:
+            unmatched_source.append(source_item)
+            continue
+
+        target_item = remaining_targets.pop(best_index)
+        matches.append((source_item, target_item, best_similarity))
+
+    return matches, unmatched_source, remaining_targets
+
+
+def _semantic_similarity(source_signature: dict[str, Any], target_signature: dict[str, Any]) -> float:
+    source_tokens = _signature_tokens(source_signature)
+    target_tokens = _signature_tokens(target_signature)
+    if not source_tokens and not target_tokens:
+        return 1.0
+    if not source_tokens or not target_tokens:
+        return 0.0
+    intersection = len(source_tokens & target_tokens)
+    union = len(source_tokens | target_tokens)
+    token_similarity = intersection / max(union, 1)
+
+    exact_name_match = 1.0 if _normalize_key(source_signature.get("name")) == _normalize_key(target_signature.get("name")) and _value_to_str(source_signature.get("name")) else 0.0
+    exact_type_match = 1.0 if _normalize_key(source_signature.get("visual_type") or source_signature.get("type_name")) == _normalize_key(target_signature.get("visual_type") or target_signature.get("type_name")) and _value_to_str(source_signature.get("visual_type") or source_signature.get("type_name")) else 0.0
+    return _clamp_unit_score((token_similarity * 0.6) + (exact_name_match * 0.25) + (exact_type_match * 0.15))
+
+
+def _signature_tokens(signature: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for value in signature.values():
+        if isinstance(value, dict):
+            tokens.update(_signature_tokens(value))
+            continue
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    tokens.update(_signature_tokens(item))
+                else:
+                    tokens.update(_text_tokens(_value_to_str(item)))
+            continue
+        tokens.update(_text_tokens(_value_to_str(value)))
+    return tokens
+
+
+def _text_tokens(value: str) -> set[str]:
+    return {token for token in re.split(r"[^a-z0-9]+", value.lower()) if token}
+
+
+def _normalize_query_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _value_to_str(value).lower()).strip()
+
+
+def _normalize_expression_text(value: Any) -> str:
+    normalized = _value_to_str(value).lower()
+    normalized = normalized.replace("=", " ")
+    normalized = normalized.replace("!", " ")
+    normalized = normalized.replace(".", " ")
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _compare_mapping_alignment(
+    report_profile: dict[str, list[dict[str, Any]]],
+    model_profile: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    source_params = {item.get("name", ""): item for item in report_profile.get("parameters", []) if item.get("name")}
+    target_params = {item.get("name", ""): item for item in model_profile.get("parameters", []) if item.get("name")}
+    source_datasets = {item.get("name", ""): item for item in report_profile.get("datasets", []) if item.get("name")}
+    target_datasets = {item.get("name", ""): item for item in model_profile.get("datasets", []) if item.get("name")}
+
+    param_matches = len(set(source_params) & set(target_params))
+    dataset_matches = len(set(source_datasets) & set(target_datasets))
+
+    source_visuals = report_profile.get("visuals", [])
+    target_visuals = model_profile.get("visuals", [])
+    visual_pairs, visual_missing, visual_extra = _match_semantic_items(source_visuals, target_visuals, _visual_signature)
+    visual_field_overlap = []
+    for source_item, target_item, _similarity in visual_pairs:
+        source_fields = _visual_field_tokens(source_item)
+        target_fields = _visual_field_tokens(target_item)
+        visual_field_overlap.append(_set_overlap_percent(source_fields, target_fields))
+
+    mapping_tokens = {_mapping_item_key(item) for item in _as_list(model_profile.get("mapping")) if _mapping_item_key(item)}
+    source_mapping_tokens = {_mapping_item_key(item) for item in _semantic_source_mappings(report_profile) if _mapping_item_key(item)}
+    mapping_overlap = len(mapping_tokens & source_mapping_tokens)
+    mapping_total = max(len(mapping_tokens), len(source_mapping_tokens), 1)
+    mapping_score = (mapping_overlap / mapping_total) * 100
+
+    total_source = max(len(source_visuals), 1)
+    visual_score = 0.0
+    if visual_pairs:
+        visual_score = sum(visual_field_overlap) / len(visual_field_overlap)
+    visual_score = _clamp_quality_score(visual_score - (len(visual_missing) / total_source) * 100)
+
+    overall = _clamp_quality_score((param_matches / max(len(source_params), len(target_params), 1) * 100 + dataset_matches / max(len(source_datasets), len(target_datasets), 1) * 100 + visual_score + mapping_score) / 4)
+    return {
+        "label": "Mapping",
+        "score": overall,
+        "summary": (
+            f"Parameters matched: {param_matches}; datasets matched: {dataset_matches}; "
+            f"visuals matched: {len(visual_pairs)}; mapping overlap: {mapping_overlap}/{mapping_total}."
+        ),
+        "parameter_matches": param_matches,
+        "dataset_matches": dataset_matches,
+        "visual_matches": len(visual_pairs),
+        "visual_missing": len(visual_missing),
+        "visual_extra": len(visual_extra),
+        "visual_field_overlap_percent": round(visual_score, 2),
+        "mapping_overlap_percent": round(mapping_score, 2),
+    }
+
+
+def _visual_field_tokens(visual_signature: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for key in ["field_refs", "parameter_refs", "expressions"]:
+        for value in _as_list(visual_signature.get(key)):
+            tokens.update(_text_tokens(_value_to_str(value)))
+    chart = visual_signature.get("chart") if isinstance(visual_signature.get("chart"), dict) else {}
+    for key in ["category_expressions", "category_labels", "series_names", "value_expressions", "titles", "resolved_chart_type"]:
+        for value in _as_list(chart.get(key)):
+            tokens.update(_text_tokens(_value_to_str(value)))
+    tablix = visual_signature.get("tablix") if isinstance(visual_signature.get("tablix"), dict) else {}
+    for key in ["row_groups", "column_groups", "cell_expressions"]:
+        for value in _as_list(tablix.get(key)):
+            if isinstance(value, dict):
+                tokens.update(_signature_tokens(value))
+            else:
+                tokens.update(_text_tokens(_value_to_str(value)))
+    return tokens
+
+
+def _set_overlap_percent(source_values: set[str], target_values: set[str]) -> float:
+    if not source_values and not target_values:
+        return 100.0
+    if not source_values or not target_values:
+        return 0.0
+    return (len(source_values & target_values) / max(len(source_values | target_values), 1)) * 100
+
+
+def _mapping_item_key(item: dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    kind = _value_to_str(item.get("kind"))
+    if kind == "visual_to_dataset":
+        return f"visual:{_value_to_str(item.get('visual_name'))}|dataset:{_value_to_str(item.get('dataset_name'))}"
+    if kind == "visual_to_fields":
+        fields = ",".join(_value_to_str(field) for field in _as_list(item.get("fields")) if _value_to_str(field))
+        return f"visual:{_value_to_str(item.get('visual_name'))}|fields:{fields}"
+    if kind == "parameter_usage":
+        fields = ",".join(_value_to_str(field) for field in _as_list(item.get("fields")) if _value_to_str(field))
+        datasets = ",".join(_value_to_str(field) for field in _as_list(item.get("dataset_names")) if _value_to_str(field))
+        return f"parameter:{_value_to_str(item.get('parameter_name'))}|datasets:{datasets}|fields:{fields}"
+    return _normalize_expression_text(item)
+
+
+def _semantic_source_mappings(report_profile: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    for visual in report_profile.get("visuals", []):
+        visual_name = _value_to_str(visual.get("name"))
+        if visual_name:
+            mappings.append({"kind": "visual_to_dataset", "visual_name": visual_name, "dataset_name": _value_to_str(visual.get("dataset_name"))})
+            fields = sorted(_visual_field_tokens(visual))
+            mappings.append({"kind": "visual_to_fields", "visual_name": visual_name, "fields": fields})
+    return mappings
+
+
+def _run_published_report_tests_if_enabled() -> dict[str, Any] | None:
+    tableau_publish_result = APP_STATE.get("publish_report") or {}
+    powerbi_publish_result = APP_STATE.get("powerbi_publish_report") or {}
+    parsed_rdl = APP_STATE.get("parsed_rdl_payload") or {}
+
+    tableau_url = _value_to_str(
+        tableau_publish_result.get("workbook_webpage_url")
+        or tableau_publish_result.get("workbook_content_url")
+        or tableau_publish_result.get("workbook_url")
+    )
+    powerbi_url = _value_to_str(
+        powerbi_publish_result.get("report_web_url")
+        or (powerbi_publish_result.get("response") or {}).get("webUrl")
+        or powerbi_publish_result.get("report_url")
+    )
+
+    print(f"DEBUG _run_published_report_tests_if_enabled: tableau_url = {tableau_url}")
+    print(f"DEBUG _run_published_report_tests_if_enabled: powerbi_url = {powerbi_url}")
+    print(f"DEBUG _run_published_report_tests_if_enabled: tableau_keys = {list(tableau_publish_result.keys())}")
+    print(f"DEBUG _run_published_report_tests_if_enabled: powerbi_keys = {list(powerbi_publish_result.keys())}")
+
+    if not tableau_url or not powerbi_url:
+        result = {
+            "status": "skipped",
+            "reason": "Missing published report URLs",
+            "tableau_url": tableau_url or "not found",
+            "powerbi_url": powerbi_url or "not found",
+            "tableau_publish_result_keys": list(tableau_publish_result.keys()) if isinstance(tableau_publish_result, dict) else [],
+            "powerbi_publish_result_keys": list(powerbi_publish_result.keys()) if isinstance(powerbi_publish_result, dict) else [],
+        }
+        print(f"DEBUG _run_published_report_tests_if_enabled: returning skipped: {result}")
+        return result
+
+    artifact_root = _artifact_run_dir()
+    if not artifact_root:
+        result = {
+            "status": "skipped",
+            "reason": "No artifact workspace directory",
+        }
+        print(f"DEBUG _run_published_report_tests_if_enabled: returning no artifact: {result}")
+        return result
+
+    try:
+        result = run_published_report_tests(
+            output_dir=artifact_root / QUALITY_DIR_NAME,
+            parsed_rdl_payload=parsed_rdl,
+            tableau_publish_result=tableau_publish_result,
+            powerbi_publish_result=powerbi_publish_result,
+            config_path=_preferred_config_path(),
+        )
+        print(f"DEBUG _run_published_report_tests_if_enabled: test result = {result}")
+        return result
+    except Exception as exc:
+        result = {
+            "status": "failed",
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+        print(f"DEBUG _run_published_report_tests_if_enabled: exception: {result}")
+        return result
+
+
+
+def _value_to_str(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _compare_quality_endpoint(_payload: dict[str, Any]) -> dict[str, Any]:
     APP_STATE["quality_comparison"] = _build_quality_comparison()
     _write_quality_artifacts("quality_comparison_completed")
     _write_artifact_manifest("quality_comparison_completed")
-    return _state_snapshot()
+
+    published_report_test_result = _run_published_report_tests_if_enabled()
+    print(f"DEBUG: published_report_test_result = {published_report_test_result}")
+    print(f"DEBUG: bool(published_report_test_result) = {bool(published_report_test_result)}")
+
+    if published_report_test_result:
+        APP_STATE["published_report_test_report"] = published_report_test_result
+        APP_STATE["quality_comparison"] = _merge_published_report_quality_score(
+            APP_STATE.get("quality_comparison", {}),
+            published_report_test_result,
+        )
+        print(f"DEBUG: APP_STATE['published_report_test_report'] set to {published_report_test_result}")
+        quality_dir = _artifact_subdir(QUALITY_DIR_NAME, create=True)
+        try:
+            _write_json_artifact(
+                quality_dir / "published_report_test_report.json",
+                published_report_test_result,
+            )
+            _write_json_artifact(
+                quality_dir / "quality_comparison.json",
+                APP_STATE.get("quality_comparison", {}),
+            )
+        except Exception:
+            pass
+    else:
+        print(f"DEBUG: published_report_test_result is falsy, not setting APP_STATE")
+
+    snapshot = _state_snapshot()
+    print(f"DEBUG: snapshot published_report_test_report = {snapshot.get('published_report_test_report')}")
+    return snapshot
+
+
+def _merge_published_report_quality_score(quality: dict[str, Any], published_report: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(quality) if isinstance(quality, dict) else {}
+    data_tests = published_report.get("data_tests") if isinstance(published_report, dict) else {}
+    screenshot_tests = published_report.get("screenshot_tests") if isinstance(published_report, dict) else {}
+    content_score = _published_report_content_score(data_tests if isinstance(data_tests, dict) else {})
+    screenshot_score = 100 if isinstance(screenshot_tests, dict) and screenshot_tests.get("status") == "passed" else 0
+    metrics = []
+    metrics.append(
+        _quality_metric(
+            "Published report content fidelity",
+            content_score,
+            _value_to_str((data_tests or {}).get("summary")) or "Published report semantic content validation.",
+        )
+    )
+    metrics.append(
+        _quality_metric(
+            "Published report screenshot readiness",
+            screenshot_score,
+            f"Screenshot capture validation: {(screenshot_tests or {}).get('status', 'not run')}.",
+        )
+    )
+    merged["metrics"] = metrics
+    merged["global_score"] = content_score
+    merged["status"] = "completed"
+    merged["executed"] = True
+    merged["summary"] = (
+        "Quality comparison uses the multimodal published-report screenshot validation as the primary output signal."
+    )
+    return merged
+
+
+def _published_report_content_score(data_tests: dict[str, Any]) -> int:
+    status = str(data_tests.get("status") or "").lower()
+    if status == "passed":
+        return 95 if _safe_quality_number(data_tests.get("warning_count")) else 100
+    checks = data_tests.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return 0 if status == "failed" else 75 if status == "partial" else 0
+    failed = sum(1 for check in checks if isinstance(check, dict) and check.get("status") == "failed")
+    partial = sum(1 for check in checks if isinstance(check, dict) and check.get("status") in {"partial", "skipped"})
+    passed = sum(1 for check in checks if isinstance(check, dict) and check.get("status") == "passed")
+    comparable = max(1, passed + failed + partial)
+    score = round((passed + (partial * 0.5)) / comparable * 100)
+    if failed == 0 and status == "partial":
+        score = max(score, 85)
+    return max(0, min(100, int(score)))
+
+
+def _safe_quality_number(value: Any) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _run_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
