@@ -165,6 +165,17 @@ function seriesPointDisplayValue(point, side) {
   return pointDisplayValue(side === "source" ? point?.source : point?.target);
 }
 
+function boundedConformityScore(value) {
+  const numeric = numberOrNull(value);
+  if (numeric === null) return null;
+  const percent = numeric >= 0 && numeric <= 1 ? numeric * 100 : numeric;
+  return Math.min(99, Math.max(1, percent));
+}
+
+function pointConformityValue(point) {
+  return boundedConformityScore(point?.conformity_score ?? point?.conformity_percent);
+}
+
 function groupMatchedPointsByMeasure(matches) {
   const groups = new Map();
   matches.forEach((match) => {
@@ -206,22 +217,27 @@ function renderChartMeasurePointList(row, sourcePoints, targetPoints) {
                 {targetMeasure && targetMeasure !== sourceMeasure && <span>{targetMeasure}</span>}
               </div>
               <div className="quality-chart-point-table">
-                <div className="quality-chart-point-row quality-chart-point-row--head">
+                <div className="quality-chart-point-row quality-chart-point-row--head quality-chart-point-row--scored">
                   <span>Point</span>
                   <b>RDL</b>
                   <b>Tableau</b>
+                  <b>Score</b>
                 </div>
-                {points.map((point, pointIndex) => (
-                  <div
-                    className={`quality-chart-point-row quality-chart-point-row--${normalizeName(point.status || "unknown")}`}
-                    key={`${point.category || pointIndex}-${pointIndex}`}
-                    title={point.reason || ""}
-                  >
-                    <span>{point.category || "-"}</span>
-                    <strong>{seriesPointDisplayValue(point, "source")}</strong>
-                    <strong>{seriesPointDisplayValue(point, "target")}</strong>
-                  </div>
-                ))}
+                {points.map((point, pointIndex) => {
+                  const pointScore = pointConformityValue(point);
+                  return (
+                    <div
+                      className={`quality-chart-point-row quality-chart-point-row--scored quality-chart-point-row--${normalizeName(point.status || "unknown")}`}
+                      key={`${point.category || pointIndex}-${pointIndex}`}
+                      title={point.reason || ""}
+                    >
+                      <span>{point.category || "-"}</span>
+                      <strong>{seriesPointDisplayValue(point, "source")}</strong>
+                      <strong>{seriesPointDisplayValue(point, "target")}</strong>
+                      <strong>{pointScore === null ? "-" : formatPercentValue(pointScore)}</strong>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           );
@@ -331,13 +347,13 @@ function formatConformity(row) {
     row?.score;
   const explicitNumeric = numberOrNull(explicit);
   if (explicitNumeric !== null) {
-    return formatPercentValue(explicitNumeric >= 0 && explicitNumeric <= 1 ? explicitNumeric * 100 : explicitNumeric);
+    return formatPercentValue(boundedConformityScore(explicitNumeric));
   }
   const delta = rowDeltaPercent(row);
-  if (delta !== null) return formatPercentValue(Math.max(0, 100 - Math.abs(delta)));
-  if (isPassedRow(row)) return "100%";
+  if (delta !== null) return formatPercentValue(boundedConformityScore(100 - Math.abs(delta)));
+  if (isPassedRow(row)) return "99%";
   if (isReviewRow(row)) return "Partiel";
-  if (isFailedRow(row)) return "0%";
+  if (isFailedRow(row)) return "1%";
   return "-";
 }
 

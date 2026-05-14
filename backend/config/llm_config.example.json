@@ -84,6 +84,7 @@
     "data_tests": {
       "enabled": true,
       "numeric_tolerance_percent": 1.0,
+      "chart_point_conformity_margin_percent": 5.0,
       "minor_delta_tolerance_percent": 5.0,
       "strict_missing_values": false,
       "required_kpis": ["orders", "sales", "quota", "variance"],

@@ -1082,6 +1082,7 @@ def _published_report_data_test_options(test_cfg: dict | None) -> dict[str, Any]
         "target_report",
         "numeric_tolerance_percent",
         "chart_point_approx_tolerance_percent",
+        "chart_point_conformity_margin_percent",
         "minor_delta_tolerance_percent",
         "strict_missing_values",
         "required_kpis",

@@ -1739,7 +1739,7 @@ def _run_pairwise_vision_data_tests(
         check
         for check in visual_checks
         if isinstance(check.get("chart_point_comparison"), dict)
-        and check.get("chart_point_comparison", {}).get("status") in {"passed", "failed"}
+        and check.get("chart_point_comparison", {}).get("status") in {"passed", "partial", "failed"}
     ]
     passed_chart_points = [
         check for check in chart_point_checks if check.get("chart_point_comparison", {}).get("status") == "passed"
@@ -2160,12 +2160,32 @@ def _annotate_conformity_status(checks: list[dict[str, Any]], test_cfg: dict[str
             check["conformity_status"] = "non_extractible"
         else:
             check["conformity_status"] = "non_conforme"
+        if "conformity_score" not in check:
+            check["conformity_score"] = _check_conformity_score(check, minor_tolerance)
+
+
+def _check_conformity_score(check: dict[str, Any], margin_percent: float) -> float:
+    chart_points = check.get("chart_point_comparison")
+    if isinstance(chart_points, dict) and isinstance(chart_points.get("conformity_score"), (int, float)):
+        return _bounded_score(float(chart_points.get("conformity_score")))
+    delta_percent = check.get("delta_percent")
+    if isinstance(delta_percent, (int, float)):
+        return _point_conformity_score(float(delta_percent), margin_percent)
+    status = _value_to_str(check.get("status"))
+    if status == "passed":
+        return 99.0
+    if status == "partial":
+        return 70.0
+    if status == "skipped":
+        return 50.0
+    return 1.0
 
 
 def _matched_visual_summary(check: dict[str, Any], source_name: str, target_name: str) -> dict[str, Any]:
     return {
         "status": check.get("status"),
         "conformity_status": check.get("conformity_status"),
+        "conformity_score": check.get("conformity_score"),
         "score": check.get("score"),
         source_name: check.get("source_signature"),
         target_name: check.get("target_signature"),
@@ -2205,6 +2225,8 @@ def _element_comparison_report(checks: list[dict[str, Any]], source_name: str, t
                 "target_value": target_value,
                 "delta": check.get("delta"),
                 "delta_percent": check.get("delta_percent"),
+                "conformity_score": check.get("conformity_score"),
+                "conformity_percent": check.get("conformity_score"),
                 "confidence": check.get("score"),
                 "reason": check.get("reason"),
                 "error": check.get("error"),
@@ -2318,14 +2340,16 @@ def _run_data_tests(results: dict[str, Any], scenario: dict[str, Any]) -> dict[s
     checks.extend(_compare_filter_values(source_profile, target_profile, scenario, test_cfg, source_name, target_name))
     checks.extend(_compare_kpi_values(source_profile, target_profile, test_cfg, source_name, target_name))
     checks.extend(_compare_visual_profiles(source_profile, target_profile, test_cfg, source_name, target_name))
+    _annotate_conformity_status(checks, test_cfg)
 
     failed = [check for check in checks if check.get("status") == "failed"]
+    partial = [check for check in checks if check.get("status") == "partial"]
     passed = [check for check in checks if check.get("status") == "passed"]
     skipped = [check for check in checks if check.get("status") == "skipped"]
     if failed:
         status = "failed"
         conformance_status = "non_conformant"
-    elif skipped or not checks:
+    elif partial or skipped or not checks:
         status = "partial"
         conformance_status = "partially_conformant"
     else:
@@ -2341,7 +2365,7 @@ def _run_data_tests(results: dict[str, Any], scenario: dict[str, Any]) -> dict[s
         check
         for check in visual_checks
         if isinstance(check.get("chart_point_comparison"), dict)
-        and check.get("chart_point_comparison", {}).get("status") in {"passed", "failed"}
+        and check.get("chart_point_comparison", {}).get("status") in {"passed", "partial", "failed"}
     ]
     passed_chart_points = [
         check for check in chart_point_checks if check.get("chart_point_comparison", {}).get("status") == "passed"
@@ -2375,6 +2399,7 @@ def _run_data_tests(results: dict[str, Any], scenario: dict[str, Any]) -> dict[s
             f"{len(skipped_kpis)} KPI value(s) not exposed by the report viewer; "
             f"{len(matched_visuals)} semantic visual match(es); "
             f"{len(passed_chart_points)}/{len(chart_point_checks)} chart point comparison(s) passed; "
+            f"{len(partial)} partial data check(s); "
             f"{len(skipped)} data check(s) not fully extractable; "
             f"{len(failed)} failed data check(s)."
         ),
@@ -3155,6 +3180,13 @@ def _compare_visual_match(
             target,
             tolerance_percent,
             _safe_float(test_cfg.get("chart_point_approx_tolerance_percent"), default=tolerance_percent),
+            _safe_float(
+                test_cfg.get("chart_point_conformity_margin_percent"),
+                default=max(
+                    tolerance_percent,
+                    _safe_float(test_cfg.get("minor_delta_tolerance_percent"), default=max(tolerance_percent * 5, 5.0)),
+                ),
+            ),
             missing_status,
         )
         if chart_like
@@ -3206,6 +3238,8 @@ def _compare_visual_match(
             }
         elif point_status == "failed":
             status = "failed"
+        elif point_status == "partial":
+            status = "partial"
         elif point_status == "passed":
             status = "passed"
         elif _has_numeric_display_points(source, target) and numeric_comparison.get("status") == "passed":
@@ -3232,6 +3266,7 @@ def _compare_visual_match(
         "matching_method": "llm_declared_semantic_match" if llm_declared_match else "semantic_signature",
         "declared_by_llm": llm_declared_match,
         "score": match.get("score", 0.0),
+        "conformity_score": _visual_conformity_score(status, chart_point_comparison, numeric_comparison, test_cfg),
         "source_signature": source.get("signature"),
         "target_signature": target.get("signature"),
         "source_chart_type": source.get("chart_type"),
@@ -3272,6 +3307,7 @@ def _compare_chart_points(
     target: dict[str, Any],
     tolerance_percent: float,
     approximate_tolerance_percent: float,
+    conformity_margin_percent: float,
     missing_status: str,
 ) -> dict[str, Any]:
     source_points = _chart_points_with_values(source)
@@ -3285,6 +3321,8 @@ def _compare_chart_points(
             "missing_in_target": [],
             "missing_in_source": [],
             "tolerance_percent": tolerance_percent,
+            "conformity_margin_percent": conformity_margin_percent,
+            "conformity_score": 50.0,
             "reason": "No structured chart points were extracted from either visual.",
             "error": "",
         }
@@ -3298,6 +3336,8 @@ def _compare_chart_points(
             "missing_in_source": [_chart_point_public(point, target) for point in target_points] if target_points else [],
             "tolerance_percent": tolerance_percent,
             "approximate_tolerance_percent": approximate_tolerance_percent,
+            "conformity_margin_percent": conformity_margin_percent,
+            "conformity_score": 1.0,
             "reason": "Structured chart points were extracted by only one matched visual.",
             "error": "" if missing_status == "skipped" else "Structured chart points were not extracted from both matched charts.",
         }
@@ -3318,6 +3358,7 @@ def _compare_chart_points(
             target_series,
             tolerance_percent,
             approximate_tolerance_percent,
+            conformity_margin_percent,
             strict_format,
         )
         series_result["series_match_score"] = round(series_score, 3)
@@ -3341,13 +3382,19 @@ def _compare_chart_points(
         )
 
     cleaned_series = []
+    series_scores = []
     for series in series_comparisons:
         cleaned = {key: value for key, value in series.items() if not key.startswith("_")}
         cleaned_series.append(cleaned)
+        if isinstance(cleaned.get("conformity_score"), (int, float)):
+            series_scores.append(float(cleaned["conformity_score"]))
 
-    passed = not unmatched_source and not unmatched_target and failed_pairs == 0
+    partial_pairs = sum(1 for series in cleaned_series for point in series.get("points", []) if point.get("status") == "partial")
+    passed = not unmatched_source and not unmatched_target and failed_pairs == 0 and partial_pairs == 0
+    partial = not unmatched_source and not unmatched_target and failed_pairs == 0 and partial_pairs > 0
+    conformity_score = _average_conformity_score(series_scores, default=99.0 if passed else 1.0)
     return {
-        "status": "passed" if passed else "failed",
+        "status": "passed" if passed else ("partial" if partial else "failed"),
         "source_points": [_chart_point_public(point, source) for point in source_points],
         "target_points": [_chart_point_public(point, target) for point in target_points],
         "matched_points": matched_points,
@@ -3356,6 +3403,8 @@ def _compare_chart_points(
         "missing_in_source": [_chart_point_public(point, target) for point in unmatched_target],
         "tolerance_percent": tolerance_percent,
         "approximate_tolerance_percent": approximate_tolerance_percent,
+        "conformity_margin_percent": conformity_margin_percent,
+        "conformity_score": conformity_score,
         "comparison_granularity": "complete_series_by_x_category",
         "format_check": "strict_display_format",
         "error": "" if passed else "Chart series points differ by X/category, Y value, or displayed format.",
@@ -3457,6 +3506,7 @@ def _compare_chart_point_series(
     target_series: dict[str, Any],
     tolerance_percent: float,
     approximate_tolerance_percent: float,
+    conformity_margin_percent: float,
     strict_format: bool,
 ) -> dict[str, Any]:
     source_points = source_series.get("points", [])
@@ -3469,6 +3519,7 @@ def _compare_chart_point_series(
     unmatched_source = []
     unmatched_target = []
     failed = 0
+    partial = 0
     for category in categories:
         source_point = source_by_category.get(category)
         target_point = target_by_category.get(category)
@@ -3476,14 +3527,30 @@ def _compare_chart_point_series(
             if target_point is not None:
                 unmatched_target.append(target_point)
             rows.append(
-                _chart_series_point_row(category, None, target_point, target_visual=target_visual, status="failed", reason="Missing RDL point.")
+                _chart_series_point_row(
+                    category,
+                    None,
+                    target_point,
+                    target_visual=target_visual,
+                    status="failed",
+                    reason="Missing RDL point.",
+                    conformity_score=1.0,
+                )
             )
             failed += 1
             continue
         if target_point is None:
             unmatched_source.append(source_point)
             rows.append(
-                _chart_series_point_row(category, source_point, None, source_visual=source_visual, status="failed", reason="Missing Tableau point.")
+                _chart_series_point_row(
+                    category,
+                    source_point,
+                    None,
+                    source_visual=source_visual,
+                    status="failed",
+                    reason="Missing Tableau point.",
+                    conformity_score=1.0,
+                )
             )
             failed += 1
             continue
@@ -3495,10 +3562,17 @@ def _compare_chart_point_series(
             target_point,
             tolerance_percent,
             approximate_tolerance_percent,
+            conformity_margin_percent,
         )
         format_match = _chart_point_format_match(source_point, target_point, source_visual, target_visual)
         point_passed = bool(metrics.get("matched")) and (format_match.get("matched") or not strict_format)
-        if not point_passed:
+        if point_passed:
+            point_status = "passed"
+        elif metrics.get("within_conformity_margin") or bool(metrics.get("matched")):
+            point_status = "partial"
+            partial += 1
+        else:
+            point_status = "failed"
             failed += 1
         row = _chart_series_point_row(
             category,
@@ -3506,15 +3580,18 @@ def _compare_chart_point_series(
             target_point,
             source_visual=source_visual,
             target_visual=target_visual,
-            status="passed" if point_passed else "failed",
+            status=point_status,
             reason="" if point_passed else _chart_point_row_reason(metrics, format_match, strict_format),
+            conformity_score=metrics.get("conformity_score"),
         )
         row.update(
             {
                 "delta_percent": metrics.get("delta_percent"),
+                "conformity_margin_percent": conformity_margin_percent,
                 "value_match": bool(metrics.get("matched")),
                 "format_match": bool(format_match.get("matched")),
                 "match_method": metrics.get("method"),
+                "within_conformity_margin": bool(metrics.get("within_conformity_margin")),
             }
         )
         rows.append(row)
@@ -3523,21 +3600,33 @@ def _compare_chart_point_series(
                 "source": _chart_point_public(source_point, source_visual),
                 "target": _chart_point_public(target_point, target_visual),
                 "delta_percent": metrics.get("delta_percent"),
+                "conformity_score": metrics.get("conformity_score"),
+                "conformity_margin_percent": conformity_margin_percent,
                 "match_method": metrics.get("method"),
                 "matching_key": _chart_point_key(source_point) or category,
                 "value_match": bool(metrics.get("matched")),
                 "format_match": bool(format_match.get("matched")),
-                "status": "passed" if point_passed else "failed",
+                "within_conformity_margin": bool(metrics.get("within_conformity_margin")),
+                "status": point_status,
                 "reason": row.get("reason", ""),
             }
         )
 
+    point_scores = [
+        float(point.get("conformity_score"))
+        for point in rows
+        if isinstance(point.get("conformity_score"), (int, float))
+    ]
+    status = "passed" if failed == 0 and partial == 0 else ("partial" if failed == 0 else "failed")
     return {
-        "status": "passed" if failed == 0 else "failed",
+        "status": status,
         "source_measure": source_series.get("measure", ""),
         "target_measure": target_series.get("measure", ""),
         "axis": source_series.get("axis") or target_series.get("axis") or "",
         "point_count": len(rows),
+        "failed_point_count": failed,
+        "partial_point_count": partial,
+        "conformity_score": _average_conformity_score(point_scores, default=99.0 if status == "passed" else 1.0),
         "matched_points": matched_points,
         "points": rows,
         "_unmatched_source_raw": unmatched_source,
@@ -3590,7 +3679,9 @@ def _chart_series_point_row(
     target_visual: dict[str, Any] | None = None,
     status: str = "",
     reason: str = "",
+    conformity_score: Any = None,
 ) -> dict[str, Any]:
+    score = _bounded_score(float(conformity_score)) if isinstance(conformity_score, (int, float)) else None
     return {
         "category": _chart_point_public_category(category, source_point, target_point),
         "source": _chart_point_public(source_point, source_visual) if source_point else None,
@@ -3601,6 +3692,8 @@ def _chart_series_point_row(
         "target_raw_value": _value_to_str(target_point.get("raw_value")) if target_point else "",
         "status": status,
         "reason": reason,
+        "conformity_score": score,
+        "conformity_percent": score,
     }
 
 
@@ -3677,6 +3770,7 @@ def _unmatched_chart_series_result(series: dict[str, Any], missing_kind: str, vi
                 target_visual=visual if missing_kind == "missing_in_source" else None,
                 status="failed",
                 reason="Series missing in Tableau." if missing_kind == "missing_in_target" else "Series missing in RDL.",
+                conformity_score=1.0,
             )
         )
     return {
@@ -3685,6 +3779,9 @@ def _unmatched_chart_series_result(series: dict[str, Any], missing_kind: str, vi
         "target_measure": series.get("measure", "") if missing_kind == "missing_in_source" else "",
         "axis": series.get("axis", ""),
         "point_count": len(points),
+        "failed_point_count": len(points),
+        "partial_point_count": 0,
+        "conformity_score": 1.0,
         "matched_points": [],
         "points": points,
     }
@@ -3697,15 +3794,20 @@ def _chart_point_value_match_metrics(
     target_point: dict[str, Any],
     tolerance_percent: float,
     approximate_tolerance_percent: float,
+    conformity_margin_percent: float,
 ) -> dict[str, Any]:
     source_value = _chart_point_scaled_value(source_visual, source_point)
     target_value = _chart_point_scaled_value(target_visual, target_point)
     delta_percent = _numeric_delta_percent(source_value, target_value)
+    conformity_score = _point_conformity_score(delta_percent, conformity_margin_percent)
+    within_conformity_margin = delta_percent <= max(tolerance_percent, conformity_margin_percent)
     if delta_percent <= tolerance_percent:
         return {
             "matched": True,
             "method": "absolute_value",
             "delta_percent": round(delta_percent, 4),
+            "conformity_score": conformity_score,
+            "within_conformity_margin": True,
             "position_delta_percent": None,
             "effective_delta_percent": round(delta_percent, 4),
         }
@@ -3722,6 +3824,8 @@ def _chart_point_value_match_metrics(
             "matched": True,
             "method": "approximate_absolute_value",
             "delta_percent": round(delta_percent, 4),
+            "conformity_score": conformity_score,
+            "within_conformity_margin": within_conformity_margin,
             "position_delta_percent": None,
             "effective_delta_percent": round(delta_percent, 4),
         }
@@ -3730,6 +3834,8 @@ def _chart_point_value_match_metrics(
         "matched": False,
         "method": "absolute_value",
         "delta_percent": round(delta_percent, 4),
+        "conformity_score": conformity_score,
+        "within_conformity_margin": within_conformity_margin,
         "position_delta_percent": round(position_delta_percent, 4) if position_delta_percent is not None else None,
         "effective_delta_percent": round(delta_percent, 4),
     }
@@ -4089,6 +4195,35 @@ def _visual_comparison_reason(chart_like: bool, chart_point_comparison: dict[str
     return "Matched visual has data that was different or not fully exposed by extraction."
 
 
+def _visual_conformity_score(
+    status: str,
+    chart_point_comparison: dict[str, Any],
+    numeric_comparison: dict[str, Any],
+    test_cfg: dict[str, Any],
+) -> float:
+    if isinstance(chart_point_comparison, dict) and isinstance(chart_point_comparison.get("conformity_score"), (int, float)):
+        return _bounded_score(float(chart_point_comparison["conformity_score"]))
+    matched_values = numeric_comparison.get("matched_values") if isinstance(numeric_comparison, dict) else []
+    deltas = [
+        float(item.get("delta_percent"))
+        for item in matched_values
+        if isinstance(item, dict) and isinstance(item.get("delta_percent"), (int, float))
+    ]
+    margin = _safe_float(
+        test_cfg.get("minor_delta_tolerance_percent"),
+        default=max(_safe_float(test_cfg.get("numeric_tolerance_percent"), default=1.0) * 5, 5.0),
+    )
+    if deltas:
+        return _average_conformity_score([_point_conformity_score(delta, margin) for delta in deltas], default=50.0)
+    if status == "passed":
+        return 99.0
+    if status == "partial":
+        return 70.0
+    if status == "skipped":
+        return 50.0
+    return 1.0
+
+
 def _relax_declared_overlap(overlap: dict[str, Any], label: str) -> dict[str, Any]:
     if overlap.get("status") != "failed":
         return overlap
@@ -4186,6 +4321,28 @@ def _compare_numeric_multiset(
 def _numeric_delta_percent(source_value: float, target_value: float) -> float:
     denominator = max(abs(source_value), abs(target_value), 1.0)
     return (abs(source_value - target_value) / denominator) * 100
+
+
+def _point_conformity_score(delta_percent: float, margin_percent: float) -> float:
+    margin = max(float(margin_percent or 0.0), 0.0001)
+    delta = max(0.0, float(delta_percent or 0.0))
+    if delta <= margin:
+        score = 99.0 - (delta / margin) * 49.0
+    else:
+        score = 50.0 - min((delta - margin) / margin, 1.0) * 49.0
+    return _bounded_score(score)
+
+
+def _average_conformity_score(scores: list[float], default: float = 50.0) -> float:
+    clean_scores = [float(score) for score in scores if isinstance(score, (int, float))]
+    if not clean_scores:
+        return _bounded_score(default)
+    return _bounded_score(sum(clean_scores) / len(clean_scores))
+
+
+def _bounded_score(score: float) -> float:
+    bounded = max(1.0, min(99.0, float(score)))
+    return round(bounded, 2)
 
 
 def _set_overlap_summary(source_values: list[Any], target_values: list[Any], missing_status: str = "failed") -> dict[str, Any]:

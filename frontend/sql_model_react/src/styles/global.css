@@ -3702,6 +3702,10 @@ textarea {
   padding: 0.48rem 0.6rem;
 }
 
+.quality-chart-point-row--scored {
+  grid-template-columns: minmax(82px, 1fr) minmax(90px, 1fr) minmax(90px, 1fr) minmax(58px, 0.55fr);
+}
+
 .quality-chart-point-row:last-child {
   border-bottom: 0;
 }
