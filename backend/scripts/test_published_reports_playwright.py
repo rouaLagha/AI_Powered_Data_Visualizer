@@ -232,7 +232,7 @@ def _run_report(
                     input_error,
                     extra={"parameters_required": True},
                 )
-            page.screenshot(path=str(screenshot_path), full_page=bool(report_cfg.get("full_page", True)))
+            screenshot_capture = _capture_report_screenshot(page, report_name, report_cfg, screenshot_path)
             data_profile = _extract_report_data_profile(page, report_name, output_dir, scenario, screenshot_path)
             _clear_error_file(output_dir, report_name)
             return {
@@ -241,6 +241,7 @@ def _run_report(
                 "screenshot_path": str(screenshot_path),
                 "storage_state_path": storage_state_path,
                 "user_data_dir": user_data_dir,
+                "screenshot_capture": screenshot_capture,
                 "data_profile": data_profile,
             }
         except Exception as exc:
@@ -350,6 +351,281 @@ def _safe_screenshot(page, screenshot_path: Path, full_page: bool) -> None:
         page.screenshot(path=str(screenshot_path), full_page=full_page)
     except Exception:
         pass
+
+
+def _capture_report_screenshot(
+    page,
+    report_name: str,
+    report_cfg: dict[str, Any],
+    screenshot_path: Path,
+) -> dict[str, Any]:
+    normalized_name = str(report_name or "").strip().lower()
+    if normalized_name == "tableau":
+        return _capture_tableau_report_screenshot(page, report_cfg, screenshot_path)
+
+    full_page = _bool_option(report_cfg.get("full_page"), True)
+    page.screenshot(path=str(screenshot_path), full_page=full_page)
+    return {
+        "mode": "page",
+        "full_page": full_page,
+        "screenshot_path": str(screenshot_path),
+    }
+
+
+def _capture_tableau_report_screenshot(page, report_cfg: dict[str, Any], screenshot_path: Path) -> dict[str, Any]:
+    timeout_ms = _timeout_ms(
+        report_cfg.get("screenshot_timeout_ms") or report_cfg.get("capture_timeout_ms"),
+        default=30000,
+    )
+    min_width = _safe_int(report_cfg.get("min_capture_width"), default=500)
+    min_height = _safe_int(report_cfg.get("min_capture_height"), default=300)
+
+    if _bool_config(report_cfg, ("hide_chrome", "hide_tableau_chrome"), True):
+        _hide_tableau_capture_chrome(page)
+
+    attempted_errors: list[str] = []
+    for selector in _tableau_capture_selectors(report_cfg):
+        for frame in _page_frames(page):
+            try:
+                locator = frame.locator(selector).first
+                box = _visible_locator_box(locator, min_width, min_height)
+                if not box:
+                    continue
+                locator.screenshot(path=str(screenshot_path), timeout=timeout_ms, animations="disabled")
+                crop = _auto_crop_tableau_screenshot_file(screenshot_path, report_cfg)
+                return {
+                    "mode": "locator",
+                    "selector": selector,
+                    "frame_url": _value_to_str(getattr(frame, "url", "")),
+                    "box": box,
+                    "auto_crop": crop,
+                    "screenshot_path": str(screenshot_path),
+                }
+            except Exception as exc:
+                attempted_errors.append(f"{selector}: {type(exc).__name__}: {exc}")
+                continue
+
+    full_page = _bool_option(report_cfg.get("full_page"), False)
+    page.screenshot(path=str(screenshot_path), full_page=full_page)
+    crop = _auto_crop_tableau_screenshot_file(screenshot_path, report_cfg)
+    return {
+        "mode": "page_fallback",
+        "full_page": full_page,
+        "auto_crop": crop,
+        "screenshot_path": str(screenshot_path),
+        "attempted_selectors": _tableau_capture_selectors(report_cfg),
+        "selector_errors": attempted_errors[-5:],
+    }
+
+
+def _tableau_capture_selectors(report_cfg: dict[str, Any]) -> list[str]:
+    configured: list[str] = []
+    for key in ("screenshot_selector", "capture_selector", "dashboard_selector"):
+        value = _value_to_str(report_cfg.get(key))
+        if value:
+            configured.append(value)
+    for key in ("screenshot_selectors", "capture_selectors"):
+        values = report_cfg.get(key)
+        if isinstance(values, list):
+            configured.extend(_value_to_str(item) for item in values if _value_to_str(item))
+
+    defaults = [
+        ".tab-dashboard",
+        ".tab-viz-dashboard",
+        ".tab-dashboard-view",
+        ".tabCanvas",
+        ".tab-view",
+        "#view",
+        "iframe[title*='Data Visualization']",
+        "iframe[title*='Tableau']",
+        "iframe[src*='/views/']",
+        "iframe[src*='vizql']",
+    ]
+    selectors = []
+    for selector in [*configured, *defaults]:
+        if selector and selector not in selectors:
+            selectors.append(selector)
+    return selectors
+
+
+def _visible_locator_box(locator, min_width: int, min_height: int) -> dict[str, float] | None:
+    try:
+        if not locator.is_visible(timeout=1000):
+            return None
+        box = locator.bounding_box(timeout=1000)
+    except Exception:
+        return None
+    if not isinstance(box, dict):
+        return None
+    width = float(box.get("width") or 0)
+    height = float(box.get("height") or 0)
+    if width < min_width or height < min_height:
+        return None
+    return {
+        "x": round(float(box.get("x") or 0), 2),
+        "y": round(float(box.get("y") or 0), 2),
+        "width": round(width, 2),
+        "height": round(height, 2),
+    }
+
+
+def _hide_tableau_capture_chrome(page) -> None:
+    css = """
+    [data-tb-test-id="global-masthead"],
+    [data-tb-test-id="viz-client-toolbar"],
+    [data-tb-test-id="toolbar"],
+    .tb-app-banner,
+    .tabToolbar,
+    .tab-widget-toolbar,
+    .tab-view-toolbar,
+    .viz-client-toolbar,
+    .tab-command-toolbar,
+    .tabMiniToolbar {
+      visibility: hidden !important;
+    }
+    """
+    try:
+        page.add_style_tag(content=css)
+    except Exception:
+        pass
+    for frame in _page_frames(page):
+        try:
+            if frame != page.main_frame:
+                frame.add_style_tag(content=css)
+        except Exception:
+            continue
+
+
+def _auto_crop_tableau_screenshot_file(screenshot_path: Path, report_cfg: dict[str, Any]) -> dict[str, Any]:
+    if not _bool_config(report_cfg, ("auto_crop", "auto_crop_canvas"), True):
+        return {"applied": False, "mode": "disabled"}
+    if Image is None:
+        return {"applied": False, "mode": "unavailable", "reason": "Pillow is not installed."}
+    try:
+        with Image.open(screenshot_path) as image:
+            cropped, crop = _auto_crop_light_report_canvas(image.convert("RGB"), report_cfg)
+            if crop.get("applied"):
+                cropped.save(screenshot_path)
+            return crop
+    except Exception as exc:
+        return {"applied": False, "mode": "failed", "reason": str(exc)}
+
+
+def _auto_crop_light_report_canvas(image, report_cfg: dict[str, Any]):
+    width, height = image.size
+    if width < 20 or height < 20:
+        return image, {"applied": False, "box": [0, 0, width, height], "mode": "too_small"}
+
+    threshold = _safe_int(report_cfg.get("canvas_crop_luma_threshold"), default=248)
+    row_ratio = _safe_float(report_cfg.get("canvas_crop_min_row_ratio"), default=0.55)
+    col_ratio = _safe_float(report_cfg.get("canvas_crop_min_col_ratio"), default=0.55)
+    min_height = _safe_int(report_cfg.get("canvas_crop_min_height"), default=300)
+    min_width = _safe_int(report_cfg.get("canvas_crop_min_width"), default=500)
+    padding = _safe_int(report_cfg.get("canvas_crop_padding"), default=0)
+    sample_x_step = max(1, width // 800)
+    sample_y_step = max(1, height // 800)
+    pixels = image.load()
+
+    def is_light(x: int, y: int) -> bool:
+        r, g, b = pixels[x, y][:3]
+        return r >= threshold and g >= threshold and b >= threshold
+
+    row_flags: list[tuple[int, bool]] = []
+    x_values = list(range(0, width, sample_x_step))
+    for y in range(0, height, sample_y_step):
+        light_count = sum(1 for x in x_values if is_light(x, y))
+        row_flags.append((y, (light_count / max(1, len(x_values))) >= row_ratio))
+
+    row_segments = _merge_close_segments(
+        _boolean_segments(row_flags, sample_y_step, height),
+        max_gap=_safe_int(report_cfg.get("canvas_crop_max_row_gap"), default=16),
+    )
+    row_segments = [segment for segment in row_segments if (segment[1] - segment[0]) >= min_height]
+    if not row_segments:
+        return image, {"applied": False, "box": [0, 0, width, height], "mode": "no_canvas_rows"}
+
+    top, bottom = max(row_segments, key=lambda segment: segment[1] - segment[0])
+    y_values = list(range(top, max(top + 1, bottom), sample_y_step))
+    col_flags: list[tuple[int, bool]] = []
+    for x in range(0, width, sample_x_step):
+        light_count = sum(1 for y in y_values if is_light(x, min(height - 1, y)))
+        col_flags.append((x, (light_count / max(1, len(y_values))) >= col_ratio))
+
+    col_segments = _merge_close_segments(
+        _boolean_segments(col_flags, sample_x_step, width),
+        max_gap=_safe_int(report_cfg.get("canvas_crop_max_col_gap"), default=16),
+    )
+    col_segments = [segment for segment in col_segments if (segment[1] - segment[0]) >= min_width]
+    if not col_segments:
+        return image, {"applied": False, "box": [0, top, width, bottom], "mode": "no_canvas_cols"}
+
+    left, right = max(col_segments, key=lambda segment: segment[1] - segment[0])
+    box = (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(width, right + padding),
+        min(height, bottom + padding),
+    )
+    if box == (0, 0, width, height):
+        return image, {"applied": False, "box": [0, 0, width, height], "mode": "already_canvas"}
+
+    original_area = width * height
+    cropped_area = max(1, (box[2] - box[0]) * (box[3] - box[1]))
+    reduction = 1 - (cropped_area / max(1, original_area))
+    min_reduction = _safe_float(report_cfg.get("canvas_crop_min_reduction_ratio"), default=0.03)
+    if reduction < min_reduction:
+        return image, {"applied": False, "box": [0, 0, width, height], "mode": "minimal_reduction"}
+
+    return image.crop(box), {
+        "applied": True,
+        "box": list(box),
+        "mode": "auto_light_canvas",
+        "original_size": {"width": width, "height": height},
+        "cropped_size": {"width": box[2] - box[0], "height": box[3] - box[1]},
+        "area_reduction_ratio": round(reduction, 4),
+    }
+
+
+def _boolean_segments(flags: list[tuple[int, bool]], step: int, limit: int) -> list[tuple[int, int]]:
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    last_position = 0
+    for position, enabled in flags:
+        last_position = position
+        if enabled and start is None:
+            start = position
+        elif not enabled and start is not None:
+            segments.append((start, min(limit, position)))
+            start = None
+    if start is not None:
+        segments.append((start, min(limit, last_position + step)))
+    return segments
+
+
+def _merge_close_segments(segments: list[tuple[int, int]], max_gap: int) -> list[tuple[int, int]]:
+    if not segments:
+        return []
+    merged = [segments[0]]
+    for start, end in segments[1:]:
+        previous_start, previous_end = merged[-1]
+        if start - previous_end <= max_gap:
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _bool_option(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    return _truthy_value(value)
+
+
+def _bool_config(config: dict[str, Any], keys: tuple[str, ...], default: bool) -> bool:
+    for key in keys:
+        if key in config:
+            return _bool_option(config.get(key), default)
+    return default
 
 
 def _failure_screenshot_path(screenshot_path: Path) -> Path:
@@ -1635,16 +1911,18 @@ def _pairwise_vision_prompt(source_name: str, target_name: str, scenario: dict[s
         "For charts, do not treat axis tick labels as data points. Axis ticks belong in axes only. "
         "If a chart has two or more measures or dual axes, explicitly identify which measure belongs to which axis "
         "(for example Sales -> left y-axis, Quota -> right y-axis). "
-        f"When reading chart measure axes from the {source_name} report, treat RDL/Power BI paginated chart axis values "
-        "as thousands when no explicit K/M/B suffix is visible: multiply the displayed axis coordinate by 1000 for the normalized value. "
-        "Pay special attention to scaled axes. If an axis or visual uses units such as K, M, B, thousands, millions, "
-        "or billions, keep raw_value as the displayed label but set value to the normalized business value. "
-        "For example, raw_value '~6.1M' must have value 6100000, and raw_value '~4B' must have value 4000000000. "
-        "If one report shows a scale without a suffix and the matching report shows the same measure with M/B units, "
-        "use axis_bindings.unit/scale to explain the scale and avoid returning only the plotted coordinate as the business value. "
-        "For every visible chart mark/point/bar/slice that can be read or estimated from the image, extract a structured "
-        "data point coordinates with x/category, measure, axis, optional series, displayed raw value, normalized y/value, and approximate=true if estimated from the plotted position. "
-        "For line/bar charts, prefer points like {category: 'March', measure: 'Sales', axis: 'left', series: 'Sales', raw_value: '$5.2M', value: 5200000}; this means x=March, measure=Sales, axis=left, y=5200000. "
+        "For charts, extract the complete series. For every visible X/category and every visible measure/series, return one "
+        "structured data point with category, measure, axis, optional series, displayed raw_value, normalized y/value, and "
+        "approximate=true if estimated from the plotted position. Do not stop after one or two points: for a line chart with "
+        "March, June, September and Sales plus Quota, return six points per report. "
+        "Do not compare or return axis tick labels as data points. Do not invent hidden points. "
+        "Pay special attention to scaled axes and measure values read from the curve. If an axis or visual uses units such "
+        "as K, M, B, thousands, millions, or billions, keep raw_value exactly as displayed and set value to the normalized "
+        "business value. For example, raw_value '~6.1M' must have value 6100000, and raw_value '~4B' must have value "
+        "4000000000. If no K/M/B suffix or explicit unit is visible, do not apply an implicit multiplier. "
+        "For line/bar charts, prefer points like {category: 'March', measure: 'Sales', axis: 'left', series: 'Sales', "
+        "raw_value: '$5.2M', value: 5200000}; this means x=March, measure=Sales, axis=left, y=5200000. "
+        "Use the same unit/format convention for equivalent measures in both reports whenever the screenshots expose it. "
         "Then semantically match equivalent visuals between the two reports.\n"
         "Return only JSON with this shape:\n"
         "{\n"
@@ -1971,7 +2249,13 @@ def _chart_points_display(points: Any) -> list[str]:
         axis = _canonical_axis_name(point.get("axis"))
         series = _value_to_str(point.get("series"))
         raw_value = _value_to_str(point.get("raw_value"))
-        value = _value_to_str(point.get("normalized_value")) or raw_value or _value_to_str(point.get("value"))
+        value = (
+            _value_to_str(point.get("display_value"))
+            or _value_to_str(point.get("comparison_display_value"))
+            or _value_to_str(point.get("normalized_value"))
+            or raw_value
+            or _value_to_str(point.get("value"))
+        )
         coordinate = _format_chart_coordinate(category, measure, axis, series, value, bool(point.get("approximate")))
         if coordinate:
             labels.append(coordinate)
@@ -2868,7 +3152,7 @@ def _compare_visual_match(
             source,
             target,
             tolerance_percent,
-            _safe_float(test_cfg.get("chart_point_approx_tolerance_percent"), default=max(tolerance_percent * 10, 10.0)),
+            _safe_float(test_cfg.get("chart_point_approx_tolerance_percent"), default=tolerance_percent),
             missing_status,
         )
         if chart_like
@@ -3016,71 +3300,391 @@ def _compare_chart_points(
             "error": "" if missing_status == "skipped" else "Structured chart points were not extracted from both matched charts.",
         }
 
-    target_remaining = list(enumerate(target_points))
-    matched_points = []
-    unmatched_source = []
-    for source_index, source_point in enumerate(source_points):
-        best_target_index = -1
-        best_target_point: dict[str, Any] | None = None
-        best_metrics: dict[str, Any] | None = None
-        best_score: tuple[float, int, float] | None = None
-        source_key = _chart_point_key(source_point)
-        keyed_candidates = [
-            (target_index, target_point)
-            for target_index, target_point in target_remaining
-            if source_key and source_key == _chart_point_key(target_point)
-        ]
-        candidate_pool = keyed_candidates or target_remaining
-        for target_index, target_point in candidate_pool:
-            key_score = _chart_point_match_score(source_point, target_point, source_index, target_index)
-            metrics = _chart_point_value_match_metrics(
-                source,
-                target,
-                source_point,
-                target_point,
-                tolerance_percent,
-                approximate_tolerance_percent,
-            )
-            effective_delta = metrics.get("effective_delta_percent")
-            if not isinstance(effective_delta, (int, float)):
-                effective_delta = 999999.0
-            score = (key_score, 1 if metrics.get("matched") else 0, -float(effective_delta))
-            if best_score is None or score > best_score:
-                best_score = score
-                best_target_index = target_index
-                best_target_point = target_point
-                best_metrics = metrics
-        if best_target_point is None:
-            unmatched_source.append(source_point)
-            continue
-        if best_metrics and best_metrics.get("matched"):
-            target_remaining = [(idx, point) for idx, point in target_remaining if idx != best_target_index]
-            matched_points.append(
-                {
-                    "source": _chart_point_public(source_point, source),
-                    "target": _chart_point_public(best_target_point, target),
-                    "delta_percent": best_metrics.get("delta_percent"),
-                    "position_delta_percent": best_metrics.get("position_delta_percent"),
-                    "match_method": best_metrics.get("method"),
-                    "matching_key": _chart_point_key(source_point) or f"index:{source_index}",
-                }
-            )
-        else:
-            unmatched_source.append(source_point)
+    strict_format = True
+    series_pairs, unmatched_source_series, unmatched_target_series = _match_chart_point_series(source_points, target_points)
+    matched_points: list[dict[str, Any]] = []
+    unmatched_source: list[dict[str, Any]] = []
+    unmatched_target: list[dict[str, Any]] = []
+    series_comparisons: list[dict[str, Any]] = []
+    failed_pairs = 0
 
-    unmatched_target = [point for _, point in target_remaining]
-    passed = not unmatched_source and not unmatched_target
+    for source_series, target_series, series_score in series_pairs:
+        series_result = _compare_chart_point_series(
+            source,
+            target,
+            source_series,
+            target_series,
+            tolerance_percent,
+            approximate_tolerance_percent,
+            strict_format,
+        )
+        series_result["series_match_score"] = round(series_score, 3)
+        series_comparisons.append(series_result)
+        matched_points.extend(series_result.get("matched_points", []))
+        unmatched_source.extend(series_result.get("_unmatched_source_raw", []))
+        unmatched_target.extend(series_result.get("_unmatched_target_raw", []))
+        failed_pairs += sum(1 for point in series_result.get("points", []) if point.get("status") == "failed")
+
+    for source_series in unmatched_source_series:
+        raw_points = source_series.get("points", [])
+        unmatched_source.extend(raw_points)
+        series_comparisons.append(
+            _unmatched_chart_series_result(source_series, "missing_in_target", source)
+        )
+    for target_series in unmatched_target_series:
+        raw_points = target_series.get("points", [])
+        unmatched_target.extend(raw_points)
+        series_comparisons.append(
+            _unmatched_chart_series_result(target_series, "missing_in_source", target)
+        )
+
+    cleaned_series = []
+    for series in series_comparisons:
+        cleaned = {key: value for key, value in series.items() if not key.startswith("_")}
+        cleaned_series.append(cleaned)
+
+    passed = not unmatched_source and not unmatched_target and failed_pairs == 0
     return {
         "status": "passed" if passed else "failed",
         "source_points": [_chart_point_public(point, source) for point in source_points],
         "target_points": [_chart_point_public(point, target) for point in target_points],
         "matched_points": matched_points,
+        "series_comparisons": cleaned_series,
         "missing_in_target": [_chart_point_public(point, source) for point in unmatched_source],
         "missing_in_source": [_chart_point_public(point, target) for point in unmatched_target],
         "tolerance_percent": tolerance_percent,
         "approximate_tolerance_percent": approximate_tolerance_percent,
-        "error": "" if passed else "Chart data points differ beyond the configured tolerance.",
-        "reason": "" if passed else "One or more chart data points could not be matched by category/series/axis/value.",
+        "comparison_granularity": "complete_series_by_x_category",
+        "format_check": "strict_display_format",
+        "error": "" if passed else "Chart series points differ by X/category, Y value, or displayed format.",
+        "reason": "" if passed else "Every measure series must match for the full set of X-axis categories.",
+    }
+
+
+def _match_chart_point_series(
+    source_points: list[dict[str, Any]],
+    target_points: list[dict[str, Any]],
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any], float]], list[dict[str, Any]], list[dict[str, Any]]]:
+    source_series = _chart_point_series_groups(source_points)
+    target_series = _chart_point_series_groups(target_points)
+    remaining_targets = list(target_series)
+    pairs: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+    unmatched_source = []
+    for source_group in source_series:
+        best_index = -1
+        best_score = 0.0
+        for index, target_group in enumerate(remaining_targets):
+            score = _chart_series_match_score(source_group, target_group)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index < 0 or best_score < 0.35:
+            unmatched_source.append(source_group)
+            continue
+        target_group = remaining_targets.pop(best_index)
+        pairs.append((source_group, target_group, best_score))
+    return pairs, unmatched_source, remaining_targets
+
+
+def _chart_point_series_groups(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    for point in points:
+        key = _chart_series_key(point)
+        if key not in groups:
+            groups[key] = {
+                "key": key,
+                "measure": _value_to_str(point.get("measure") or point.get("series")) or key,
+                "axis": _canonical_axis_name(point.get("axis")),
+                "points": [],
+            }
+            ordered_keys.append(key)
+        groups[key]["points"].append(point)
+        if not groups[key].get("axis"):
+            groups[key]["axis"] = _canonical_axis_name(point.get("axis"))
+    return [groups[key] for key in ordered_keys]
+
+
+def _chart_series_key(point: dict[str, Any]) -> str:
+    measure = _normalize_key(point.get("measure") or point.get("series"))
+    axis = _canonical_axis_name(point.get("axis"))
+    if measure:
+        return f"{measure}|{axis}" if axis else measure
+    return axis or f"series_{point.get('index', 0)}"
+
+
+def _chart_series_match_score(source_series: dict[str, Any], target_series: dict[str, Any]) -> float:
+    source_measure = _normalize_key(source_series.get("measure"))
+    target_measure = _normalize_key(target_series.get("measure"))
+    score = _measure_name_similarity(source_measure, target_measure) * 0.65
+    if source_series.get("axis") and source_series.get("axis") == target_series.get("axis"):
+        score += 0.2
+    source_categories = {_chart_category_key(point) for point in source_series.get("points", [])}
+    target_categories = {_chart_category_key(point) for point in target_series.get("points", [])}
+    source_categories.discard("")
+    target_categories.discard("")
+    score += _token_overlap_score(source_categories, target_categories) * 0.15
+    return score
+
+
+def _measure_name_similarity(source_measure: str, target_measure: str) -> float:
+    if not source_measure or not target_measure:
+        return 0.0
+    if source_measure == target_measure:
+        return 1.0
+    if source_measure in target_measure or target_measure in source_measure:
+        return 0.85
+    source_tokens = set(source_measure.split())
+    target_tokens = set(target_measure.split())
+    overlap = _token_overlap_score(source_tokens, target_tokens)
+    source_compact = source_measure.replace(" ", "")
+    target_compact = target_measure.replace(" ", "")
+    for token in source_tokens:
+        if len(token) >= 4 and token in target_compact:
+            overlap = max(overlap, 0.75)
+    for token in target_tokens:
+        if len(token) >= 4 and token in source_compact:
+            overlap = max(overlap, 0.75)
+    return overlap
+
+
+def _compare_chart_point_series(
+    source_visual: dict[str, Any],
+    target_visual: dict[str, Any],
+    source_series: dict[str, Any],
+    target_series: dict[str, Any],
+    tolerance_percent: float,
+    approximate_tolerance_percent: float,
+    strict_format: bool,
+) -> dict[str, Any]:
+    source_points = source_series.get("points", [])
+    target_points = target_series.get("points", [])
+    source_by_category = _chart_points_by_category(source_points)
+    target_by_category = _chart_points_by_category(target_points)
+    categories = _ordered_chart_categories(source_points, target_points)
+    rows = []
+    matched_points = []
+    unmatched_source = []
+    unmatched_target = []
+    failed = 0
+    for category in categories:
+        source_point = source_by_category.get(category)
+        target_point = target_by_category.get(category)
+        if source_point is None:
+            if target_point is not None:
+                unmatched_target.append(target_point)
+            rows.append(
+                _chart_series_point_row(category, None, target_point, target_visual=target_visual, status="failed", reason="Missing RDL point.")
+            )
+            failed += 1
+            continue
+        if target_point is None:
+            unmatched_source.append(source_point)
+            rows.append(
+                _chart_series_point_row(category, source_point, None, source_visual=source_visual, status="failed", reason="Missing Tableau point.")
+            )
+            failed += 1
+            continue
+
+        metrics = _chart_point_value_match_metrics(
+            source_visual,
+            target_visual,
+            source_point,
+            target_point,
+            tolerance_percent,
+            approximate_tolerance_percent,
+        )
+        format_match = _chart_point_format_match(source_point, target_point, source_visual, target_visual)
+        point_passed = bool(metrics.get("matched")) and (format_match.get("matched") or not strict_format)
+        if not point_passed:
+            failed += 1
+        row = _chart_series_point_row(
+            category,
+            source_point,
+            target_point,
+            source_visual=source_visual,
+            target_visual=target_visual,
+            status="passed" if point_passed else "failed",
+            reason="" if point_passed else _chart_point_row_reason(metrics, format_match, strict_format),
+        )
+        row.update(
+            {
+                "delta_percent": metrics.get("delta_percent"),
+                "value_match": bool(metrics.get("matched")),
+                "format_match": bool(format_match.get("matched")),
+                "match_method": metrics.get("method"),
+            }
+        )
+        rows.append(row)
+        matched_points.append(
+            {
+                "source": _chart_point_public(source_point, source_visual),
+                "target": _chart_point_public(target_point, target_visual),
+                "delta_percent": metrics.get("delta_percent"),
+                "match_method": metrics.get("method"),
+                "matching_key": _chart_point_key(source_point) or category,
+                "value_match": bool(metrics.get("matched")),
+                "format_match": bool(format_match.get("matched")),
+                "status": "passed" if point_passed else "failed",
+                "reason": row.get("reason", ""),
+            }
+        )
+
+    return {
+        "status": "passed" if failed == 0 else "failed",
+        "source_measure": source_series.get("measure", ""),
+        "target_measure": target_series.get("measure", ""),
+        "axis": source_series.get("axis") or target_series.get("axis") or "",
+        "point_count": len(rows),
+        "matched_points": matched_points,
+        "points": rows,
+        "_unmatched_source_raw": unmatched_source,
+        "_unmatched_target_raw": unmatched_target,
+    }
+
+
+def _chart_points_by_category(points: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for index, point in enumerate(points):
+        key = _chart_category_key(point) or f"index:{index}"
+        if key not in result:
+            result[key] = point
+    return result
+
+
+def _ordered_chart_categories(source_points: list[dict[str, Any]], target_points: list[dict[str, Any]]) -> list[str]:
+    ordered = []
+    for index, point in enumerate(source_points + target_points):
+        key = _chart_category_key(point) or f"index:{index}"
+        if key not in ordered:
+            ordered.append(key)
+    return ordered
+
+
+def _chart_category_key(point: dict[str, Any]) -> str:
+    normalized = _normalize_key(point.get("category") or point.get("label"))
+    month_aliases = {
+        "jan": "january",
+        "feb": "february",
+        "mar": "march",
+        "apr": "april",
+        "jun": "june",
+        "jul": "july",
+        "aug": "august",
+        "sep": "september",
+        "sept": "september",
+        "oct": "october",
+        "nov": "november",
+        "dec": "december",
+    }
+    return month_aliases.get(normalized, normalized)
+
+
+def _chart_series_point_row(
+    category: str,
+    source_point: dict[str, Any] | None,
+    target_point: dict[str, Any] | None,
+    source_visual: dict[str, Any] | None = None,
+    target_visual: dict[str, Any] | None = None,
+    status: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "category": _chart_point_public_category(category, source_point, target_point),
+        "source": _chart_point_public(source_point, source_visual) if source_point else None,
+        "target": _chart_point_public(target_point, target_visual) if target_point else None,
+        "source_value": _chart_point_display_value(source_point, source_visual) if source_point else "",
+        "target_value": _chart_point_display_value(target_point, target_visual) if target_point else "",
+        "source_raw_value": _value_to_str(source_point.get("raw_value")) if source_point else "",
+        "target_raw_value": _value_to_str(target_point.get("raw_value")) if target_point else "",
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _chart_point_public_category(category: str, source_point: dict[str, Any] | None, target_point: dict[str, Any] | None) -> str:
+    for point in (source_point, target_point):
+        if isinstance(point, dict):
+            value = _value_to_str(point.get("category") or point.get("label"))
+            if value:
+                return value
+    return category
+
+
+def _chart_point_display_value(point: dict[str, Any], visual: dict[str, Any] | None = None) -> str:
+    raw_value = _value_to_str(point.get("raw_value"))
+    value: Any = None
+    if isinstance(visual, dict):
+        value = _chart_point_scaled_value(visual, point)
+    if value is None:
+        parsed = _parse_numeric_value(raw_value)
+        value = parsed if parsed is not None else point.get("value")
+    if isinstance(value, (int, float)):
+        return _format_business_number(float(value))
+    return raw_value or _value_to_str(point.get("value"))
+
+
+def _format_business_number(value: float) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return _value_to_str(value)
+    if numeric != numeric or numeric in (float("inf"), float("-inf")):
+        return _value_to_str(value)
+    if abs(numeric - round(numeric)) < 0.0001:
+        return f"{int(round(numeric)):,}"
+    return f"{numeric:,.4f}".rstrip("0").rstrip(".")
+
+
+def _chart_point_format_match(
+    source_point: dict[str, Any],
+    target_point: dict[str, Any],
+    source_visual: dict[str, Any],
+    target_visual: dict[str, Any],
+) -> dict[str, Any]:
+    source_value = _chart_point_display_value(source_point, source_visual)
+    target_value = _chart_point_display_value(target_point, target_visual)
+    return {
+        "matched": _normalize_display_value_for_format(source_value) == _normalize_display_value_for_format(target_value),
+        "source_value": source_value,
+        "target_value": target_value,
+    }
+
+
+def _normalize_display_value_for_format(value: Any) -> str:
+    return re.sub(r"\s+", " ", _value_to_str(value).replace("~", "").strip()).lower()
+
+
+def _chart_point_row_reason(metrics: dict[str, Any], format_match: dict[str, Any], strict_format: bool) -> str:
+    if not metrics.get("matched"):
+        return "Y value differs beyond tolerance."
+    if strict_format and not format_match.get("matched"):
+        return "Displayed Y format differs."
+    return "Point differs."
+
+
+def _unmatched_chart_series_result(series: dict[str, Any], missing_kind: str, visual: dict[str, Any]) -> dict[str, Any]:
+    points = []
+    for point in series.get("points", []):
+        points.append(
+            _chart_series_point_row(
+                _chart_category_key(point),
+                point if missing_kind == "missing_in_target" else None,
+                point if missing_kind == "missing_in_source" else None,
+                source_visual=visual if missing_kind == "missing_in_target" else None,
+                target_visual=visual if missing_kind == "missing_in_source" else None,
+                status="failed",
+                reason="Series missing in Tableau." if missing_kind == "missing_in_target" else "Series missing in RDL.",
+            )
+        )
+    return {
+        "status": "failed",
+        "source_measure": series.get("measure", "") if missing_kind == "missing_in_target" else "",
+        "target_measure": series.get("measure", "") if missing_kind == "missing_in_source" else "",
+        "axis": series.get("axis", ""),
+        "point_count": len(points),
+        "matched_points": [],
+        "points": points,
     }
 
 
@@ -3110,14 +3714,6 @@ def _chart_point_value_match_metrics(
     position_delta_percent = None
     if both_approximate and source_position is not None and target_position is not None:
         position_delta_percent = abs(source_position - target_position) * 100
-        if position_delta_percent <= approximate_tolerance_percent:
-            return {
-                "matched": True,
-                "method": "axis_position",
-                "delta_percent": round(delta_percent, 4),
-                "position_delta_percent": round(position_delta_percent, 4),
-                "effective_delta_percent": round(position_delta_percent, 4),
-            }
 
     if both_approximate and delta_percent <= approximate_tolerance_percent:
         return {
@@ -3130,10 +3726,10 @@ def _chart_point_value_match_metrics(
 
     return {
         "matched": False,
-        "method": "axis_position" if position_delta_percent is not None else "absolute_value",
+        "method": "absolute_value",
         "delta_percent": round(delta_percent, 4),
         "position_delta_percent": round(position_delta_percent, 4) if position_delta_percent is not None else None,
-        "effective_delta_percent": round(position_delta_percent if position_delta_percent is not None else delta_percent, 4),
+        "effective_delta_percent": round(delta_percent, 4),
     }
 
 
@@ -3150,8 +3746,6 @@ def _chart_point_scaled_value(visual: dict[str, Any], point: dict[str, Any]) -> 
     binding = _axis_binding_for_point(visual, point)
     multiplier = _unit_multiplier(binding.get("unit") if binding else "")
     numeric_value = float(value)
-    if _rdl_chart_axis_k_multiplier_applies(visual, point, raw_value):
-        return numeric_value * 1_000.0
     if multiplier != 1.0 and abs(numeric_value) < 10000:
         return numeric_value * multiplier
     return numeric_value
@@ -3187,9 +3781,6 @@ def _rdl_chart_axis_k_multiplier_applies(visual: dict[str, Any], point: dict[str
 
 
 def _chart_axis_scale_multiplier(visual: dict[str, Any], point: dict[str, Any]) -> float:
-    raw_value = _value_to_str(point.get("raw_value"))
-    if _rdl_chart_axis_k_multiplier_applies(visual, point, raw_value):
-        return 1_000.0
     binding = _axis_binding_for_point(visual, point)
     multiplier = _unit_multiplier(binding.get("unit") if binding else "")
     return multiplier if multiplier != 1.0 else 1.0
@@ -3413,10 +4004,9 @@ def _chart_point_match_score(source_point: dict[str, Any], target_point: dict[st
 
 def _chart_point_public(point: dict[str, Any], visual: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized_value = None
-    axis_multiplier = 1.0
     if isinstance(visual, dict):
         normalized_value = _chart_point_scaled_value(visual, point)
-        axis_multiplier = _chart_axis_scale_multiplier(visual, point)
+    display_value = _chart_point_display_value(point, visual)
     payload = {
         "category": point.get("category", ""),
         "measure": point.get("measure", ""),
@@ -3424,13 +4014,14 @@ def _chart_point_public(point: dict[str, Any], visual: dict[str, Any] | None = N
         "series": point.get("series", ""),
         "label": point.get("label", ""),
         "raw_value": point.get("raw_value", ""),
+        "raw_display_value": point.get("raw_value", ""),
+        "display_value": display_value,
+        "comparison_display_value": display_value,
         "value": point.get("value"),
         "approximate": bool(point.get("approximate")),
     }
     if normalized_value is not None:
         payload["normalized_value"] = normalized_value
-    if axis_multiplier != 1.0:
-        payload["axis_multiplier"] = axis_multiplier
     return payload
 
 
@@ -3658,6 +4249,7 @@ def _parse_numeric_value(raw: Any) -> float | None:
     if not text:
         return None
     text = text.replace("\u00a0", " ").strip()
+    text = re.sub(r"^(?:~|approx\.?|approximately|about)\s*", "", text, flags=re.IGNORECASE)
     match = re.fullmatch(
         r"(?P<sign>[-+])?\s*\$?\s*(?P<number>\d[\d,\s]*(?:\.\d+)?)\s*(?P<suffix>[kmbKMB])?\s*%?",
         text,

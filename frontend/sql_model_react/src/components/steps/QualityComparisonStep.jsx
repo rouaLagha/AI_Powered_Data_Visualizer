@@ -145,23 +145,24 @@ function renderPointGroups(points) {
   );
 }
 
-function hasCompactUnitSuffix(value) {
-  return /\d\s*[kmb]\b/i.test(String(value || ""));
+function pointDisplayValue(point) {
+  if (!point || typeof point !== "object") return "-";
+  if (point.display_value !== undefined && point.display_value !== null && point.display_value !== "") return point.display_value;
+  if (
+    point.comparison_display_value !== undefined &&
+    point.comparison_display_value !== null &&
+    point.comparison_display_value !== ""
+  ) {
+    return point.comparison_display_value;
+  }
+  if (point.normalized_value !== undefined && point.normalized_value !== null) return formatValue(point.normalized_value);
+  return point.raw_value || formatValue(point.value);
 }
 
-function pointDisplayValue(point, side = "") {
-  if (!point || typeof point !== "object") return "-";
-  if (point.normalized_value !== undefined && point.normalized_value !== null) return formatValue(point.normalized_value);
-  if (side === "source" && point.axis_multiplier === undefined && !hasCompactUnitSuffix(point.raw_value)) {
-    const numeric = Number(point.value);
-    if (Number.isFinite(numeric)) return formatValue(numeric * 1000);
-  }
-  if (point.axis_multiplier !== undefined && point.axis_multiplier !== null && !hasCompactUnitSuffix(point.raw_value)) {
-    const numeric = Number(point.value);
-    const multiplier = Number(point.axis_multiplier);
-    if (Number.isFinite(numeric) && Number.isFinite(multiplier)) return formatValue(numeric * multiplier);
-  }
-  return point.raw_value || formatValue(point.value);
+function seriesPointDisplayValue(point, side) {
+  const directValue = side === "source" ? point?.source_value : point?.target_value;
+  if (directValue !== undefined && directValue !== null && directValue !== "") return directValue;
+  return pointDisplayValue(side === "source" ? point?.source : point?.target);
 }
 
 function groupMatchedPointsByMeasure(matches) {
@@ -182,14 +183,53 @@ function groupMatchedPointsByMeasure(matches) {
     }
     groups.get(key).points.push({
       category: source.category || target.category || "-",
-      sourceValue: pointDisplayValue(source, "source"),
-      targetValue: pointDisplayValue(target, "target"),
+      sourceValue: pointDisplayValue(source),
+      targetValue: pointDisplayValue(target),
     });
   });
   return Array.from(groups.values());
 }
 
 function renderChartMeasurePointList(row, sourcePoints, targetPoints) {
+  const seriesComparisons = row?.chart_point_comparison?.series_comparisons;
+  if (Array.isArray(seriesComparisons) && seriesComparisons.length > 0) {
+    return (
+      <div className="quality-chart-measure-list">
+        {seriesComparisons.map((series, seriesIndex) => {
+          const sourceMeasure = series.source_measure || "RDL";
+          const targetMeasure = series.target_measure || "Tableau";
+          const points = Array.isArray(series.points) ? series.points : [];
+          return (
+            <div className="quality-chart-measure-card" key={`${sourceMeasure}-${targetMeasure}-${series.axis || ""}-${seriesIndex}`}>
+              <div className="quality-chart-measure-title">
+                <strong>{sourceMeasure}</strong>
+                {targetMeasure && targetMeasure !== sourceMeasure && <span>{targetMeasure}</span>}
+              </div>
+              <div className="quality-chart-point-table">
+                <div className="quality-chart-point-row quality-chart-point-row--head">
+                  <span>Point</span>
+                  <b>RDL</b>
+                  <b>Tableau</b>
+                </div>
+                {points.map((point, pointIndex) => (
+                  <div
+                    className={`quality-chart-point-row quality-chart-point-row--${normalizeName(point.status || "unknown")}`}
+                    key={`${point.category || pointIndex}-${pointIndex}`}
+                    title={point.reason || ""}
+                  >
+                    <span>{point.category || "-"}</span>
+                    <strong>{seriesPointDisplayValue(point, "source")}</strong>
+                    <strong>{seriesPointDisplayValue(point, "target")}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   const matches = row?.chart_point_comparison?.matched_points;
   if (!Array.isArray(matches) || matches.length === 0) {
     return (

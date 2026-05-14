@@ -811,11 +811,12 @@ def _build_published_report_test_scenario(
     report_parameters = parsed_payload.get("report_parameters", []) if isinstance(parsed_payload, dict) else []
     configured_filters.update(_report_parameter_defaults(report_parameters))
 
-    tableau_url = _optional_str(
-        tableau_publish_report.get("workbook_webpage_url")
-        or tableau_publish_report.get("workbook_content_url")
-        or tableau_publish_report.get("workbook_url")
-    )
+    tableau_view_name = _published_report_text_option(
+        test_cfg,
+        "tableau",
+        ["view_name", "dashboard_name", "tableau_view_name", "sheet_name"],
+    ) or _published_report_default_tableau_view_name(parsed_payload)
+    tableau_url = _published_report_tableau_url(tableau_publish_report, tableau_cfg)
     powerbi_url = _optional_str(
         powerbi_publish_report.get("report_web_url")
         or (powerbi_publish_report.get("response") or {}).get("webUrl")
@@ -857,8 +858,10 @@ def _build_published_report_test_scenario(
             "tableau": {
                 "url": tableau_url,
                 "screenshot_name": "tableau_report.png",
-                "full_page": True,
+                "full_page": False,
                 "wait_after_render_ms": 2000,
+                "auto_crop": True,
+                "hide_chrome": True,
                 "filter_steps": _published_report_filter_steps(test_cfg, report_name="tableau"),
                 "storage_state_path": "" if tableau_prefer_user_data_dir else tableau_storage_state_path,
                 "user_data_dir": (
@@ -873,6 +876,9 @@ def _build_published_report_test_scenario(
     if config_path is not None:
         scenario["llm_config_path"] = str(config_path)
 
+    scenario["reports"]["powerbi"].update(_published_report_capture_options(test_cfg, "powerbi"))
+    scenario["reports"]["tableau"].update(_published_report_capture_options(test_cfg, "tableau"))
+
     screenshot_tests = _published_report_screenshot_test_options(test_cfg)
     if screenshot_tests:
         scenario["screenshot_tests"] = screenshot_tests
@@ -881,11 +887,6 @@ def _build_published_report_test_scenario(
     if data_tests:
         scenario["data_tests"] = data_tests
 
-    tableau_view_name = _published_report_text_option(
-        test_cfg,
-        "tableau",
-        ["view_name", "dashboard_name", "tableau_view_name", "sheet_name"],
-    )
     if tableau_view_name:
         scenario["reports"]["tableau"]["view_name"] = tableau_view_name
 
@@ -908,6 +909,101 @@ def _build_published_report_test_scenario(
         scenario["reports"]["tableau"]["filter_steps"] = test_cfg.get("tableau_filter_steps")
 
     return scenario
+
+
+def _published_report_tableau_url(
+    tableau_publish_report: dict,
+    tableau_cfg: dict | None,
+) -> str:
+    report = tableau_publish_report if isinstance(tableau_publish_report, dict) else {}
+    nested_report = report.get("tableau_publish_report")
+    if isinstance(nested_report, dict):
+        report = nested_report
+
+    for key in ("workbook_webpage_url", "workbook_url", "webpage_url", "url"):
+        value = _optional_str(report.get(key), default="")
+        if _is_http_url(value):
+            return value
+
+    server_url = (_optional_str(report.get("server_url") or (tableau_cfg or {}).get("server_url"), default="") or "").rstrip("/")
+    site_content_url = (_optional_str(report.get("site_content_url") or (tableau_cfg or {}).get("site_content_url"), default="") or "").strip("/")
+    workbook_id = _optional_str(report.get("workbook_id") or report.get("id"), default="")
+    if server_url and workbook_id:
+        if site_content_url:
+            return f"{server_url}/#/site/{site_content_url}/workbooks/{workbook_id}"
+        return f"{server_url}/#/workbooks/{workbook_id}"
+
+    for key in ("workbook_content_url", "content_url"):
+        value = _optional_str(report.get(key), default="")
+        if _is_http_url(value):
+            return value
+    return ""
+
+
+def _is_http_url(value: Any) -> bool:
+    return isinstance(value, str) and value.lower().startswith(("http://", "https://"))
+
+
+def _published_report_default_tableau_view_name(parsed_payload: dict) -> str:
+    if not isinstance(parsed_payload, dict):
+        return ""
+    candidates: list[Any] = []
+    visual_model = parsed_payload.get("visual_model")
+    if isinstance(visual_model, dict):
+        layout = visual_model.get("layout")
+        if isinstance(layout, dict):
+            candidates.append(layout.get("report_name"))
+        candidates.append(visual_model.get("report_name"))
+    layout = parsed_payload.get("layout")
+    if isinstance(layout, dict):
+        candidates.append(layout.get("report_name"))
+    candidates.extend([parsed_payload.get("report_name"), parsed_payload.get("name")])
+    for candidate in candidates:
+        value = _optional_str(candidate, default="")
+        if value:
+            return f"{value} Dashboard"
+    return ""
+
+
+def _published_report_capture_options(test_cfg: dict | None, report_name: str) -> dict[str, Any]:
+    if not isinstance(test_cfg, dict):
+        return {}
+    report_cfg = test_cfg.get(report_name)
+    if not isinstance(report_cfg, dict):
+        return {}
+    allowed_keys = {
+        "after_view_click_wait_ms",
+        "auto_crop",
+        "auto_crop_canvas",
+        "canvas_crop_luma_threshold",
+        "canvas_crop_max_col_gap",
+        "canvas_crop_max_row_gap",
+        "canvas_crop_min_col_ratio",
+        "canvas_crop_min_height",
+        "canvas_crop_min_reduction_ratio",
+        "canvas_crop_min_row_ratio",
+        "canvas_crop_min_width",
+        "canvas_crop_padding",
+        "capture_selector",
+        "capture_selectors",
+        "capture_timeout_ms",
+        "dashboard_selector",
+        "full_page",
+        "hide_chrome",
+        "hide_tableau_chrome",
+        "loading_selectors",
+        "locale",
+        "min_capture_height",
+        "min_capture_width",
+        "ready_selector",
+        "screenshot_selector",
+        "screenshot_selectors",
+        "screenshot_timeout_ms",
+        "viewport",
+        "view_click_timeout_ms",
+        "wait_after_render_ms",
+    }
+    return {key: value for key, value in report_cfg.items() if key in allowed_keys}
 
 
 def _published_report_filter_steps(test_cfg: dict | None, report_name: str) -> list[dict]:
@@ -985,6 +1081,7 @@ def _published_report_data_test_options(test_cfg: dict | None) -> dict[str, Any]
         "source_report",
         "target_report",
         "numeric_tolerance_percent",
+        "chart_point_approx_tolerance_percent",
         "minor_delta_tolerance_percent",
         "strict_missing_values",
         "required_kpis",

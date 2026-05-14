@@ -3710,6 +3710,14 @@ textarea {
   background: #f8fafc;
 }
 
+.quality-chart-point-row--failed strong {
+  color: #b91c1c;
+}
+
+.quality-chart-point-row--passed strong {
+  color: #166534;
+}
+
 .quality-chart-point-row span,
 .quality-chart-point-row b {
   color: #64748b;

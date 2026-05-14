@@ -64,7 +64,12 @@
       "storage_state_path": "env:POWERBI_PLAYWRIGHT_STORAGE_STATE"
     },
     "tableau": {
-      "storage_state_path": "env:TABLEAU_PLAYWRIGHT_STORAGE_STATE"
+      "storage_state_path": "env:TABLEAU_PLAYWRIGHT_STORAGE_STATE",
+      "user_data_dir": ".auth/tableau-profile",
+      "prefer_user_data_dir": true,
+      "full_page": false,
+      "auto_crop": true,
+      "hide_chrome": true
     },
     "screenshot_tests": {
       "enabled": true,
