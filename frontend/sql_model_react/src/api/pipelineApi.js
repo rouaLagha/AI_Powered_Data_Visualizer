@@ -264,6 +264,37 @@ export function runQlikMetadataJob({
   });
 }
 
+export function runQlikPowerBiMetadataJob({
+  fileName,
+  contentBase64,
+  jobsRoot = "",
+  qlikEndpoint = "ws://localhost:4848/app",
+  qlikAppsDir = "",
+  dataprepCacheDir = "",
+  qlikUserDirectory = "",
+  qlikUserId = "",
+  qlikSessionCookie = "",
+  jobId = "",
+  requestTimeoutSeconds = 30,
+}) {
+  return requestJson("/api/qlik-powerbi/metadata/run", {
+    method: "POST",
+    body: JSON.stringify({
+      file_name: fileName,
+      content_base64: contentBase64,
+      jobs_root: jobsRoot,
+      job_id: jobId,
+      qlik_endpoint: qlikEndpoint,
+      qlik_apps_dir: qlikAppsDir,
+      dataprep_cache_dir: dataprepCacheDir,
+      qlik_user_directory: qlikUserDirectory,
+      qlik_user_id: qlikUserId,
+      qlik_session_cookie: qlikSessionCookie,
+      request_timeout_seconds: requestTimeoutSeconds,
+    }),
+  });
+}
+
 export function runQlikConversionJob({
   fileName,
   contentBase64,

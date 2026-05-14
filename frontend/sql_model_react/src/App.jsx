@@ -15,6 +15,7 @@ import ConsumerWorkbookStep from "./components/steps/ConsumerWorkbookStep.jsx";
 import QualityComparisonStep from "./components/steps/QualityComparisonStep.jsx";
 import RdlAiEditorPage from "./pages/RdlAiEditorPage.jsx";
 import QlikConversionPage from "./pages/QlikConversionPage.jsx";
+import QlikPowerBiConversionPage from "./pages/QlikPowerBiConversionPage.jsx";
 import TableauReportCreatorPage from "./pages/TableauReportCreatorPage.jsx";
 import {
   STATUS,
@@ -152,6 +153,7 @@ function tableauPayload(config) {
 const navItems = [
   { id: "pipeline", label: "RDL -> Tableau Conversion" },
   { id: "qlik", label: "Qlik -> Tableau conversion" },
+  { id: "qlikPowerBi", label: "Qlik -> Power BI" },
   { id: "editor", label: "AI RDL report Editor" },
   { id: "tableauCreator", label: "AI Tableau report creator" },
 ];
@@ -666,6 +668,27 @@ export default function App() {
           {loading && <div className="loading-banner">{loading} in progress...</div>}
           {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
           <QlikConversionPage />
+        </main>
+      </div>
+    );
+  }
+
+  if (activePage === "qlikPowerBi") {
+    return (
+      <div className="app-shell">
+        <Header
+          activeStepTitle="Conversion Qlik vers Power BI"
+          validationStatus={validationStatus}
+          context={headerContext}
+          navItems={navItems}
+          activePage={activePage}
+          onNavigate={setActivePage}
+          showValidationBadge={false}
+        />
+        <main className="page-workspace">
+          {loading && <div className="loading-banner">{loading} in progress...</div>}
+          {errorMessage && <div className="loading-banner error-banner">{errorMessage}</div>}
+          <QlikPowerBiConversionPage />
         </main>
       </div>
     );

@@ -26,6 +26,7 @@ POST_ENDPOINTS = {
     "/api/tableau/publish",
     "/api/conversion/run",
     "/api/qlik/metadata/run",
+    "/api/qlik-powerbi/metadata/run",
     "/api/qlik/convert/run",
     "/api/rdl-editor/apply",
 }

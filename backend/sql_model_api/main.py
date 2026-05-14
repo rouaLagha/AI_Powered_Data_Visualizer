@@ -49,6 +49,10 @@ from src.rdl_to_twb.pipeline import (
 )
 from src.qlik_to_twb.metadata_pipeline import run_qlik_metadata_job, run_uploaded_qlik_metadata_job
 from src.qlik_to_twb.pipeline import run_qlik_to_twb
+from src.qlik_to_powerbi.metadata_pipeline import (
+    run_qlik_powerbi_metadata_job,
+    run_uploaded_qlik_powerbi_metadata_job,
+)
 from sql_model_assistant_app import (
     DEFAULT_LLM_CONFIG,
     FALLBACK_LLM_CONFIG,
@@ -96,6 +100,7 @@ DATA_MODEL_TWB_NAME = "data_model_to_publish.twb"
 FINAL_WORKBOOK_TWB_NAME = "data_model_with_mapped_visuals.twb"
 QLIK_OUTPUT_DIR = PROJECT_ROOT / "output"
 QLIK_JOBS_DIR = QLIK_OUTPUT_DIR / "qlik_jobs"
+QLIK_POWERBI_JOBS_DIR = QLIK_OUTPUT_DIR / "qlik_powerbi_jobs"
 STATE_LOCK = Lock()
 RDL_XSD_PATH = BACKEND_DIR / "assets" / "ReportDefinition.xsd"
 TWB_XSD_PATH = BACKEND_DIR / "assets" / "twb_2026.1.0.xsd"
@@ -3451,6 +3456,69 @@ def _run_qlik_metadata_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _run_qlik_powerbi_metadata_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    output_dir_value = str(payload.get("jobs_root") or payload.get("output_dir") or "").strip()
+    jobs_root = _resolve_workspace_path(output_dir_value) if output_dir_value else QLIK_POWERBI_JOBS_DIR
+    job_id = str(payload.get("job_id") or "").strip() or _new_qlik_job_id()
+    try:
+        request_timeout_seconds = float(payload.get("request_timeout_seconds") or 30.0)
+    except (TypeError, ValueError):
+        request_timeout_seconds = 30.0
+
+    common_kwargs = {
+        "jobs_root": jobs_root,
+        "job_id": job_id,
+        "qlik_endpoint": str(payload.get("qlik_endpoint") or "ws://localhost:4848/app").strip(),
+        "qlik_apps_dir": str(payload.get("qlik_apps_dir") or "").strip(),
+        "dataprep_cache_dir": str(payload.get("dataprep_cache_dir") or "").strip(),
+        "qlik_user_directory": str(payload.get("qlik_user_directory") or "").strip(),
+        "qlik_user_id": str(payload.get("qlik_user_id") or "").strip(),
+        "qlik_session_cookie": str(payload.get("qlik_session_cookie") or "").strip(),
+        "request_timeout_seconds": request_timeout_seconds,
+    }
+
+    content_base64 = str(payload.get("content_base64") or payload.get("file_base64") or "").strip()
+    try:
+        if content_base64:
+            file_name = str(payload.get("file_name") or "uploaded.qvf").strip() or "uploaded.qvf"
+            result = run_uploaded_qlik_powerbi_metadata_job(
+                file_name=file_name,
+                file_bytes=_decode_base64_file(content_base64),
+                **common_kwargs,
+            )
+        else:
+            qvf_path = str(payload.get("qvf_path") or "").strip()
+            if not qvf_path:
+                raise ValueError("Upload a QVF file or provide qvf_path.")
+            result = run_qlik_powerbi_metadata_job(source_qvf_path=qvf_path, **common_kwargs)
+    except Exception as exc:
+        result = _write_failed_qlik_job(jobs_root=jobs_root, job_id=job_id, exc=exc)
+
+    intermediate_model = result.get("intermediate_model_data")
+    if not isinstance(intermediate_model, dict):
+        intermediate_model = {}
+
+    return {
+        "ok": True,
+        "status": result.get("status", "completed"),
+        "job_id": result.get("job_id", ""),
+        "app_id": result.get("app_id", ""),
+        "client": result.get("client", ""),
+        "extraction_mode": result.get("extraction_mode", ""),
+        "error": result.get("error", ""),
+        "job_dir": str(jobs_root / str(result.get("job_id", ""))),
+        "result": result,
+        "summary": result.get("summary", {}),
+        "intermediate_model": intermediate_model,
+        "visual_metadata": result.get("visual_metadata", []) if isinstance(result.get("visual_metadata"), list) else [],
+        "connection_metadata": result.get("connection_metadata", []) if isinstance(result.get("connection_metadata"), list) else [],
+        "connection_warnings": result.get("connection_warnings", []) if isinstance(result.get("connection_warnings"), list) else [],
+        "dataprep_cache_metadata": result.get("dataprep_cache_metadata", {}) if isinstance(result.get("dataprep_cache_metadata"), dict) else {},
+        "artifacts": _artifact_payloads(result if isinstance(result, dict) else {}),
+        "trace_steps": result.get("trace_steps", []),
+    }
+
+
 def _run_qlik_conversion_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
     output_dir_value = str(payload.get("output_dir") or "").strip()
     jobs_root_value = str(payload.get("jobs_root") or "").strip()
@@ -3646,6 +3714,7 @@ POST_HANDLERS = {
     "/api/quality/compare": _compare_quality_endpoint,
     "/api/conversion/run": _run_conversion_endpoint,
     "/api/qlik/metadata/run": _run_qlik_metadata_endpoint,
+    "/api/qlik-powerbi/metadata/run": _run_qlik_powerbi_metadata_endpoint,
     "/api/qlik/convert/run": _run_qlik_conversion_endpoint,
     "/api/rdl-editor/apply": _apply_rdl_editor_endpoint,
 }

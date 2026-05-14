@@ -52,6 +52,9 @@ class QlikEngineApiClient(Protocol):
     def get_connections(self, app_id: str) -> list[JsonDict]:
         ...
 
+    def get_tables_and_fields(self, app_id: str) -> list[JsonDict]:
+        ...
+
 
 def default_qlik_desktop_apps_dir() -> Path:
     return Path.home() / "Documents" / "Qlik" / "Sense" / "Apps"
@@ -196,6 +199,32 @@ class QlikEngineClient:
     def close(self) -> None:
         self._rpc.close()
 
+    def _ensure_open(self, app_id: str) -> int:
+        if self._app_handle is not None and self._app_id == app_id:
+            return self._app_handle
+
+        result = self._rpc.request(-1, "OpenDoc", [app_id])
+        qreturn = dict(result.get("qReturn") or {})
+        handle = qreturn.get("qHandle")
+        if not isinstance(handle, int):
+            raise ConnectionError(f"QIX OpenDoc did not return an app handle for {app_id}.")
+
+        self._app_id = app_id
+        self._app_handle = handle
+        self._object_cache = {}
+        self._sheets_cache = None
+        self._visuals_cache = None
+        return handle
+
+    def _create_session_list(self, app_id: str, definition: JsonDict) -> int:
+        app_handle = self._ensure_open(app_id)
+        result = self._rpc.request(app_handle, "CreateSessionObject", [definition])
+        qreturn = dict(result.get("qReturn") or {})
+        handle = qreturn.get("qHandle")
+        if not isinstance(handle, int):
+            raise ConnectionError("QIX CreateSessionObject did not return a handle.")
+        return handle
+
     def open_app(self, app_id: str) -> JsonDict:
         handle = self._ensure_open(app_id)
         app_info: JsonDict = {
@@ -222,6 +251,49 @@ class QlikEngineClient:
         handle = self._ensure_open(app_id)
         result = self._rpc.request(handle, "GetScript", [])
         return str(result.get("qScript") or "")
+
+    def _load_objects(self, app_id: str) -> None:
+        if self._sheets_cache is not None and self._visuals_cache is not None:
+            return
+
+        app_handle = self._ensure_open(app_id)
+        result = self._rpc.request(app_handle, "GetAllInfos", [])
+        infos = [
+            dict(info)
+            for info in _as_list(result.get("qInfos"))
+            if isinstance(info, dict) and str(info.get("qId") or "").strip()
+        ]
+
+        sheets: list[JsonDict] = []
+        child_to_sheet: dict[str, str] = {}
+        for rank, info in enumerate(infos):
+            if str(info.get("qType") or "").lower() != "sheet":
+                continue
+            object_data = self._get_object_data(str(info["qId"]))
+            layout = dict(object_data.get("layout") or {})
+            props = dict(object_data.get("properties") or {})
+            sheet = self._parse_sheet(info, layout, props, rank)
+            for child_id in sheet.get("object_ids", []):
+                child_to_sheet[str(child_id)] = str(sheet["id"])
+            sheets.append(sheet)
+
+        visuals: list[JsonDict] = []
+        for info in infos:
+            qid = str(info.get("qId") or "")
+            qtype = str(info.get("qType") or "")
+            if not self._looks_like_visual_type(qtype):
+                continue
+            object_data = self._get_object_data(qid)
+            layout = dict(object_data.get("layout") or {})
+            props = dict(object_data.get("properties") or {})
+            if not self._looks_like_visual_layout(qtype, layout, props):
+                continue
+            visual = self._parse_visual(info, layout, props, child_to_sheet.get(qid, ""))
+            if visual:
+                visuals.append(visual)
+
+        self._sheets_cache = sheets
+        self._visuals_cache = visuals
 
     def get_sheets(self, app_id: str) -> list[JsonDict]:
         self._load_objects(app_id)
@@ -359,90 +431,91 @@ class QlikEngineClient:
             if connection
         ]
 
-    def _ensure_open(self, app_id: str) -> int:
-        if self._app_handle is not None and self._app_id == app_id:
-            return self._app_handle
-        result = self._rpc.request(-1, "OpenDoc", [app_id])
-        qreturn = dict(result.get("qReturn") or {})
-        handle = qreturn.get("qHandle")
-        if not isinstance(handle, int):
-            raise ConnectionError(f"QIX OpenDoc did not return an app handle for {app_id}.")
-        self._app_id = app_id
-        self._app_handle = handle
-        self._object_cache = {}
-        self._sheets_cache = None
-        self._visuals_cache = None
-        return handle
+    def get_tables_and_fields(self, app_id: str) -> list[JsonDict]:
+        """Return detected tables and their fields.
 
-    def _load_objects(self, app_id: str) -> None:
-        if self._sheets_cache is not None and self._visuals_cache is not None:
-            return
+        This implementation parses the app load script to extract LOAD /
+        RESIDENT / FROM patterns and returns a best-effort list of tables
+        with their discovered fields. It does not require QIX-specific list
+        object support and works as a fallback when the engine API surface
+        varies.
+        """
+        try:
+            script = (self.get_load_script(app_id) or "")
+        except Exception:
+            script = ""
 
-        app_handle = self._ensure_open(app_id)
-        result = self._rpc.request(app_handle, "GetAllInfos", [])
-        infos = [
-            dict(info)
-            for info in _as_list(result.get("qInfos"))
-            if isinstance(info, dict) and str(info.get("qId") or "").strip()
-        ]
+        tables: dict[str, dict] = {}
 
-        sheets: list[JsonDict] = []
-        child_to_sheet: dict[str, str] = {}
-        infos_by_id = {str(info.get("qId") or ""): info for info in infos}
-        for rank, info in enumerate(infos):
-            qtype = str(info.get("qType") or "").lower()
-            if qtype != "sheet":
+        # Helper to add table entry
+        def add_table(name: str, fields: list[str] | None = None, source: str | None = None) -> None:
+            key = (name or "").strip()
+            if not key:
+                return
+            if key not in tables:
+                tables[key] = {"name": key, "fields": [], "source_qvd": source or ""}
+            if fields:
+                # preserve order, dedupe
+                for f in fields:
+                    if f and f not in tables[key]["fields"]:
+                        tables[key]["fields"].append(f)
+
+        # 1) Detect explicit QVD references
+        for match in re.finditer(r"\bFROM\s+\[?([^\]\s;']+\.qvd)\]?", script, flags=re.IGNORECASE):
+            qvd_path = match.group(1).strip("'\"")
+            name = Path(qvd_path).stem
+            add_table(name, fields=None, source=qvd_path)
+
+        # 2) Parse LOAD ... FROM/RESIDENT blocks to extract field lists
+        # Matches LOAD <fields> FROM <target> ... ; or LOAD <fields> RESIDENT <table> ...;
+        for load_match in re.finditer(r"\bLOAD\s+(.*?)\s+(FROM|RESIDENT)\s+([^;\n]+)", script, flags=re.IGNORECASE | re.DOTALL):
+            raw_fields = load_match.group(1)
+            op = load_match.group(2).upper()
+            target = load_match.group(3).strip()
+
+            # clean fields: remove parentheses and qualifiers, split by comma
+            # handle "Field as Alias" and "Field (something)"
+            field_tokens = []
+            for part in re.split(r",(?=(?:[^'\"]*['\"][^'\"]*['\"])*[^'\"]*$)", raw_fields):
+                token = part.strip()
+                if not token:
+                    continue
+                # remove trailing qualifiers like "AS Alias" or "(something)"
+                token = re.sub(r"\s+AS\s+.+$", "", token, flags=re.IGNORECASE).strip()
+                token = re.sub(r"\(.*?\)", "", token).strip()
+                # if token contains space, take last part (e.g., "Table.Field" -> "Field")
+                token = token.split()[-1]
+                token = token.strip('"\'')
+                if token:
+                    field_tokens.append(token)
+
+            # choose table name: if FROM references a qvd path, use its stem
+            table_name = ""
+            qvd_in_target = re.search(r"([\w\-/\\.]+\.qvd)", target, flags=re.IGNORECASE)
+            if qvd_in_target:
+                table_name = Path(qvd_in_target.group(1)).stem
+            else:
+                # RESIDENT target gives table name directly
+                if op == "RESIDENT":
+                    table_name = re.sub(r"[^A-Za-z0-9_]+", "", target.split()[0])
+                else:
+                    # try to find an alias AS <name> nearby
+                    alias_match = re.search(r"AS\s+([A-Za-z0-9_]+)", target, flags=re.IGNORECASE)
+                    if alias_match:
+                        table_name = alias_match.group(1)
+
+            if not table_name:
+                # fallback: try to infer a table name from a preceding LET or statement
                 continue
-            object_data = self._get_object_data(str(info["qId"]))
-            layout = dict(object_data.get("layout") or {})
-            props = dict(object_data.get("properties") or {})
-            sheet = self._parse_sheet(info, layout, props, rank)
-            for child_id in sheet.get("object_ids", []):
-                child_to_sheet.setdefault(str(child_id), str(sheet["id"]))
-            sheets.append(sheet)
 
-        visuals: list[JsonDict] = []
-        candidate_ids: list[str] = []
-        for info in infos:
-            qid = str(info.get("qId") or "").strip()
-            if not qid:
-                continue
-            qtype = str(info.get("qType") or "")
-            if self._looks_like_visual_type(qtype):
-                candidate_ids.append(qid)
+            add_table(table_name, fields=field_tokens, source=(qvd_in_target.group(1) if qvd_in_target else None))
 
-        for child_id in child_to_sheet:
-            if child_id not in candidate_ids:
-                candidate_ids.append(child_id)
+        # 3) If still empty, fallback to scanning for simple table aliases (AS table)
+        for alias in re.findall(r"\bAS\s+([A-Za-z0-9_]+)\b", script, flags=re.IGNORECASE):
+            add_table(alias)
 
-        seen_visual_ids: set[str] = set()
-        for qid in candidate_ids:
-            if qid in seen_visual_ids:
-                continue
-            seen_visual_ids.add(qid)
-            info = infos_by_id.get(qid, {"qId": qid, "qType": ""})
-            qtype = str(info.get("qType") or "")
-            object_data = self._get_object_data(qid)
-            layout = dict(object_data.get("layout") or {})
-            props = dict(object_data.get("properties") or {})
-            if not self._looks_like_visual_layout(qtype, layout, props):
-                continue
-            visual = self._parse_visual(info, layout, props, child_to_sheet.get(qid, ""))
-            if visual:
-                visuals.append(visual)
-
-        self._sheets_cache = sheets
-        self._visuals_cache = visuals
-
-    def _create_session_list(self, app_id: str, definition: JsonDict) -> int:
-        app_handle = self._ensure_open(app_id)
-        result = self._rpc.request(app_handle, "CreateSessionObject", [definition])
-        qreturn = dict(result.get("qReturn") or {})
-        handle = qreturn.get("qHandle")
-        if not isinstance(handle, int):
-            raise ConnectionError("QIX CreateSessionObject did not return a handle.")
-        return handle
-
+        # convert to list
+        return list(tables.values())
     def _object_layout_by_handle(self, handle: int) -> JsonDict:
         result = self._rpc.request(handle, "GetLayout", [])
         return dict(result.get("qLayout") or {})
@@ -644,6 +717,74 @@ def extract_qlik_metadata(
             visual_objects=visual_objects,
             visual_table_matches=_as_list(dataprep_cache_metadata.get("visual_table_matches")),
         )
+        tables_and_fields = client.get_tables_and_fields(app_id)
+
+        # Build a simple summary for UI metrics
+        sheet_count = len(sheets or [])
+        visual_count = len(visual_objects or [])
+        measure_count = len(client.get_master_measures(app_id) or [])
+        dimension_count = len(client.get_master_dimensions(app_id) or [])
+        # count distinct filter fields from visuals (list objects and filter panes)
+        filter_fields = set()
+        for vis in visual_objects or []:
+            for f in (vis.get("filters") or []):
+                if isinstance(f, dict):
+                    filter_fields.add(str(f.get("field") or f.get("name") or ""))
+                else:
+                    filter_fields.add(str(f or ""))
+        filter_count = len([f for f in filter_fields if f])
+
+        # Build a simple semantic model: tables and inferred relationships
+        semantic_tables = []
+        for t in tables_and_fields or []:
+            semantic_tables.append({
+                "name": t.get("name") or "",
+                "fields": t.get("fields") or [],
+                "source_qvd": t.get("source_qvd") or "",
+            })
+
+        # Infer relationships where two tables share a field name (e.g., ID fields)
+        relationships = []
+        name_to_table = {t["name"]: t for t in semantic_tables}
+        # map field -> tables
+        field_map: dict[str, list[str]] = {}
+        for t in semantic_tables:
+            for f in t.get("fields") or []:
+                key = str(f).strip()
+                if not key:
+                    continue
+                field_map.setdefault(key, []).append(t["name"])
+
+        for field, tables_sharing in field_map.items():
+            if len(tables_sharing) < 2:
+                continue
+            # create pairwise relationships (simple)
+            primary = tables_sharing[0]
+            for other in tables_sharing[1:]:
+                relationships.append(
+                    {
+                        "from_table": primary,
+                        "from_column": field,
+                        "to_table": other,
+                        "to_column": field,
+                        "cardinality": "many_to_one",
+                    }
+                )
+
+        summary = {
+            "sheet_count": sheet_count,
+            "visual_count": visual_count,
+            "measure_count": measure_count,
+            "dimension_count": dimension_count,
+            "filter_count": filter_count,
+        }
+
+        semantic_model = {
+            "tables": semantic_tables,
+            "relationships": relationships,
+            "connections": connections,
+        }
+
         return {
             "source": {
                 "qvf_path": str(qvf_path),
@@ -663,6 +804,9 @@ def extract_qlik_metadata(
             "master_dimensions": client.get_master_dimensions(app_id),
             "master_measures": client.get_master_measures(app_id),
             "variables": client.get_variables(app_id),
+            "tables_and_fields": tables_and_fields,
+            "summary": summary,
+            "semantic_model": semantic_model,
         }
     finally:
         close = getattr(client, "close", None)
