@@ -12,6 +12,7 @@ from src.qlik_to_twb.metadata_pipeline import (
 )
 from src.qlik_to_twb.pipeline import normalize_qlik_metadata
 from src.qlik_to_twb.qlik_client import QlikEngineApiClient
+from src.qlik_to_powerbi.pbip_generator import generate_powerbi_pbip_project
 
 
 JsonDict = dict[str, Any]
@@ -51,6 +52,7 @@ def run_qlik_powerbi_metadata_job(
     qlik_user_id: str = "",
     qlik_session_cookie: str = "",
     request_timeout_seconds: float = 30.0,
+    pbip_template_path: str = "",
 ) -> JsonDict:
     result = run_qlik_metadata_job(
         source_qvf_path=source_qvf_path,
@@ -65,7 +67,7 @@ def run_qlik_powerbi_metadata_job(
         qlik_session_cookie=qlik_session_cookie,
         request_timeout_seconds=request_timeout_seconds,
     )
-    return _append_powerbi_intermediate_model(result)
+    return _append_powerbi_intermediate_model(result, pbip_template_path=pbip_template_path)
 
 
 def run_uploaded_qlik_powerbi_metadata_job(
@@ -81,6 +83,7 @@ def run_uploaded_qlik_powerbi_metadata_job(
     qlik_user_id: str = "",
     qlik_session_cookie: str = "",
     request_timeout_seconds: float = 30.0,
+    pbip_template_path: str = "",
 ) -> JsonDict:
     result = run_uploaded_qlik_metadata_job(
         file_name=file_name,
@@ -96,7 +99,7 @@ def run_uploaded_qlik_powerbi_metadata_job(
         qlik_session_cookie=qlik_session_cookie,
         request_timeout_seconds=request_timeout_seconds,
     )
-    return _append_powerbi_intermediate_model(result)
+    return _append_powerbi_intermediate_model(result, pbip_template_path=pbip_template_path)
 
 
 def normalize_qlik_to_powerbi_model(qlik_metadata: JsonDict) -> JsonDict:
@@ -386,7 +389,7 @@ def normalize_qlik_to_powerbi_model(qlik_metadata: JsonDict) -> JsonDict:
         "summary": summary,
     }
 
-def _append_powerbi_intermediate_model(job_result: JsonDict) -> JsonDict:
+def _append_powerbi_intermediate_model(job_result: JsonDict, pbip_template_path: str = "") -> JsonDict:
     result = dict(job_result)
     metadata_path = Path(str(result.get("qlik_metadata") or ""))
     if not metadata_path.exists():
@@ -419,12 +422,30 @@ def _append_powerbi_intermediate_model(job_result: JsonDict) -> JsonDict:
 
     result["powerbi_intermediate_model"] = str(intermediate_path)
     result["intermediate_model_data"] = intermediate_model
+    pbip_output_dir = metadata_path.parent / "powerbi_pbip_project"
+    pbip_result = generate_powerbi_pbip_project(
+        intermediate_model=intermediate_model,
+        output_dir=pbip_output_dir,
+        template_path=pbip_template_path or None,
+        project_name=_slug(str(intermediate_model.get("source", {}).get("app_title") or result.get("app_id") or "QlikPowerBiReport"), "QlikPowerBiReport"),
+    )
+    result["powerbi_pbip_generation"] = pbip_result
+    result["powerbi_pbip_project"] = pbip_result.get("project_dir", "")
+    result["powerbi_pbip_file"] = pbip_result.get("pbip_path", "")
+    result["powerbi_pbip_archive"] = pbip_result.get("archive_path", "")
+    result["powerbi_pbip_manifest"] = pbip_result.get("manifest_path", "")
+    result["powerbi_semantic_model"] = pbip_result.get("semantic_model_path", "")
+    result["powerbi_report_model"] = pbip_result.get("report_path", "")
+    result["powerbi_llm_mapping"] = pbip_result.get("llm_mapping_path", "")
     result["summary"] = {
         **dict(result.get("summary") or {}),
         **dict(intermediate_model.get("summary") or {}),
+        "pbip_visual_count": int(dict(pbip_result.get("summary") or {}).get("visuals") or 0),
+        "pbip_page_count": int(dict(pbip_result.get("summary") or {}).get("pages") or 0),
     }
     trace_steps = _as_list(result.get("trace_steps"))
     trace_steps.append("Power BI intermediate model normalized and written")
+    trace_steps.append("Power BI PBIP project generated from template metadata")
     result["trace_steps"] = trace_steps
 
     job_path = Path(str(result.get("job") or metadata_path.parent / "job.json"))

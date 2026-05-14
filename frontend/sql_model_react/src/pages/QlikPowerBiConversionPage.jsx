@@ -6,6 +6,11 @@ import Card from "../components/shared/Card.jsx";
 
 const ARTIFACT_LABELS = {
   powerbi_intermediate_model: "Modèle intermédiaire Power BI",
+  powerbi_pbip_archive: "Projet PBIP Power BI",
+  powerbi_pbip_manifest: "Manifest génération PBIP",
+  powerbi_semantic_model: "Modèle sémantique Power BI",
+  powerbi_report_model: "Rapport Power BI JSON",
+  powerbi_llm_mapping: "Mapping LLM Qlik vers Power BI",
   qlik_metadata: "Métadonnées Qlik brutes",
   visual_metadata_path: "Visualisations Qlik",
   connection_metadata_path: "Connexions Qlik",
@@ -16,6 +21,11 @@ const ARTIFACT_LABELS = {
 
 const ARTIFACT_ORDER = [
   "powerbi_intermediate_model",
+  "powerbi_pbip_archive",
+  "powerbi_pbip_manifest",
+  "powerbi_semantic_model",
+  "powerbi_report_model",
+  "powerbi_llm_mapping",
   "qlik_metadata",
   "visual_metadata_path",
   "connection_metadata_path",

@@ -101,6 +101,9 @@ FINAL_WORKBOOK_TWB_NAME = "data_model_with_mapped_visuals.twb"
 QLIK_OUTPUT_DIR = PROJECT_ROOT / "output"
 QLIK_JOBS_DIR = QLIK_OUTPUT_DIR / "qlik_jobs"
 QLIK_POWERBI_JOBS_DIR = QLIK_OUTPUT_DIR / "qlik_powerbi_jobs"
+DEFAULT_QLIK_POWERBI_PBIP_TEMPLATE = Path(
+    os.getenv("QLIK_POWERBI_PBIP_TEMPLATE_PATH") or r"C:\Users\Roua\Desktop\test"
+)
 STATE_LOCK = Lock()
 RDL_XSD_PATH = BACKEND_DIR / "assets" / "ReportDefinition.xsd"
 TWB_XSD_PATH = BACKEND_DIR / "assets" / "twb_2026.1.0.xsd"
@@ -3475,6 +3478,11 @@ def _run_qlik_powerbi_metadata_endpoint(payload: dict[str, Any]) -> dict[str, An
         "qlik_user_id": str(payload.get("qlik_user_id") or "").strip(),
         "qlik_session_cookie": str(payload.get("qlik_session_cookie") or "").strip(),
         "request_timeout_seconds": request_timeout_seconds,
+        "pbip_template_path": str(
+            payload.get("pbip_template_path")
+            or payload.get("powerbi_template_path")
+            or DEFAULT_QLIK_POWERBI_PBIP_TEMPLATE
+        ).strip(),
     }
 
     content_base64 = str(payload.get("content_base64") or payload.get("file_base64") or "").strip()

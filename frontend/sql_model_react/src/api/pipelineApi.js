@@ -274,6 +274,7 @@ export function runQlikPowerBiMetadataJob({
   qlikUserDirectory = "",
   qlikUserId = "",
   qlikSessionCookie = "",
+  pbipTemplatePath = "",
   jobId = "",
   requestTimeoutSeconds = 30,
 }) {
@@ -290,6 +291,7 @@ export function runQlikPowerBiMetadataJob({
       qlik_user_directory: qlikUserDirectory,
       qlik_user_id: qlikUserId,
       qlik_session_cookie: qlikSessionCookie,
+      pbip_template_path: pbipTemplatePath,
       request_timeout_seconds: requestTimeoutSeconds,
     }),
   });
