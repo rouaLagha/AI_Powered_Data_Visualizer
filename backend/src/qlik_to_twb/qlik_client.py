@@ -109,14 +109,18 @@ class QixJsonRpcClient:
                 "Install backend requirements with: pip install -r backend/requirements.txt"
             ) from exc
 
-        self._connection = connect(
-            self._global_endpoint_url(),
-            additional_headers=self._headers(),
-            open_timeout=self.config.request_timeout_seconds,
-            ping_interval=None,
-            max_size=None,
-            proxy=None,
-        )
+        endpoint_url = self._global_endpoint_url()
+        try:
+            self._connection = connect(
+                endpoint_url,
+                additional_headers=self._headers(),
+                open_timeout=self.config.request_timeout_seconds,
+                ping_interval=None,
+                max_size=None,
+                proxy=None,
+            )
+        except OSError as exc:
+            raise ConnectionError(_qix_connection_error_message(endpoint_url, exc)) from exc
 
     def close(self) -> None:
         if self._connection is None:
@@ -1204,6 +1208,16 @@ def _normalize_qix_connection(item: Any) -> JsonDict:
         "source": "qix_get_connections",
         "internal": _is_internal_connection_name(name),
     }
+
+
+def _qix_connection_error_message(endpoint_url: str, error: OSError) -> str:
+    reason = str(error).strip() or type(error).__name__
+    return (
+        f"Cannot connect to Qlik Engine QIX endpoint {endpoint_url}. "
+        "Start Qlik Sense Desktop and keep it running, or set qlik_endpoint to the correct QIX WebSocket URL. "
+        "For Qlik Sense Desktop the default endpoint is ws://localhost:4848/app. "
+        f"Original connection error: {reason}"
+    )
 
 
 def _connection_items(payload: JsonDict) -> list[Any]:
