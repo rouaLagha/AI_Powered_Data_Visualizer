@@ -1104,6 +1104,60 @@ def _build_llm_mapping_manifest(intermediate_model: JsonDict, semantic_model: Js
     }
 
 
+def _infer_measure_format(dax_expression: str, qlik_expression: str, measure_name: str) -> str:
+    """Infer the appropriate Power BI format string for a measure based on its expression and nature.
+    
+    Rules:
+    - COUNT/DISTINCTCOUNT measures -> integer format: "0"
+    - Ratio measures (DIVIDE with aggregate divisor) -> percentage format: "0.00%"
+    - Numeric measures (SUM, aggregates) -> decimal format: "0.00"
+    - Scale-divided measures (e.g., /1000) -> decimal format: "0.00"
+    """
+    dax = str(dax_expression or "").strip().upper()
+    qlik = str(qlik_expression or "").strip().upper()
+    name = str(measure_name or "").strip().upper()
+    
+    # Count measures -> integer format
+    if "DISTINCTCOUNT(" in dax or "COUNT(DISTINCT" in qlik:
+        return "0"
+    if dax.startswith("COUNT(") or ("COUNT(" in dax and "DISTINCTCOUNT(" not in dax):
+        return "0"
+    
+    # Ratio/percentage detection: DIVIDE with function (not literal number) as divisor
+    if "DIVIDE(" in dax:
+        # Extract divisor to check if it's a function or a literal
+        # Simple heuristic: if divisor contains SUM, DIVIDE, COUNT, etc. -> it's a ratio
+        divide_match = re.search(r"DIVIDE\s*\(\s*[^,]+\s*,\s*([^)]+)\s*\)", dax)
+        if divide_match:
+            divisor = divide_match.group(1).strip().upper()
+            # If divisor is a function (contains SUM, COUNT, DIVIDE, etc.), treat as ratio/percentage
+            if any(func in divisor for func in ["SUM(", "COUNT(", "DIVIDE(", "AVERAGE(", "MAX(", "MIN("]):
+                return "0.00%"
+            # Otherwise, it's division by a literal (like /1000) -> keep as decimal
+            return "0.00"
+    
+    # Ratio in Qlik format (division operator)
+    if "/" in qlik and not qlik.startswith("SUM("):
+        parts = qlik.split("/")
+        if len(parts) == 2:
+            left = parts[0].strip().upper()
+            right = parts[1].strip().upper()
+            # Check if it looks like a ratio (has functions on both sides)
+            if ("SUM(" in left or "COUNT(" in left) and ("SUM(" in right or "COUNT(" in right):
+                return "0.00%"
+        return "0.00"
+    
+    # Default to decimal for numeric measures
+    if any(keyword in dax for keyword in ["SUM(", "COUNT(", "AVERAGE(", "MAX(", "MIN(", "DIVIDE("]):
+        return "0.00"
+    
+    if any(keyword in qlik for keyword in ["SUM(", "COUNT(", "AVERAGE(", "MAX(", "MIN("]):
+        return "0.00"
+    
+    # If we can't determine, use decimal format to avoid "General" format
+    return "0.00"
+
+
 def _measures_by_referenced_field(
     measures: list[Any],
     field_to_table: dict[str, str] | None = None,
@@ -1148,7 +1202,7 @@ def _measures_by_referenced_field(
         payload = {
             "name": _safe_measure_name(name),
             "expression": dax,
-            "formatString": "General",
+            "formatString": _infer_measure_format(dax, expression, name),
             "source": {
                 "qlik_expression": expression,
                 "requires_llm_review": _requires_llm_review(expression),
