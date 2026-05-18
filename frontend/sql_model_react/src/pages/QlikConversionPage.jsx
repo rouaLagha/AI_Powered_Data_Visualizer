@@ -134,6 +134,18 @@ function uniqueQvdTables(...groups) {
   return tables;
 }
 
+function qvdMatchesByVisualId(dataprepCacheMetadata) {
+  const matches = new Map();
+  toArray(dataprepCacheMetadata?.visual_table_matches).forEach((match) => {
+    if (!match || typeof match !== "object") return;
+    const visualId = String(match.visual_id || "").trim();
+    const bestMatch = match.best_match && typeof match.best_match === "object" ? match.best_match : null;
+    if (!visualId || !bestMatch?.table_name) return;
+    matches.set(visualId, bestMatch);
+  });
+  return matches;
+}
+
 function connectionKey(connection, index) {
   return String(connection?.id || connection?.name || `connection-${index}`);
 }
@@ -203,7 +215,8 @@ export default function QlikConversionPage() {
   const connectionWarnings = firstArray(result?.connection_warnings, result?.result?.connection_warnings);
   const dataprepCacheMetadata = result?.dataprep_cache_metadata || result?.result?.dataprep_cache_metadata || {};
   const qvdTables = uniqueQvdTables(dataprepCacheMetadata?.qvd_tables, dataprepCacheMetadata?.internal_qvd_tables);
-  const matchedVisualCount = visualMetadata.filter((visual) => visual?.best_data_cache_match?.table_name).length;
+  const visualQvdMatches = qvdMatchesByVisualId(dataprepCacheMetadata);
+  const matchedVisualCount = visualQvdMatches.size;
   const selectedFileLabel = qvfFile ? `${qvfFile.name}${qvfFile.size ? ` (${formatSize(qvfFile.size)})` : ""}` : "No QVF selected";
   const runStatus = failed ? "Failed" : result?.ok ? "Completed" : "QVF upload";
   const detailRows = [
@@ -407,25 +420,28 @@ export default function QlikConversionPage() {
 
                 {visualMetadata.length ? (
                   <div className="qlik-metadata-list">
-                    {visualMetadata.map((visual, index) => (
-                      <div className="qlik-metadata-row" key={visual.id || `${visual.title}-${index}`}>
-                        <div className="qlik-metadata-main">
-                          <strong>{displayValue(visual.title || visual.id, `Visual ${index + 1}`)}</strong>
-                          <span className="sheet-label">{sheetLabel(visual, index)}</span>
+                    {visualMetadata.map((visual, index) => {
+                      const qvdMatch = visualQvdMatches.get(String(visual.id || visual.visual_id || "").trim());
+                      return (
+                        <div className="qlik-metadata-row" key={visual.id || `${visual.title}-${index}`}>
+                          <div className="qlik-metadata-main">
+                            <strong>{displayValue(visual.title || visual.id, `Visual ${index + 1}`)}</strong>
+                            <span className="sheet-label">{sheetLabel(visual, index)}</span>
+                          </div>
+                          <div className="qlik-count-pills">
+                            <Badge tone="indigo">{toArray(visual.dimensions).length} dims</Badge>
+                            <Badge tone="green">{toArray(visual.measures).length} measures</Badge>
+                          </div>
+                          <p>Dimensions: {fieldList(visual.dimensions, "field")}</p>
+                          <p>Measures: {fieldList(visual.measures, "expression")}</p>
+                          {qvdMatch?.table_name && (
+                            <p>
+                              QVD match: {qvdMatch.table_name} ({toArray(qvdMatch.matched_fields).join(", ")})
+                            </p>
+                          )}
                         </div>
-                        <div className="qlik-count-pills">
-                          <Badge tone="indigo">{toArray(visual.dimensions).length} dims</Badge>
-                          <Badge tone="green">{toArray(visual.measures).length} measures</Badge>
-                        </div>
-                        <p>Dimensions: {fieldList(visual.dimensions, "field")}</p>
-                        <p>Measures: {fieldList(visual.measures, "expression")}</p>
-                        {visual.best_data_cache_match?.table_name && (
-                          <p>
-                            QVD match: {visual.best_data_cache_match.table_name} ({visual.best_data_cache_match.matched_fields?.join(", ")})
-                          </p>
-                        )}
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="qlik-empty-state compact">

@@ -332,8 +332,6 @@ def _normalize_visual(visual: JsonDict, fields: dict[str, JsonDict]) -> JsonDict
         "type": visual.get("type", ""),
         "source_type": visual.get("source_type") or visual.get("type", ""),
         "qix": dict(visual.get("qix") or {}),
-        "data_cache_matches": _as_list(visual.get("data_cache_matches")),
-        "best_data_cache_match": dict(visual.get("best_data_cache_match") or {}),
         "dimensions": dimensions,
         "measures": measures,
     }

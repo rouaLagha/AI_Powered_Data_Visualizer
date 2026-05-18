@@ -760,10 +760,6 @@ def extract_qlik_metadata(
             visual_objects=visual_objects,
             cache_dir=str(getattr(config, "dataprep_cache_dir", "") or ""),
         )
-        visual_objects = _attach_dataprep_matches_to_visuals(
-            visual_objects=visual_objects,
-            visual_table_matches=_as_list(dataprep_cache_metadata.get("visual_table_matches")),
-        )
         tables_and_fields = client.get_tables_and_fields(app_id)
         get_table_relationships = getattr(client, "get_table_relationships", None)
         association_candidates: list[JsonDict] = []
@@ -1210,24 +1206,6 @@ def _match_visuals_to_qvd_tables(visual_objects: list[JsonDict], qvd_tables: lis
             }
         )
     return matches
-
-
-def _attach_dataprep_matches_to_visuals(
-    visual_objects: list[JsonDict],
-    visual_table_matches: list[JsonDict],
-) -> list[JsonDict]:
-    match_by_id = {str(item.get("visual_id") or ""): item for item in visual_table_matches if isinstance(item, dict)}
-    output = []
-    for visual in visual_objects:
-        if not isinstance(visual, dict):
-            continue
-        enriched = dict(visual)
-        match = match_by_id.get(str(enriched.get("id") or ""))
-        if match:
-            enriched["data_cache_matches"] = match.get("matches", [])
-            enriched["best_data_cache_match"] = match.get("best_match", {})
-        output.append(enriched)
-    return output
 
 
 def _attach_visual_usage_to_qvd_tables(qvd_tables: list[JsonDict], visual_table_matches: list[JsonDict]) -> None:

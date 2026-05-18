@@ -200,6 +200,7 @@ def build_tableau_mapping_contract(
     proposed_sheets = _proposed_sheets_by_id(proposed_mapping)
     tables = _as_table_metadata(intermediate_model)
     field_table_index = _field_table_index(tables)
+    visual_qvd_matches = _visual_qvd_matches_by_id(intermediate_model)
     expression_map: list[JsonDict] = []
     visual_type_map: dict[str, str] = {}
     contract_warnings = _string_list(proposed_mapping.get("warnings"))
@@ -230,6 +231,10 @@ def build_tableau_mapping_contract(
                 visual_index=visual_index,
                 field_table_index=field_table_index,
                 tables=tables,
+                qvd_match=visual_qvd_matches.get(
+                    str(source_visual.get("id") or source_visual.get("visual_id") or "").strip(),
+                    {},
+                ),
             )
             contract_visuals.append(visual)
             if visual["original_qlik_visual_type"]:
@@ -284,6 +289,7 @@ def _build_visual_contract(
     visual_index: int,
     field_table_index: dict[str, str],
     tables: list[JsonDict],
+    qvd_match: JsonDict | None = None,
 ) -> JsonDict:
     visual_id = str(source_visual.get("id") or source_visual.get("visual_id") or "").strip()
     visual_title = str(source_visual.get("title") or source_visual.get("visual_title") or visual_id or f"Visual {visual_index + 1}").strip()
@@ -314,7 +320,12 @@ def _build_visual_contract(
     measures, measure_columns = _build_measure_contracts(source_visual, proposed_measures, field_table_index, warnings)
 
     columns_used = _dedupe_columns([*dimension_columns, *measure_columns])
-    table_usage = _table_usage_for_visual(source_visual=source_visual, columns_used=columns_used, tables=tables, field_table_index=field_table_index)
+    table_usage = _table_usage_for_visual(
+        qvd_match=qvd_match,
+        columns_used=columns_used,
+        tables=tables,
+        field_table_index=field_table_index,
+    )
     tables_used = [item["table_name"] for item in table_usage if item.get("table_name")]
     if not tables_used and columns_used:
         warnings.append("No source table could be inferred for one or more visual columns.")
@@ -574,20 +585,36 @@ def _as_table_metadata(intermediate_model: JsonDict) -> list[JsonDict]:
     return tables
 
 
+def _visual_qvd_matches_by_id(intermediate_model: JsonDict) -> dict[str, JsonDict]:
+    dataprep_metadata = intermediate_model.get("dataprep_cache_metadata") if isinstance(intermediate_model, dict) else {}
+    if not isinstance(dataprep_metadata, dict):
+        return {}
+
+    matches_by_id: dict[str, JsonDict] = {}
+    for match in _as_list(dataprep_metadata.get("visual_table_matches")):
+        if not isinstance(match, dict):
+            continue
+        visual_id = str(match.get("visual_id") or "").strip()
+        best_match = match.get("best_match") if isinstance(match.get("best_match"), dict) else {}
+        if visual_id and str(best_match.get("table_name") or "").strip():
+            matches_by_id[visual_id] = best_match
+    return matches_by_id
+
+
 def _table_usage_for_visual(
-    source_visual: JsonDict,
+    qvd_match: JsonDict | None,
     columns_used: list[JsonDict],
     tables: list[JsonDict],
     field_table_index: dict[str, str],
 ) -> list[JsonDict]:
     usage: dict[str, JsonDict] = {}
-    best_match = source_visual.get("best_data_cache_match") if isinstance(source_visual.get("best_data_cache_match"), dict) else {}
-    if best_match.get("table_name"):
-        usage[str(best_match.get("table_name"))] = {
-            "table_name": str(best_match.get("table_name")),
+    qvd_match = qvd_match if isinstance(qvd_match, dict) else {}
+    if qvd_match.get("table_name"):
+        usage[str(qvd_match.get("table_name"))] = {
+            "table_name": str(qvd_match.get("table_name")),
             "source": "dataprep_qvd_match",
-            "matched_columns": _string_list(best_match.get("matched_fields")),
-            "match_score": best_match.get("score", 0),
+            "matched_columns": _string_list(qvd_match.get("matched_fields")),
+            "match_score": qvd_match.get("score", 0),
         }
 
     for column in columns_used:
