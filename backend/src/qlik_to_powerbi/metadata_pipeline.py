@@ -324,14 +324,33 @@ def normalize_qlik_to_powerbi_model(qlik_metadata: JsonDict) -> JsonDict:
     )
 
     validated_associations = _validated_associations_from_metadata(qlik_metadata)
+    table_metadata = _relationship_table_metadata(tables)
+    seen_relationship_keys: set[tuple[str, str, str, str]] = set()
     if validated_associations:
-        table_metadata = _relationship_table_metadata(tables)
         for rel in validate_and_convert_associations_to_relationships(validated_associations, table_metadata):
             if _is_valid_relationship(rel):
                 relationships.append({
                     "id": _slug(f"{rel['from_table']}_{rel['from_column']}_{rel['to_table']}_{rel['to_column']}", None),
                     **rel,
                 })
+
+    if association_candidates:
+        for rel in _relationships_from_association_candidates(association_candidates, table_metadata):
+            if not _is_valid_relationship(rel):
+                continue
+            rel_key = (
+                str(rel.get("from_table") or "").strip().lower(),
+                str(rel.get("from_column") or "").strip().lower(),
+                str(rel.get("to_table") or "").strip().lower(),
+                str(rel.get("to_column") or "").strip().lower(),
+            )
+            if rel_key in seen_relationship_keys:
+                continue
+            seen_relationship_keys.add(rel_key)
+            relationships.append({
+                "id": _slug(f"{rel['from_table']}_{rel['from_column']}_{rel['to_table']}_{rel['to_column']}", None),
+                **rel,
+            })
     
     table_name_lookup = {
         str(t.get("name") or "").strip().lower(): str(t.get("name") or "").strip()
@@ -1146,6 +1165,22 @@ def _is_valid_relationship(relationship: JsonDict) -> bool:
     if source in {"qix_get_tables_and_keys", "qlik_script_parse", "qlik_script_parse_unvalidated"}:
         return False
     return True
+
+
+def _relationships_from_association_candidates(
+    association_candidates: list[JsonDict],
+    table_metadata: dict[str, JsonDict] | None = None,
+) -> list[JsonDict]:
+    normalized_candidates: list[JsonDict] = []
+    for candidate in association_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        clean_candidate = dict(candidate)
+        clean_candidate["requires_validation"] = False
+        if not clean_candidate.get("validated"):
+            clean_candidate["validated"] = True
+        normalized_candidates.append(clean_candidate)
+    return validate_and_convert_associations_to_relationships(normalized_candidates, table_metadata)
 
 
 def _is_technical_relationship(relationship: JsonDict) -> bool:

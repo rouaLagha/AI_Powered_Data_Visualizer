@@ -970,6 +970,8 @@ def _build_semantic_model(intermediate_model: JsonDict) -> JsonDict:
         rel_payload["to_column"] = to_column
         filtered_relationships.append(_relationship_payload(rel_payload))
 
+    _ensure_relationship_columns(tables, filtered_relationships)
+
     return {
         "name": "QlikConvertedSemanticModel",
         "compatibilityLevel": 1601,
@@ -1391,6 +1393,57 @@ def _relationship_payload(relationship: JsonDict) -> JsonDict:
         "crossFilteringBehavior": "bothDirections",
         "source": relationship.get("source") or "",
     }
+
+
+def _ensure_relationship_columns(tables: list[JsonDict], relationships: list[JsonDict]) -> None:
+    table_lookup = {
+        str(table.get("name") or table.get("table_name") or "").strip().lower(): table
+        for table in tables
+        if isinstance(table, dict) and str(table.get("name") or table.get("table_name") or "").strip()
+    }
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            continue
+        for table_key, column_key in (
+            ("fromTable", "fromColumn"),
+            ("toTable", "toColumn"),
+        ):
+            table_name = str(relationship.get(table_key) or "").strip()
+            column_name = str(relationship.get(column_key) or "").strip()
+            if not table_name or not column_name:
+                continue
+            table = table_lookup.get(table_name.lower())
+            if not table:
+                continue
+            columns = _as_list(table.get("columns"))
+            if any(
+                str(column.get("name") or column.get("sourceColumn") or "").strip().lower() == column_name.lower()
+                for column in columns
+                if isinstance(column, dict)
+            ):
+                continue
+            columns.append(
+                {
+                    "name": column_name,
+                    "dataType": _infer_relationship_column_type(column_name),
+                    "sourceColumn": column_name,
+                    "summarizeBy": "none",
+                }
+            )
+            table["columns"] = columns
+
+
+def _infer_relationship_column_type(column_name: str) -> str:
+    text = str(column_name or "").strip().lower()
+    if not text:
+        return "string"
+    if any(token in text for token in ("date", "time", "year", "month")):
+        return "dateTime"
+    if text.endswith("key") or text.endswith("id") or text.startswith("key") or text.startswith("id"):
+        return "int64"
+    if any(token in text for token in ("qty", "count", "number", "num", "amount", "total", "sales", "profit", "cost")):
+        return "double"
+    return "string"
 
 
 def _field_ref(item: Any) -> JsonDict:
