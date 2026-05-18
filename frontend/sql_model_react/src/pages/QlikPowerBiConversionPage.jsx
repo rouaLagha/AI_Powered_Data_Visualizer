@@ -11,6 +11,8 @@ const ARTIFACT_LABELS = {
   powerbi_pbip_manifest: "PBIP generation manifest",
   powerbi_semantic_model: "Power BI semantic model",
   powerbi_report_model: "Visual elements JSON",
+  powerbi_semantic_definition: "Semantic model definition",
+  powerbi_report_definition: "Report definition",
   powerbi_llm_mapping: "Mapping JSON",
   qlik_metadata: "Raw Qlik metadata",
   visual_metadata_path: "Qlik visuals",
@@ -26,6 +28,8 @@ const ARTIFACT_ORDER = [
   "powerbi_pbip_manifest",
   "powerbi_semantic_model",
   "powerbi_report_model",
+  "powerbi_semantic_definition",
+  "powerbi_report_definition",
   "powerbi_llm_mapping",
   "qlik_metadata",
   "visual_metadata_path",
@@ -417,6 +421,8 @@ export default function QlikPowerBiConversionPage() {
     "powerbi_pbip_manifest",
     "powerbi_semantic_model",
     "powerbi_report_model",
+    "powerbi_semantic_definition",
+    "powerbi_report_definition",
     "powerbi_llm_mapping",
   ]);
   const hasGenerationArtifacts = artifacts.some(([key]) => generationArtifactKeys.has(key));
@@ -426,12 +432,14 @@ export default function QlikPowerBiConversionPage() {
     result?.powerbi_pbip_file ||
     result?.powerbi_pbip_archive ||
     result?.powerbi_report_model ||
+    result?.powerbi_report_definition ||
     result?.powerbi_llm_mapping ||
     result?.result?.powerbi_pbip_generation ||
     result?.result?.powerbi_pbip_project ||
     result?.result?.powerbi_pbip_file ||
     result?.result?.powerbi_pbip_archive ||
     result?.result?.powerbi_report_model ||
+    result?.result?.powerbi_report_definition ||
     result?.result?.powerbi_llm_mapping
   );
   const generationDone = generateRequested && (hasPowerBiGenerationResult || hasGenerationArtifacts);
