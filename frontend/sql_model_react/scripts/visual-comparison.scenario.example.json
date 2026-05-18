@@ -1,0 +1,39 @@
+{
+  "name": "regional-sales-rdl-vs-local-tableau-workbook",
+  "filters": {
+    "CalendarYear": 2013,
+    "SalesTerritoryGroup": "Europe"
+  },
+  "rdl": {
+    "source_path": "C:/Users/Roua/Downloads/RegionalSales.rdl",
+    "reference_png_path": "../../outputs/visual-comparison/manual-reference/reference-rdl.png",
+    "reference_pdf_path": "",
+    "export_command": "",
+    "pdf_dpi": 160
+  },
+  "tableau": {
+    "mode": "local_twb",
+    "artifact_path": "../../outputs/converted_report_perfect.twb",
+    "generated_png_path": "../../outputs/visual-comparison/manual-tableau/generated-tableau.png",
+    "generated_pdf_path": "",
+    "export_command": "",
+    "pdf_dpi": 160
+  },
+  "comparison": {
+    "accepted_threshold": 95,
+    "pixelmatch_threshold": 0.1,
+    "include_antialias": false,
+    "background": {
+      "r": 255,
+      "g": 255,
+      "b": 255,
+      "a": 255
+    },
+    "output_size": null,
+    "mask_rects": [],
+    "visual_regions": []
+  },
+  "output": {
+    "dir": "../../outputs/visual-comparison/latest"
+  }
+}
