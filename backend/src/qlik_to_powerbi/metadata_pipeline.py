@@ -532,6 +532,8 @@ def _append_powerbi_intermediate_model(job_result: JsonDict, pbip_template_path:
     result["powerbi_pbip_manifest"] = pbip_result.get("manifest_path", "")
     result["powerbi_semantic_model"] = pbip_result.get("semantic_model_path", "")
     result["powerbi_report_model"] = pbip_result.get("report_path", "")
+    result["powerbi_semantic_definition"] = pbip_result.get("semantic_model_definition_path", "")
+    result["powerbi_report_definition"] = pbip_result.get("report_definition_path", "")
     result["powerbi_llm_mapping"] = pbip_result.get("llm_mapping_path", "")
     result["summary"] = {
         **dict(result.get("summary") or {}),
@@ -1649,7 +1651,21 @@ def _expression_fields(expression: Any) -> list[str]:
     for match in re.findall(r"\[([^\]]+)\]", text):
         _append_unique(fields, match)
     for match in re.finditer(
-        r"\b(?:sum|avg|average|count|min|max|only|median|stdev)\s*\(\s*(?:\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))",
+        r"\b(?:sum|avg|average|count|min|max|only|median|stdev)\s*\(\s*(?:distinct\s+)?(?:\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_ .]*))\s*(?:-|\+|,|\)|/)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        first = str(match.group(1) or match.group(2) or "").strip()
+        if first and not first.lower().startswith("distinct "):
+            _append_unique(fields, first)
+    for match in re.finditer(
+        r"\b(?:sum|avg|average|count|min|max|only|median|stdev)\s*\([^)]*?(?:-|\+|/)\s*(?:\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_ .]*))\s*\)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        _append_unique(fields, str(match.group(1) or match.group(2) or "").strip())
+    for match in re.finditer(
+        r"\b(?:sum|avg|average|count|min|max|only|median|stdev)\s*\(\s*(?:distinct\s+)?(?:\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))",
         text,
         flags=re.IGNORECASE,
     ):
